@@ -1,0 +1,24 @@
+# Secrets and build noise that must never reach the image. .env is the
+# important one: `COPY . .` would otherwise bake API_HASH, BOT_TOKEN and
+# REDIS_PASSWORD into a layer.
+.env
+cookies.txt
+*.session
+cache*.db
+
+.git
+.gitignore
+.claude
+.zed
+.vscode
+.idea
+
+node_modules/
+bin/
+dist/
+coverage/
+
+Dockerfile
+docker-compose.yml
+.dockerignore
+README.md

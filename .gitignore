@@ -1,0 +1,18 @@
+# Secrets — never commit
+.env
+cookies.txt
+test_cookies.txt
+*.session
+cache*.db
+
+# Build artifacts
+/ytube-api
+/bin/
+/dist/
+node_modules/
+
+# Editor / OS
+.idea/
+.vscode/
+.zed/
+.DS_Store

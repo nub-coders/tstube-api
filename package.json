@@ -1,0 +1,27 @@
+{
+  "name": "gotube-api",
+  "version": "2026.3.12",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript replacement for the ytube_api FastAPI service + Telegram bot",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
+    "start": "node dist/index.js",
+    "dev": "node --watch dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "ioredis": "^5.4.1",
+    "youtubei.js": "18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}

@@ -1,0 +1,79 @@
+# The deployment: one image, two roles. The Node process serves the HTTP API and
+# runs the Telegram bot; START_BOT picks which. They're split into two services so the
+# API can be scaled without every replica long-polling Telegram for the same bot.
+#
+# `docker compose up -d` starts both. The API takes its Traefik route from
+# API_HOST; the bot takes updates from Telegram (exactly one replica, ever).
+#
+# Before first run: cp .env.example .env and fill it in.
+
+x-app: &app
+  build: .
+  image: gotube-api:latest
+  restart: always
+  # PID 1 reaping: the service shells out to yt-dlp, and init also forwards
+  # SIGTERM to the Node signal handler that drains in-flight streams.
+  init: true
+  env_file: .env
+  # Redis comes from .env — a managed Redis hostname resolves fine from inside a
+  # container. If yours is REDIS_HOST=localhost, that's the one value that can't
+  # cross the container boundary: point it at host.docker.internal (resolvable
+  # via the extra_hosts below) for a Redis on the host.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  networks:
+    - web
+  volumes:
+    # Firefox profile: auto-export cookies via yt-dlp --cookies-from-browser
+    - /root/snap/firefox/common/.mozilla/firefox:/home/app/.mozilla/firefox:ro
+    - /root/snap/firefox/common/.mozilla/firefox:/home/app/snap/firefox/common/.mozilla/firefox:ro
+  # Pinned resolvers: 8.8.8.8 was dropping 12-40% of this host's UDP DNS
+  # queries (rate limiting — ICMP to it was clean), and every dropped query
+  # cost a 4-5s stall. Because each stream resolves a fresh per-session
+  # rr*---sn-*.googlevideo.com hostname, that hit ~15-40% of stream starts.
+  # Cloudflare measured 0% loss over 120 queries; 8.8.4.4 stays as fallback.
+  # Set here (not just on the host) because Docker's embedded resolver caches
+  # its upstream list at container start.
+  dns:
+    - 1.1.1.1
+    - 1.0.0.1
+    - 8.8.4.4
+  # timeout:1 caps a dropped-query stall at 1s instead of 5s, and rotate
+  # spreads queries across the three servers.
+  dns_opt:
+    - timeout:1
+    - attempts:2
+    - rotate
+
+services:
+  gotube-api:
+    <<: *app
+    # Scale horizontally: `docker compose up -d --scale gotube-api=N`.
+    # (No container_name — Compose needs unique names to run >1 replica.)
+    # Stream job state lives in Redis, so resolver calls work across replicas,
+    # and Traefik load-balances all of them via the labels below.
+    environment:
+      START_BOT: "false"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.gotube-api.rule=Host(`${API_HOST:-api.nubcoders.com}`)"
+      - "traefik.http.routers.gotube-api.entrypoints=websecure"
+      - "traefik.http.routers.gotube-api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.gotube-api.loadbalancer.server.port=8000"
+
+  gotube-bot:
+    <<: *app
+    container_name: gotube-bot
+    # One long-poll consumer — never scale this past 1, or every replica answers
+    # the same command. START_BOT=true here and false above is the only
+    # difference between the two services; the bot process also listens on
+    # :8000 internally, which is what keeps the image healthcheck green.
+    environment:
+      START_BOT: "true"
+    depends_on:
+      - gotube-api
+    # No Traefik labels: the bot takes updates from Telegram, not from the edge.
+
+networks:
+  web:
+    external: true
