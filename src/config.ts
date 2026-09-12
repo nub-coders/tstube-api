@@ -152,7 +152,7 @@ export function loadConfig(): Config {
     COOKIES_BROWSER: getenv('COOKIES_BROWSER', 'firefox'),
     COOKIES_BOOTSTRAP_URL: getenv(
       'COOKIES_BOOTSTRAP_URL',
-      'https://www.youtube.com/watch?v=BaW_jenozKc',
+      'https://www.youtube.com',
     ),
     COOKIES_REFRESH_HOURS: cookiesRefresh,
 

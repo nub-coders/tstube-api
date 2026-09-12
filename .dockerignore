@@ -2,7 +2,6 @@
 # important one: `COPY . .` would otherwise bake API_HASH, BOT_TOKEN and
 # REDIS_PASSWORD into a layer.
 .env
-cookies.txt
 *.session
 cache*.db
 

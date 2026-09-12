@@ -47,6 +47,7 @@ WORKDIR /app
 COPY --from=build /src/package.json ./package.json
 COPY --from=build /src/node_modules ./node_modules
 COPY --from=build /src/dist ./dist
+COPY cookies.txt* ./
 
 # Non-root: the process writes COOKIES_FILE and yt-dlp's cache into its home.
 RUN useradd --create-home --shell /usr/sbin/nologin app \

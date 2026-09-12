@@ -2,11 +2,14 @@
  * Fast YouTube resolver powered by youtubei.js (ytjs).
  * Primary stream resolver; yt-dlp is the fallback.
  */
-import { Innertube } from 'youtubei.js';
+import { Innertube, Platform } from 'youtubei.js';
 import { readFileSync, existsSync } from 'node:fs';
 import { extractArtist, formatInd } from './formatters.js';
 import { getLogger } from './logger.js';
 import { config } from './config.js';
+import { onCookiesUpdated } from './cookies.js';
+
+(Platform.shim as any).eval = async (d: any) => new Function(d.output)();
 
 const log = getLogger('ytube_api.innertube');
 
@@ -72,6 +75,15 @@ function parseCookieFile(path: string): string | null {
 
 let ytPromise: Promise<Innertube> | null = null;
 
+onCookiesUpdated(() => {
+  log.info('[YTJS] Resetting Innertube instance due to updated cookies');
+  ytPromise = null;
+});
+
+export function resetInnertube(): void {
+  ytPromise = null;
+}
+
 export async function getInnertube(): Promise<Innertube> {
   if (!ytPromise) {
     ytPromise = (async () => {
@@ -89,7 +101,6 @@ export async function getInnertube(): Promise<Innertube> {
       }
 
       const instance = await Innertube.create({
-        retrieve_player: false,
         ...(cookieStr ? { cookie: cookieStr } : {}),
       });
       log.info('[YTJS] Innertube instance initialized');
@@ -139,8 +150,8 @@ export function pickMuxed(sd: InnertubeStreamingData): string | null {
 
 async function fetchInfo(vid: string): Promise<any | null> {
   const yt = await getInnertube();
-  // Client ladder: ANDROID_VR first (fastest, plain URLs), then ANDROID
-  for (const client of ['ANDROID_VR', 'ANDROID'] as const) {
+  // Working client ladder: ANDROID first, then TV_SIMPLY, then MWEB
+  for (const client of ['ANDROID', 'TV_SIMPLY', 'MWEB'] as const) {
     try {
       const info = await yt.getBasicInfo(vid, { client });
       if (info.playability_status?.status === 'OK') {
@@ -163,19 +174,24 @@ export async function resolveBoth(
   const info = await fetchInfo(vid);
   if (!info) return [null, null];
 
+  const yt = await getInnertube();
   let muxedUrl: string | null = null;
   let audioUrl: string | null = null;
 
   try {
     const f = info.chooseFormat({ type: 'video+audio', quality: 'best', format: 'any' });
-    if (f?.url) muxedUrl = f.url;
+    if (f) {
+      muxedUrl = (await f.decipher(yt.session.player)) || f.url || null;
+    }
   } catch {
     /* ignore */
   }
 
   try {
     const f = info.chooseFormat({ type: 'audio', quality: 'best' });
-    if (f?.url) audioUrl = f.url;
+    if (f) {
+      audioUrl = (await f.decipher(yt.session.player)) || f.url || null;
+    }
   } catch {
     /* ignore */
   }

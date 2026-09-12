@@ -56,7 +56,7 @@ services:
       START_BOT: "false"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.gotube-api.rule=Host(`${API_HOST:-api.nubcoders.com}`)"
+      - "traefik.http.routers.gotube-api.rule=Host(`${API_HOST:-apitest.nubcoders.com}`)"
       - "traefik.http.routers.gotube-api.entrypoints=websecure"
       - "traefik.http.routers.gotube-api.tls.certresolver=letsencrypt"
       - "traefik.http.services.gotube-api.loadbalancer.server.port=8000"
