@@ -63,6 +63,7 @@ export interface Config {
   ADMIN_ID_SET: Set<number>;
 
   // ── Redis ────────────────────────────────────────────────────
+  REDIS_URL: string | null;
   REDIS_HOST: string;
   REDIS_PORT: number;
   REDIS_USERNAME: string;
@@ -128,6 +129,25 @@ export function loadConfig(): Config {
   const cookiesRefresh = getfloat('COOKIES_REFRESH_HOURS', 6);
   const apiHost = getenv('API_HOST', 'apitest.nubcoders.com');
 
+  let redisHost = getenv('REDIS_HOST', 'localhost');
+  let redisPort = getint('REDIS_PORT', 15440);
+  let redisUsername = getenv('REDIS_USERNAME', 'default');
+  let redisPassword = process.env.REDIS_PASSWORD || null;
+  const redisUrl = process.env.REDIS_URL || null;
+
+  if (redisUrl) {
+    try {
+      const fixedUrl = redisUrl.replace(/^edis:\/\//, 'redis://');
+      const parsed = new URL(fixedUrl.startsWith('redis://') || fixedUrl.startsWith('rediss://') ? fixedUrl : `redis://${fixedUrl}`);
+      if (parsed.hostname) redisHost = parsed.hostname;
+      if (parsed.port) redisPort = Number.parseInt(parsed.port, 10);
+      if (parsed.username) redisUsername = decodeURIComponent(parsed.username);
+      if (parsed.password) redisPassword = decodeURIComponent(parsed.password);
+    } catch {
+      /* fallback to discrete env vars */
+    }
+  }
+
   cached = Object.freeze({
     API_ID: apiID,
     API_HASH: getenv('API_HASH', 'b18441a1ff607e10a989891a5462e627'),
@@ -138,10 +158,11 @@ export function loadConfig(): Config {
     ADMIN_IDS: adminIDs,
     ADMIN_ID_SET: adminSet,
 
-    REDIS_HOST: getenv('REDIS_HOST', 'localhost'),
-    REDIS_PORT: getint('REDIS_PORT', 15440),
-    REDIS_USERNAME: getenv('REDIS_USERNAME', 'default'),
-    REDIS_PASSWORD: process.env.REDIS_PASSWORD || null,
+    REDIS_URL: redisUrl,
+    REDIS_HOST: redisHost,
+    REDIS_PORT: redisPort,
+    REDIS_USERNAME: redisUsername,
+    REDIS_PASSWORD: redisPassword,
     UPSTASH_REDIS_REST_URL: process.env.UPSTASH_REDIS_REST_URL || null,
     UPSTASH_REDIS_REST_TOKEN: process.env.UPSTASH_REDIS_REST_TOKEN || null,
 
