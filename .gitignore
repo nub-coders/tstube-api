@@ -10,9 +10,11 @@ cache*.db
 /bin/
 /dist/
 node_modules/
+cf-worker-test/
 
 # Editor / OS
 .idea/
 .vscode/
 .zed/
 .DS_Store
+*.webm

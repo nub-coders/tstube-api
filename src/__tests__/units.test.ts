@@ -107,7 +107,7 @@ describe('urlValidation', () => {
       expect(e).toBeInstanceOf(HttpError);
       expect((e as HttpError).status).toBe(400);
       expect((e as HttpError).payload).toEqual({
-        detail: 'Invalid target: only YouTube URLs are allowed',
+        detail: 'Invalid target: only allowed streaming target URLs or search queries permitted',
       });
     }
   });

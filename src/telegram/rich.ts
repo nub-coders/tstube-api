@@ -11,6 +11,7 @@
  */
 import { TelegramApi, type InlineButton, type InlineKeyboardMarkup, type TgMessage } from './api.js';
 import { getLogger } from '../logger.js';
+import { renderCustomEmojis, stripCustomEmojis, extractButtonEmoji } from './customEmojis.js';
 
 const log = getLogger('ytube_api.bot');
 
@@ -26,17 +27,43 @@ export interface ButtonSpec {
   text: string;
   callback_data?: string;
   url?: string;
+  copy_text?: { text: string };
+  /** Shorthand for `copy_text: { text }` to copy text to clipboard on tap. */
+  copyText?: string;
   style?: ButtonStyleValue;
   disabled?: boolean;
+  icon_custom_emoji_id?: string;
+  /** Shorthand for `icon_custom_emoji_id` — pass a raw Telegram custom emoji document ID. */
+  emojiId?: string;
+  /** Optional label rendered beneath the button (second line in Telegram's two-line button layout). */
+  label?: string;
+  /** Optional hint text shown in the button's bottom-right corner alongside the emoji. */
+  hint?: string;
 }
 
 /** One inline-keyboard button. `style` is omitted when unspecified (DEFAULT). */
 export function btn(text: string, opts: Omit<ButtonSpec, 'text'> = {}): InlineButton {
-  const b: InlineButton = { text };
+  const extracted = extractButtonEmoji(text);
+  const iconId = opts.icon_custom_emoji_id ?? opts.emojiId ?? extracted.icon_custom_emoji_id;
+  const buttonText = (iconId !== undefined && extracted.icon_custom_emoji_id !== undefined)
+    ? extracted.text
+    : text;
+
+  const b: InlineButton = { text: buttonText };
   if (opts.callback_data !== undefined) b.callback_data = opts.callback_data;
   if (opts.url !== undefined) b.url = opts.url;
+  if (opts.copy_text !== undefined) {
+    b.copy_text = opts.copy_text;
+  } else if (opts.copyText !== undefined) {
+    b.copy_text = { text: opts.copyText };
+  }
   if (opts.style !== undefined) b.style = opts.style;
   if (opts.disabled) b.disabled = true;
+  if (iconId !== undefined) {
+    b.icon_custom_emoji_id = iconId;
+  }
+  if (opts.label !== undefined) b.label = opts.label;
+  if (opts.hint !== undefined) b.hint = opts.hint;
   return b;
 }
 
@@ -57,9 +84,11 @@ export function escapeHtml(value: unknown): string {
 export function stripRichHtml(html: string): string {
   let out = html;
   out = out.replace(/<br\s*\/?>/gi, '\n');
-  out = out.replace(/<\/(p|h[1-6]|div|tr|li|blockquote|details|summary)>/gi, '\n');
+  out = out.replace(/<\/(p|h[1-6]|div|tr|li|blockquote|details|summary|tg-button-row)>/gi, '\n');
+  out = out.replace(/<tg-button[^>]*>(.*?)<\/tg-button>/gi, '[$1] ');
   out = out.replace(/<li[^>]*>/gi, '• ');
   out = out.replace(/<\/t[dh]>/gi, '  ');
+  out = stripCustomEmojis(out);
   out = out.replace(/<[^>]+>/g, '');
   out = out
     .replace(/&lt;/g, '<')
@@ -88,25 +117,26 @@ export async function sendSmartRichMessage(
   opts: SmartSendOptions = {},
 ): Promise<TgMessage | null> {
   const { receiverUserId, fallbackHtml, replyMarkup } = opts;
+  const richHtml = renderCustomEmojis(html);
 
   if (receiverUserId !== undefined && receiverUserId !== null) {
     try {
       return await api.sendRichMessage({
         chat_id: chatId,
-        rich_message: { html },
+        rich_message: { html: richHtml },
         reply_markup: replyMarkup,
         ephemeral_message_parameters: { receiver_user_id: receiverUserId },
       });
     } catch (e) {
       const err = String(e).toLowerCase();
       if (['bot_not_admin', 'ephemeral', '400', 'bad request'].some((k) => err.includes(k))) {
-        return await sendRichOrPlain(api, chatId, fallbackHtml ?? html, replyMarkup);
+        return await sendRichOrPlain(api, chatId, fallbackHtml ? renderCustomEmojis(fallbackHtml) : richHtml, replyMarkup);
       }
       log.error('[RICH] ephemeral send failed', { err: String(e) });
       return null;
     }
   }
-  return await sendRichOrPlain(api, chatId, html, replyMarkup);
+  return await sendRichOrPlain(api, chatId, richHtml, replyMarkup);
 }
 
 /** Rich send, degrading to a classic message when rich messages are unsupported. */
@@ -116,11 +146,12 @@ async function sendRichOrPlain(
   html: string,
   replyMarkup?: InlineKeyboardMarkup,
 ): Promise<TgMessage | null> {
+  const richHtml = renderCustomEmojis(html);
   if (api.richAvailable) {
     try {
       return await api.sendRichMessage({
         chat_id: chatId,
-        rich_message: { html },
+        rich_message: { html: richHtml },
         reply_markup: replyMarkup,
       });
     } catch (e) {
@@ -130,7 +161,7 @@ async function sendRichOrPlain(
   try {
     return await api.sendMessage({
       chat_id: chatId,
-      text: stripRichHtml(html),
+      text: stripRichHtml(richHtml),
       reply_markup: replyMarkup,
     });
   } catch (e) {
@@ -147,12 +178,13 @@ export async function editSmartRichMessage(
   html: string,
   replyMarkup?: InlineKeyboardMarkup,
 ): Promise<boolean> {
+  const richHtml = renderCustomEmojis(html);
   if (api.richAvailable) {
     try {
       await api.editRichMessage({
         chat_id: chatId,
         message_id: messageId,
-        rich_message: { html },
+        rich_message: { html: richHtml },
         reply_markup: replyMarkup,
       });
       return true;
@@ -164,7 +196,7 @@ export async function editSmartRichMessage(
     await api.editMessageText({
       chat_id: chatId,
       message_id: messageId,
-      text: stripRichHtml(html),
+      text: stripRichHtml(richHtml),
       reply_markup: replyMarkup,
     });
     return true;
@@ -186,7 +218,7 @@ export async function sendRichDraft(
     await api.sendRichMessageDraft({
       chat_id: chatId,
       draft_id: draftId,
-      rich_message: { html },
+      rich_message: { html: renderCustomEmojis(html) },
     });
   } catch {
     /* drafts are cosmetic */

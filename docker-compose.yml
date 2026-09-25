@@ -7,9 +7,10 @@
 #
 # Before first run: cp .env.example .env and fill it in.
 
+name: tstube-api
+
 x-app: &app
-  build: .
-  image: gotube-api:latest
+  image: tstube-api:latest
   restart: always
   # PID 1 reaping: the service shells out to yt-dlp, and init also forwards
   # SIGTERM to the Node signal handler that drains in-flight streams.
@@ -46,9 +47,10 @@ x-app: &app
     - rotate
 
 services:
-  gotube-api:
+  tstube-api:
     <<: *app
-    # Scale horizontally: `docker compose up -d --scale gotube-api=N`.
+    build: .
+    # Scale horizontally: `docker compose up -d --scale tstube-api=N`.
     # (No container_name — Compose needs unique names to run >1 replica.)
     # Stream job state lives in Redis, so resolver calls work across replicas,
     # and Traefik load-balances all of them via the labels below.
@@ -56,14 +58,14 @@ services:
       START_BOT: "false"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.gotube-api.rule=Host(`${API_HOST:-apitest.nubcoders.com}`)"
-      - "traefik.http.routers.gotube-api.entrypoints=websecure"
-      - "traefik.http.routers.gotube-api.tls.certresolver=letsencrypt"
-      - "traefik.http.services.gotube-api.loadbalancer.server.port=8000"
+      - "traefik.http.routers.tstube-api.rule=Host(`${API_HOST:-apitest.nubcoders.com}`)"
+      - "traefik.http.routers.tstube-api.entrypoints=websecure"
+      - "traefik.http.routers.tstube-api.tls.certresolver=letsencrypt"
+      - "traefik.http.services.tstube-api.loadbalancer.server.port=8000"
 
-  gotube-bot:
+  tstube-bot:
     <<: *app
-    container_name: gotube-bot
+    container_name: tstube-bot
     # One long-poll consumer — never scale this past 1, or every replica answers
     # the same command. START_BOT=true here and false above is the only
     # difference between the two services; the bot process also listens on
@@ -71,7 +73,7 @@ services:
     environment:
       START_BOT: "true"
     depends_on:
-      - gotube-api
+      - tstube-api
     # No Traefik labels: the bot takes updates from Telegram, not from the edge.
 
 networks:

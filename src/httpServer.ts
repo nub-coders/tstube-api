@@ -23,8 +23,12 @@ import {
 } from './tools.js';
 import { argsFor, validateQuery, paramsFor, type QueryValues, type ValidationDetail } from './routeArgs.js';
 import { HttpError } from './httpError.js';
+import { BoundedCache } from './boundedCache.js';
 
 const log = getLogger('ytube_api.http');
+
+/** Short-lived in-process token→userId cache to avoid a Redis round-trip per request. */
+const AUTH_CACHE = new BoundedCache<number>(1024, 2);
 
 const ASSET_DIR = join(dirname(fileURLToPath(import.meta.url)), 'assets');
 
@@ -354,10 +358,19 @@ async function runPipeline(
   }
 
   // ── RateLimitMiddleware ──
-  const userId = await getUserByToken(ctx.token);
-  ctx.authUserId = userId;
+  if (ctx.token) {
+    const cached = AUTH_CACHE.get(ctx.token);
+    if (cached !== undefined) {
+      ctx.authUserId = cached;
+    } else {
+      ctx.authUserId = await getUserByToken(ctx.token);
+      if (ctx.authUserId) {
+        AUTH_CACHE.set(ctx.token, ctx.authUserId);
+      }
+    }
+  }
 
-  if (!userId) {
+  if (!ctx.authUserId) {
     const { required_arguments, optional_arguments } = argsFor(ctx.routePath);
     return json(401, {
       error: 'Token required',
@@ -368,10 +381,10 @@ async function runPipeline(
   }
 
   const cfg = config();
-  const userLimit = isAdmin(userId) ? cfg.ADMIN_LIMIT : cfg.DAILY_LIMIT;
+  const userLimit = isAdmin(ctx.authUserId) ? cfg.ADMIN_LIMIT : cfg.DAILY_LIMIT;
 
   // Increment optimistically; only reject if we've now gone over.
-  const newCount = await incrementUserRequests(userId);
+  const newCount = await incrementUserRequests(ctx.authUserId);
   if (newCount > userLimit) {
     return json(429, {
       error: 'Daily limit exceeded',
@@ -387,7 +400,7 @@ async function runPipeline(
   if (result.status >= 400 && !result.stream) {
     const body = serializeBody(result);
     try {
-      await incrementFailedRequests(userId, result.status, ctx.pathname, extractError(body));
+      await incrementFailedRequests(ctx.authUserId, result.status, ctx.pathname, extractError(body));
     } catch (e) {
       log.error(`[RATELIMIT] failed to record failure: ${String(e)}`);
     }

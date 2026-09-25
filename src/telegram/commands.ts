@@ -2,10 +2,11 @@
  * Command handlers — /start, /menu, /ping (plugins/commands.py) and
  * /status, /token (plugins/status.py).
  */
-import type { TelegramApi, TgMessage } from './api.js';
+import type { TelegramApi, TgMessage, InlineButton } from './api.js';
 import { btn, keyboard, ButtonStyle, sendSmartRichMessage, sendRichDraft } from './rich.js';
 import {
   BOT_START_TIME,
+  apiUrl,
   getReadableTime,
   menuContent,
   pingContent,
@@ -26,12 +27,12 @@ export function isGroupChat(chat: { type: string } | undefined): boolean {
 function startKeyboard() {
   return keyboard([
     [
-      btn('🔧 API Implementation', { callback_data: 'api_implementation', style: ButtonStyle.PRIMARY }),
+      btn('🚀 Quick Start', { callback_data: 'impl_quick_ref', style: ButtonStyle.PRIMARY }),
       btn('📊 Usage Status', { callback_data: 'usage_status', style: ButtonStyle.PRIMARY }),
     ],
     [
-      btn('🔄 Revoke Token', { callback_data: 'revoke_token', style: ButtonStyle.DANGER }),
-      btn('❓ Help', { callback_data: 'help' }),
+      btn('📖 API Docs', { callback_data: 'api_docs', style: ButtonStyle.PRIMARY }),
+      btn('❓ Help & Guide', { callback_data: 'help' }),
     ],
   ]);
 }
@@ -72,17 +73,7 @@ export async function cmdMenu(api: TelegramApi, msg: TgMessage): Promise<void> {
   await sendSmartRichMessage(api, msg.chat.id, content.html, {
     receiverUserId: receiverUid,
     fallbackHtml: content.fallback,
-    replyMarkup: keyboard([
-      [
-        btn('🔧 API Implementation', { callback_data: 'api_implementation', style: ButtonStyle.PRIMARY }),
-        btn('📊 Usage Status', { callback_data: 'usage_status', style: ButtonStyle.PRIMARY }),
-      ],
-      [
-        btn('🔄 Revoke Token', { callback_data: 'revoke_token', style: ButtonStyle.DANGER }),
-        btn('❓ Help', { callback_data: 'help' }),
-      ],
-      [btn('📖 API Docs', { callback_data: 'api_docs', style: ButtonStyle.PRIMARY })],
-    ]),
+    replyMarkup: startKeyboard(),
   });
 }
 
@@ -99,7 +90,9 @@ export async function cmdPing(api: TelegramApi, msg: TgMessage): Promise<void> {
   const uptime = getReadableTime((Date.now() - BOT_START_TIME) / 1000);
   const html = pingContent(elapsed, uptime);
 
-  await sendSmartRichMessage(api, chatId, html, { receiverUserId: receiverUid });
+  await sendSmartRichMessage(api, chatId, html, {
+    receiverUserId: receiverUid,
+  });
 }
 
 export async function cmdStatus(api: TelegramApi, msg: TgMessage): Promise<void> {
@@ -132,9 +125,8 @@ export async function cmdStatus(api: TelegramApi, msg: TgMessage): Promise<void>
     replyMarkup: keyboard([
       [
         btn('🔄 Refresh', { callback_data: 'usage_status', style: ButtonStyle.PRIMARY }),
-        btn('🔑 View Token', { callback_data: 'view_token', style: ButtonStyle.PRIMARY }),
+        btn('📱 Main Menu', { callback_data: 'back_menu' }),
       ],
-      [btn('📱 Main Menu', { callback_data: 'back_menu' })],
     ]),
   });
 }

@@ -297,7 +297,7 @@ export async function buildStats(
 </table>
 
 <details>
-  <summary>Error Details &amp; Failing Endpoints</summary>
+  <summary><b>Error Details &amp; Failing Endpoints</b></summary>
   <h3>By Status Code</h3>
   <table border="1">
     <tr><th>Status</th><th>Count</th></tr>
@@ -404,7 +404,7 @@ export function adminHelpCard(): string {
 </table>
 
 <details>
-  <summary>Command Examples</summary>
+  <summary><b>Command Examples</b></summary>
   <pre><code>/user 123456789
 /grant 123456789 500
 /revoke 123456789

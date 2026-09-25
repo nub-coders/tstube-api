@@ -8,6 +8,7 @@ import { extractArtist, formatInd } from './formatters.js';
 import { getLogger } from './logger.js';
 import { config } from './config.js';
 import { onCookiesUpdated } from './cookies.js';
+import { BoundedCache } from './boundedCache.js';
 
 (Platform.shim as any).eval = async (d: any) => new Function(d.output)();
 
@@ -16,6 +17,8 @@ const log = getLogger('ytube_api.innertube');
 const ID_RE = /(?:v=|\/shorts\/|youtu\.be\/|\/embed\/|\/v\/|\/live\/)([A-Za-z0-9_-]{11})/;
 const BARE_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 
+// INFO_CACHE: caches getBasicInfo results for 1 hour.
+const INFO_CACHE = new BoundedCache<any>(2048, 3600);
 type Json = Record<string, any>;
 
 export interface InnertubeStreamingData {
@@ -149,12 +152,16 @@ export function pickMuxed(sd: InnertubeStreamingData): string | null {
 }
 
 async function fetchInfo(vid: string): Promise<any | null> {
+  const cached = INFO_CACHE.get(vid);
+  if (cached !== undefined) return cached;
+
   const yt = await getInnertube();
   // Working client ladder: ANDROID first, then TV_SIMPLY, then MWEB
   for (const client of ['ANDROID', 'TV_SIMPLY', 'MWEB'] as const) {
     try {
       const info = await yt.getBasicInfo(vid, { client });
       if (info.playability_status?.status === 'OK') {
+        INFO_CACHE.set(vid, info);
         return info;
       }
       log.info(`[YTJS] ${vid} ${client} playability status: ${info.playability_status?.status} (${info.playability_status?.reason || 'no reason'})`);

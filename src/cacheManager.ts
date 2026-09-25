@@ -13,6 +13,8 @@ import { resolve as innertubeResolve } from './innertube.js';
 import { resolveG } from './ytdlp.js';
 import { redis } from './redis.js';
 import { getLogger } from './logger.js';
+import { detectProvider, resolveToPlayableStream } from './platformResolvers.js';
+import { fetchResults as scrapeSearch } from './searchService.js';
 
 const log = getLogger('ytube_api.Stream');
 
@@ -107,18 +109,58 @@ export async function invalidate(url: string, prefix = ''): Promise<void> {
   log.info(`[CACHE INVALIDATE] ${prefix}${url.slice(0, 80)}`);
 }
 
+export async function resolveTargetUrl(url: string): Promise<[string, boolean]> {
+  try {
+    const provider = detectProvider(url);
+    if (['apple_music', 'amazon_music', 'jiosaavn', 'soundcloud', 'spotify'].includes(provider)) {
+      const res = await resolveToPlayableStream(url);
+      if (res?.stream_url && provider === 'jiosaavn') {
+        return [res.stream_url, true];
+      }
+      if (provider === 'soundcloud') {
+        return [url, false];
+      }
+      if (res?.stream_url && (res.stream_url.includes('youtube.com') || res.stream_url.includes('youtu.be'))) {
+        return [res.stream_url, false];
+      }
+      const searchQuery = res?.search_query;
+      if (searchQuery) {
+        const searchRes = await scrapeSearch(searchQuery, 1);
+        const results = searchRes?.main_results ?? [];
+        if (results.length > 0 && results[0].url) {
+          return [results[0].url, false];
+        } else if (results.length > 0 && results[0].video_id) {
+          return [`https://www.youtube.com/watch?v=${results[0].video_id}`, false];
+        }
+        return [`ytsearch:${searchQuery}`, false];
+      }
+    }
+  } catch (e) {
+    log.warning(`[PLATFORM RESOLVE ERROR] ${url.slice(0, 80)}: ${String(e)}`);
+  }
+  return [url, false];
+}
+
 async function resolveUrl(
   url: string,
   kind: 'audio' | 'muxed',
   formatSelector: string,
   cookies: string | null,
 ): Promise<string | null> {
-  const streamUrl = await innertubeResolve(url, kind);
+  const streamUrl = await resolveG(url, formatSelector, cookies, 40, 'YT-DLP');
   if (streamUrl) {
-    log.info(`[INNERTUBE] ✅ ${kind} ${url.slice(0, 80)}`);
     return streamUrl;
   }
-  return resolveG(url, formatSelector, cookies, 40, 'YT-DLP');
+  try {
+    const itUrl = await innertubeResolve(url, kind);
+    if (itUrl) {
+      log.info(`[INNERTUBE] ✅ ${kind} ${url.slice(0, 80)}`);
+      return itUrl;
+    }
+  } catch (e) {
+    log.warning(`[INNERTUBE] Fallback failed: ${String(e)}`);
+  }
+  return null;
 }
 
 async function getStreamFor(
@@ -150,8 +192,9 @@ async function getStreamFor(
     return fileUrl;
   }
 
-  // 3. Resolve — Innertube first, yt-dlp fallback
-  const streamUrl = await resolveUrl(url, kind, formatSelector, cookies);
+  // 3. Resolve target & stream URL
+  const [targetUrl, isDirect] = await resolveTargetUrl(url);
+  const streamUrl = isDirect ? targetUrl : await resolveUrl(targetUrl, kind, formatSelector, cookies);
   if (streamUrl) {
     writeCache(url, streamUrl, prefix);
     const expire = extractExpire(streamUrl);
@@ -170,14 +213,14 @@ async function getStreamFor(
 }
 
 export function getStream(url: string, cookies: string | null = null): Promise<string | null> {
-  return getStreamFor(url, 'audio:', 'audio', '251/250/bestaudio[ext=m4a]/bestaudio', cookies);
+  return getStreamFor(url, 'audio:', 'audio', '251/250/140/bestaudio[ext=m4a]/bestaudio/best', cookies);
 }
 
 export function getVideoStream(
   url: string,
   cookies: string | null = null,
 ): Promise<string | null> {
-  return getStreamFor(url, 'video:', 'muxed', '22/18/best[ext=mp4]', cookies);
+  return getStreamFor(url, 'video:', 'muxed', 'best[ext=mp4]/22/18/best', cookies);
 }
 
 /** Test/ops hook to point the file cache at a temp dir. */

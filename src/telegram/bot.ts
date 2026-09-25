@@ -1,12 +1,12 @@
 /**
- * Bot entrypoint — port of bot.py's setup_bot_commands + Pyrogram plugin
- * dispatch, running on the raw Bot API long-polling loop.
+ * Bot entrypoint — grammY-powered Bot API 10.3 engine with custom emojis support.
  *
  * Handler registration mirrors the Python decorators: commands in
  * plugins/commands.py + status.py (any chat), and the private-only admin
  * commands from admin.py / broadcast.py.
  */
-import { TelegramApi, type TgMessage } from './api.js';
+import { Bot } from 'grammy';
+import { TelegramApi, type CallbackQuery, type TgMessage } from './api.js';
 import { BOT_COMMANDS, cmdMenu, cmdPing, cmdStart, cmdStatus, cmdToken } from './commands.js';
 import {
   cmdAdminHelp,
@@ -30,7 +30,7 @@ const REVOKE_ID_RE = /^\/revoke\s+\d+/;
 
 const PRIVATE_ONLY = new Set(['stats', 'listusers', 'adminhelp', 'errors', 'broadcast']);
 
-async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise<void> {
+export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise<void> {
   if (!msg.from || msg.from.is_bot) return;
   const text = msg.text ?? '';
   if (!text.startsWith('/')) return;
@@ -79,55 +79,46 @@ async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise<void> 
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /**
- * Start the bot's long-poll loop. Returns a function that stops it after the
- * in-flight update finishes.
+ * Start the bot's long-poll loop using grammY with Bot API 10.3.
+ * Returns a function that gracefully stops polling.
  */
 export async function startBot(cfg: Config): Promise<() => Promise<void>> {
   if (!cfg.BOT_TOKEN) throw new Error('BOT_TOKEN is required to start the bot');
 
-  const api = new TelegramApi(cfg.BOT_TOKEN);
-  await api.deleteWebhook();
-  await api.setMyCommands(BOT_COMMANDS);
-  const me = await api.getMe();
-  log.info(`[BOT] Started @${me.username ?? me.first_name} (${me.id})`);
+  const bot = new Bot(cfg.BOT_TOKEN);
+  const api = new TelegramApi(cfg.BOT_TOKEN, bot.api);
 
-  let running = true;
-  let offset: number | undefined;
+  await bot.api.deleteWebhook({ drop_pending_updates: false });
+  await bot.api.setMyCommands(BOT_COMMANDS);
+  const me = await bot.api.getMe();
+  log.info(`[BOT] Started @${me.username ?? me.first_name} (${me.id}) via grammY (Bot API 10.3)`);
 
-  const loop = async (): Promise<void> => {
-    while (running) {
-      try {
-        const updates = await api.getUpdates({
-          offset,
-          timeout: 30,
-          allowed_updates: ['message', 'callback_query'],
-        });
-        for (const update of updates) {
-          if (!running) break;
-          offset = update.update_id + 1;
-          try {
-            if (update.message) await dispatchMessage(api, update.message);
-            else if (update.callback_query) await handleCallback(api, update.callback_query);
-          } catch (e) {
-            log.error('[BOT] handler failed', { err: String(e) });
-          }
-        }
-      } catch (e) {
-        if (!running) break;
-        log.error('[BOT] getUpdates failed, retrying', { err: String(e) });
-        await sleep(2000);
-      }
+  bot.on('message:text', async (ctx) => {
+    try {
+      await dispatchMessage(api, ctx.message as unknown as TgMessage);
+    } catch (e) {
+      log.error('[BOT] message handler failed', { err: String(e) });
     }
-  };
+  });
 
-  void loop();
+  bot.on('callback_query:data', async (ctx) => {
+    try {
+      await handleCallback(api, ctx.callbackQuery as unknown as CallbackQuery);
+    } catch (e) {
+      log.error('[BOT] callback handler failed', { err: String(e) });
+    }
+  });
+
+  bot.catch((err) => {
+    log.error('[BOT] grammY error caught', { err: String(err.error) });
+  });
+
+  void bot.start({
+    allowed_updates: ['message', 'callback_query'],
+  });
 
   return async () => {
-    running = false;
+    await bot.stop();
   };
 }

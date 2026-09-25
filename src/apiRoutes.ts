@@ -85,6 +85,14 @@ export function root(): Result {
   return json(200, {
     name: 'ytube_api API',
     version: VERSION,
+    supported_platforms: [
+      'YouTube',
+      'Apple Music',
+      'Amazon Music',
+      'SoundCloud',
+      'JioSaavn',
+      'Spotify',
+    ],
     endpoints: {
       '/search': 'Search songs via scrape or YouTube Data API (FREE)',
       '/trending': 'Get trending music (FREE)',
@@ -300,15 +308,18 @@ export async function videoInfo(ctx: Ctx): Promise<Result> {
       const videoId = extractVideoIdFromUrl(q);
       const metadataTask = videoId ? getVideoById(videoId) : Promise.resolve(null);
       const relatedTask = videoId ? related(videoId, 5) : Promise.resolve([]);
+      const streamUrlTask = resolveStreamUrlForInfo(ctx, q);
 
-      const streamUrlValue = await resolveStreamUrlForInfo(ctx, q);
-      const metadataResult = await metadataTask;
+      const [streamUrlValue, metadataResult, suggestedRaw] = await Promise.all([
+        streamUrlTask, metadataTask, relatedTask,
+      ]);
+
       const info: Record<string, unknown> =
         metadataResult && typeof metadataResult === 'object'
           ? (metadataResult as Record<string, unknown>)
           : {};
 
-      let suggested = await relatedTask;
+      let suggested = suggestedRaw;
       if (!suggested.length && info.title) {
         try {
           const sData = await scrapeSearch(String(info.title), 5);

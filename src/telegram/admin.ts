@@ -188,7 +188,7 @@ const BROADCAST_HELP = `<h1>📢 Broadcast Command</h1>
 </table>
 
 <details>
-  <summary>Broadcast Instructions</summary>
+  <summary><b>Broadcast Instructions</b></summary>
   <p>1. Send or forward any text, photo, video, or document to this chat.<br/>
   2. Reply to that message with <code>/broadcast</code> or <code>/broadcast -f</code>.<br/>
   3. Real-time progress will stream via draft updates until delivery completes.</p>

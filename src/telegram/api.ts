@@ -8,6 +8,8 @@
  * keyboard instead of losing the interaction.
  */
 
+import { Api } from 'grammy';
+
 const API_BASE = 'https://api.telegram.org';
 
 export class BotApiError extends Error {
@@ -25,8 +27,14 @@ export interface InlineButton {
   text: string;
   callback_data?: string;
   url?: string;
+  copy_text?: { text: string };
   style?: 'primary' | 'success' | 'danger';
   disabled?: boolean;
+  icon_custom_emoji_id?: string;
+  /** Shorthand for `icon_custom_emoji_id` — pass a raw Telegram custom emoji document ID. */
+  emojiId?: string;
+  label?: string;
+  hint?: string;
 }
 
 export interface InlineKeyboardMarkup {
@@ -84,8 +92,11 @@ type Json = Record<string, unknown>;
 
 export class TelegramApi {
   private richUnsupported = false;
+  readonly grammyApi: Api;
 
-  constructor(private readonly token: string) {}
+  constructor(private readonly token: string, apiInstance?: Api) {
+    this.grammyApi = apiInstance ?? new Api(token);
+  }
 
   get baseUrl(): string {
     return `${API_BASE}/bot${this.token}`;

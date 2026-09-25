@@ -11,6 +11,17 @@ import { createRedis, closeRedis } from './redis.js';
 import { createAppServer, metricsHandler, rateLimitStatus, type Handler } from './httpServer.js';
 import * as routes from './apiRoutes.js';
 import { bootstrap as bootstrapCookies, startRefresh, stopRefresh } from './cookies.js';
+import { setDefaultResultOrder } from 'node:dns';
+import { getInnertube } from './innertube.js';
+import { fetchTrending } from './searchService.js';
+import { setGlobalDispatcher, Agent } from 'undici';
+
+// DNS: prefer IPv4 to avoid IPv6-to-timeout fallback stalls.
+setDefaultResultOrder('ipv4first');
+
+// Global HTTP keep-alive dispatcher for all fetch() calls.
+const dispatcher = new Agent({ keepAliveTimeout: 30000, keepAliveMaxTimeout: 600000 });
+setGlobalDispatcher(dispatcher);
 
 const log = getLogger('ytube_api.main');
 
@@ -56,6 +67,22 @@ async function main(): Promise<void> {
   server.listen(HTTP_PORT, HTTP_HOST, () => {
     log.info(`[STARTUP] HTTP API listening on http://${HTTP_HOST}:${HTTP_PORT}`);
   });
+
+  // Prefetch Innertube at startup to eliminate ~300ms cold-start on first request.
+  void (async () => {
+    try {
+      await getInnertube();
+      log.info('[STARTUP] Innertube pre-warmed');
+    } catch { /* first request will retry */ }
+  })();
+
+  // Pre-warm trending cache so the first /trending request is fast.
+  void (async () => {
+    try {
+      await fetchTrending(25);
+      log.info('[STARTUP] Trending pre-warmed');
+    } catch { /* best effort */ }
+  })();
 
   let stopBot: (() => Promise<void>) | null = null;
   if (cfg.BOT_TOKEN && cfg.START_BOT) {

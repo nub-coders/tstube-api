@@ -23,7 +23,7 @@ describe('rich content', () => {
     const { startNew } = await import('../telegram/content.js');
     const token = 'ABCDefghij';
     const c = startNew('Bob', token, true);
-    expect(c.html).toContain(`<code>${token}</code>`);
+    expect(c.html).toContain(`<tg-button type="copy_text" text="${token}"`);
     expect(c.fallback).toContain('<code>ABCD******</code>');
     expect(c.fallback).toContain('Group Chat Privacy Notice');
   });
@@ -31,7 +31,8 @@ describe('rich content', () => {
   it('escapes the username', async () => {
     const { startNew } = await import('../telegram/content.js');
     const c = startNew('a<b>&"c', 'tok1234567', false);
-    expect(c.html).toContain('Welcome to YT-DLP API, a&lt;b&gt;&amp;&quot;c!');
+    expect(c.html).toContain('a&lt;b&gt;&amp;&quot;c');
+    expect(c.html).toContain('NuB YT API');
   });
 
   it('renders the status progress bar and Indian-grouped counts', async () => {
@@ -53,12 +54,16 @@ describe('rich content', () => {
     const { buildMainMenuKeyboard } = await import('../telegram/callbackContent.js');
     const kb = buildMainMenuKeyboard();
     expect(kb.inline_keyboard.map((row) => row.map((b) => b.text))).toEqual([
-      ['🔧 API Implementation', '📊 Usage Status'],
-      ['🔄 Revoke Token', '❓ Help'],
-      ['📖 API Docs'],
+      ['Quick Start', 'Usage Status'],
+      ['API Docs', 'Help & Guide'],
     ]);
+    expect(kb.inline_keyboard[0]![0]!.icon_custom_emoji_id).toBeDefined();
+    expect(kb.inline_keyboard[0]![1]!.icon_custom_emoji_id).toBeDefined();
+    expect(kb.inline_keyboard[1]![0]!.icon_custom_emoji_id).toBeDefined();
+    expect(kb.inline_keyboard[1]![1]!.icon_custom_emoji_id).toBeDefined();
     expect(kb.inline_keyboard[0]![0]!.style).toBe('primary');
-    expect(kb.inline_keyboard[1]![0]!.style).toBe('danger');
+    expect(kb.inline_keyboard[0]![1]!.style).toBe('primary');
+    expect(kb.inline_keyboard[1]![0]!.style).toBe('primary');
     // Unstyled (ButtonStyle.DEFAULT) buttons omit `style` entirely.
     expect(kb.inline_keyboard[1]![1]!.style).toBeUndefined();
   });
@@ -66,9 +71,10 @@ describe('rich content', () => {
   it('renders every callback card without throwing and keeps key headers', async () => {
     const cb = await import('../telegram/callbackContent.js');
     expect(cb.apiDocs().html).toContain('<h1>API Documentation</h1>');
+    expect(cb.apiDocs().html).toContain('<summary><b>🎥 GET /info');
     expect(cb.apiInfoGet('T').html).toContain('&amp;q=https://youtube.com/watch?v=dQw4w9WgXcQ');
     expect(cb.help('T').html).toContain('params={"token": "T", "q": "VIDEO_URL"}');
-    expect(cb.backMenu().html).toContain('YT-DLP API Bot Menu');
+    expect(cb.backMenu().html).toContain('NuB YT API • Control Center');
     expect(cb.viewTokenGroup('T')).toContain('<code>T</code>');
   });
 

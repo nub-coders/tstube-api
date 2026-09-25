@@ -1,4 +1,4 @@
-# ytube-api (TypeScript)
+# tstube-api
 
 A TypeScript rewrite of the `ytube_api` FastAPI service + Telegram bot. The HTTP
 responses, status codes, JSON key order, error envelopes, rate limiting and the

@@ -36,6 +36,7 @@ describe('free endpoints', () => {
     expect(Object.keys(body)).toEqual([
       'name',
       'version',
+      'supported_platforms',
       'endpoints',
       'free_endpoints',
       'auth',
@@ -43,6 +44,14 @@ describe('free endpoints', () => {
     ]);
     expect(body.name).toBe('ytube_api API');
     expect(body.version).toBe('2026.3.12');
+    expect(body.supported_platforms).toEqual([
+      'YouTube',
+      'Apple Music',
+      'Amazon Music',
+      'SoundCloud',
+      'JioSaavn',
+      'Spotify',
+    ]);
     expect(Object.keys(body.endpoints as object)).toEqual([
       '/search',
       '/trending',

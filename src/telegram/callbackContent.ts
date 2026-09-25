@@ -2,7 +2,7 @@
  * Callback rich-UI content — verbatim port of the `@Client.on_callback_query()`
  * bodies in plugins/commands.py.
  */
-import { btn, keyboard, ButtonStyle, type InlineKeyboardMarkup } from './rich.js';
+import { btn, keyboard, ButtonStyle, escapeHtml, type InlineKeyboardMarkup } from './rich.js';
 import { apiUrl } from './content.js';
 import { comma } from '../pyTime.js';
 
@@ -19,7 +19,12 @@ export function viewTokenGroup(token: string): string {
 <table border="1">
   <tr><th>Bearer Token</th></tr>
   <tr><td><code>${token}</code></td></tr>
-</table>`;
+</table>
+
+<tg-button-row>
+  <tg-button type="copy_text" text="${escapeHtml(token)}" style="success">🔑 Copy API Key</tg-button>
+  <tg-button type="url" url="${apiUrl()}" style="primary">🌐 Open API Gateway</tg-button>
+</tg-button-row>`;
 }
 
 // ── api_implementation ──────────────────────────────────────────
@@ -35,8 +40,13 @@ export function apiImplementation(token: string): Card {
   <tr><td><b>Base URL</b></td><td><code>${apiUrl()}</code></td></tr>
 </table>
 
+<tg-button-row>
+  <tg-button type="copy_text" text="${escapeHtml(token)}" style="success">🔑 Copy Token</tg-button>
+  <tg-button type="url" url="${apiUrl()}" style="primary">🌐 Open API Gateway</tg-button>
+</tg-button-row>
+
 <details>
-  <summary>Authentication Tips</summary>
+  <summary><b>Authentication Tips</b></summary>
   <p>Tokens can be passed as query parameter (<code>?token=...</code>) or Bearer header (<code>Authorization: Bearer ...</code>).</p>
 </details>`,
     keyboard: keyboard([
@@ -80,7 +90,7 @@ export function usageCallback(
 </table>
 
 <details>
-  <summary>Rate Limiting Rules</summary>
+  <summary><b>Rate Limiting Rules</b></summary>
   <p>• Data endpoints (<code>/info</code>, <code>/stream</code>): ${comma(limit)} req/day<br/>
   • Search &amp; Discovery (<code>/search</code>, <code>/trending</code>): Unlimited</p>
 </details>`;
@@ -160,7 +170,7 @@ export function help(userToken: string): Card {
 </table>
 
 <details>
-  <summary>Python Quick Example</summary>
+  <summary><b>Python Quick Example</b></summary>
   <pre><code class="language-python">import requests
 res = requests.get(
     "${apiUrl('info')}",
@@ -258,7 +268,7 @@ export function implQuickRef(token: string): Card {
 </table>
 
 <details>
-  <summary>Python Quick One-Liner</summary>
+  <summary><b>Python Quick One-Liner</b></summary>
   <pre><code class="language-python">import requests
 data = requests.get("${apiUrl('info')}?token=${token}&amp;q=VIDEO_URL").json()</code></pre>
 </details>`,
@@ -273,25 +283,101 @@ data = requests.get("${apiUrl('info')}?token=${token}&amp;q=VIDEO_URL").json()</
 export function apiDocs(): Card {
   return {
     html: `<h1>API Documentation</h1>
-<blockquote>Interactive endpoint reference and schema descriptions.</blockquote>
+<blockquote>Interactive endpoint reference, request parameters, and schemas. Tap any endpoint below to expand:</blockquote>
 
 <table border="1">
   <tr><th>Feature</th><th>Specification</th></tr>
   <tr><td><b>Base URL</b></td><td><code>${apiUrl()}/</code></td></tr>
-  <tr><td><b>Authentication</b></td><td><code>?token=YOUR_TOKEN</code> or Bearer Header</td></tr>
-  <tr><td><b>Quota</b></td><td>1,000 calls/day (Data), Unlimited (Search)</td></tr>
+  <tr><td><b>Authentication</b></td><td><code>?token=YOUR_TOKEN</code> or <code>Authorization: Bearer</code></td></tr>
+  <tr><td><b>Daily Quota</b></td><td>1,000 calls/day (Data), Unlimited (Search &amp; Trending)</td></tr>
+  <tr><td><b>Burst Rate</b></td><td>10 req/s concurrency limit</td></tr>
 </table>
 
-<p>Select an endpoint below to inspect parameters and example payloads:</p>`,
+<tg-button-row>
+  <tg-button type="url" url="${apiUrl()}" style="primary">🌐 Open API Gateway</tg-button>
+  <tg-button type="url" url="${apiUrl('health')}" style="primary">🩺 System Health</tg-button>
+</tg-button-row>
+
+<details>
+  <summary><b>🎥 GET /info — Video Metadata &amp; Streams</b></summary>
+  <blockquote>Extract rich video metadata, available formats (1080p, 720p, 480p, 360p), audio tracks, and direct CDN URLs.</blockquote>
+  <table border="1">
+    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
+    <tr><td><code>q</code></td><td>string</td><td>Yes</td><td>Video URL (YouTube, TikTok, Bilibili) or search query</td></tr>
+    <tr><td><code>token</code></td><td>string</td><td>Yes*</td><td>Bearer token (*or Authorization header)</td></tr>
+    <tr><td><code>max_results</code></td><td>int</td><td>No</td><td>Search fallback count (default: 1)</td></tr>
+  </table>
+  <p><b>cURL:</b></p>
+  <pre><code class="language-bash">curl -s -H "Authorization: Bearer YOUR_TOKEN" "${apiUrl('info')}?q=https://youtu.be/dQw4w9WgXcQ"</code></pre>
+</details>
+
+<details>
+  <summary><b>⚡ GET /stream — Live Seekable Media Stream Pipe</b></summary>
+  <blockquote>Direct streaming proxy pipe supporting HTTP 206 Partial Content, Range headers, and chunked playback.</blockquote>
+  <table border="1">
+    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
+    <tr><td><code>q</code></td><td>string</td><td>Yes</td><td>Video URL to stream</td></tr>
+    <tr><td><code>token</code></td><td>string</td><td>Yes*</td><td>Bearer token (*or Authorization header)</td></tr>
+    <tr><td><code>format</code></td><td>string</td><td>No</td><td>Specific format code or audio/video selector</td></tr>
+  </table>
+  <p><b>cURL:</b></p>
+  <pre><code class="language-bash">curl -L -H "Authorization: Bearer YOUR_TOKEN" "${apiUrl('stream')}?q=https://youtu.be/dQw4w9WgXcQ" -o video.mp4</code></pre>
+</details>
+
+<details>
+  <summary><b>🔍 GET /search — Multi-Platform Search (Free &amp; Unmetered)</b></summary>
+  <blockquote>Fast query discovery with durations, thumbnails, views, and channel IDs. Unmetered (no quota consumed).</blockquote>
+  <table border="1">
+    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
+    <tr><td><code>q</code></td><td>string</td><td>Yes</td><td>Search query keywords</td></tr>
+    <tr><td><code>max_results</code></td><td>int</td><td>No</td><td>Results to return (1–20, default: 5)</td></tr>
+  </table>
+  <p><b>cURL:</b></p>
+  <pre><code class="language-bash">curl -s "${apiUrl('search')}?q=lofi+hip+hop&amp;max_results=5"</code></pre>
+</details>
+
+<details>
+  <summary><b>🔥 GET /trending — Regional Trending Feeds (Free)</b></summary>
+  <blockquote>Explore viral videos across countries and categories. Completely free and unmetered.</blockquote>
+  <table border="1">
+    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
+    <tr><td><code>region</code></td><td>string</td><td>No</td><td>ISO 3166-1 alpha-2 country code (default: US)</td></tr>
+    <tr><td><code>category</code></td><td>string</td><td>No</td><td>Category: default, music, gaming, movies</td></tr>
+  </table>
+  <p><b>cURL:</b></p>
+  <pre><code class="language-bash">curl -s "${apiUrl('trending')}?region=US"</code></pre>
+</details>
+
+<details>
+  <summary><b>🎼 GET /formats — Stream Format Matrix</b></summary>
+  <blockquote>List all available resolutions, video/audio codecs (h264, vp9, av01), and audio bitrates.</blockquote>
+  <table border="1">
+    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
+    <tr><td><code>q</code></td><td>string</td><td>Yes</td><td>Video URL to analyze</td></tr>
+    <tr><td><code>token</code></td><td>string</td><td>Yes*</td><td>Bearer token (*or Authorization header)</td></tr>
+  </table>
+  <p><b>cURL:</b></p>
+  <pre><code class="language-bash">curl -s -H "Authorization: Bearer YOUR_TOKEN" "${apiUrl('formats')}?q=https://youtu.be/dQw4w9WgXcQ"</code></pre>
+</details>
+
+<details>
+  <summary><b>📊 GET /rate-limit-status — Quota Telemetry</b></summary>
+  <blockquote>Check consumed quota, remaining daily requests, burst capacity, and midnight UTC reset time.</blockquote>
+  <table border="1">
+    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
+    <tr><td><code>token</code></td><td>string</td><td>Yes*</td><td>Bearer token (*or Authorization header)</td></tr>
+  </table>
+  <p><b>cURL:</b></p>
+  <pre><code class="language-bash">curl -s "${apiUrl('rate-limit-status')}?token=YOUR_TOKEN"</code></pre>
+</details>
+
+<details>
+  <summary><b>🩺 GET /health — Health Check Probe</b></summary>
+  <blockquote>High-availability health check endpoint returning HTTP 200 {"status": "ok"}.</blockquote>
+  <p><b>cURL:</b></p>
+  <pre><code class="language-bash">curl -s "${apiUrl('health')}"</code></pre>
+</details>`,
     keyboard: keyboard([
-      [
-        btn('🎥 Video Info', { callback_data: 'api_info', style: ButtonStyle.PRIMARY }),
-        btn('🔍 Search', { callback_data: 'api_search', style: ButtonStyle.PRIMARY }),
-      ],
-      [
-        btn('📊 Rate Limit', { callback_data: 'api_ratelimit', style: ButtonStyle.PRIMARY }),
-        btn('❤️ Health Check', { callback_data: 'api_health', style: ButtonStyle.PRIMARY }),
-      ],
       [btn('🔙 Back to Menu', { callback_data: 'back_menu' })],
     ]),
   };
@@ -570,12 +656,12 @@ print("Online:" if is_api_online() else "Offline")</code></pre>`,
 export function implPythonPart2(): Card {
   return {
     html: `<h1>Python Implementation (Part 2)</h1>
-<blockquote>Production-ready <code>YtubeAPIClient</code> wrapper with connection pooling.</blockquote>
+<blockquote>Production-ready <code>NubYtApiClient</code> wrapper with connection pooling.</blockquote>
 
 <pre><code class="language-python">import requests
 from typing import Dict, List
 
-class YtubeAPIClient:
+class NubYtApiClient:
     def __init__(self, token: str, base_url: str = "${apiUrl()}"):
         self.token = token
         self.base_url = base_url.rstrip("/")
@@ -617,7 +703,7 @@ export function implPythonExamples(token: string): Card {
     html: `<h1>Python Usage Examples</h1>
 <blockquote>Calling client methods for search, info, and quota checks.</blockquote>
 
-<pre><code class="language-python">client = YtubeAPIClient("${token}")
+<pre><code class="language-python">client = NubYtApiClient("${token}")
 
 # 1. Search videos
 videos = client.search("python fast api", max_results=3)
@@ -648,7 +734,7 @@ export function implPythonAdvanced(): Card {
 
 <pre><code class="language-python">import time
 
-def process_batch(client: YtubeAPIClient, urls: list[str]):
+def process_batch(client: NubYtApiClient, urls: list[str]):
     results = []
     for i, url in enumerate(urls, 1):
         try:
@@ -680,7 +766,7 @@ export function implPythonErrors(): Card {
 <pre><code class="language-python">import requests
 import time
 
-def safe_get_video(client: YtubeAPIClient, url: str, retries: int = 3):
+def safe_get_video(client: NubYtApiClient, url: str, retries: int = 3):
     for attempt in range(retries):
         try:
             return client.get_info(url)
@@ -707,15 +793,21 @@ def safe_get_video(client: YtubeAPIClient, url: str, retries: int = 3):
 
 export function backMenu(): Card {
   return {
-    html: `<h1>YT-DLP API Bot Menu</h1>
-<blockquote>Choose an option below to manage your token, inspect usage metrics, or view endpoint documentation.</blockquote>
+    html: `<h1>⚡ NuB YT API • Control Center</h1>
+<blockquote>Choose an option below to inspect usage metrics, test endpoints, or view documentation.</blockquote>
 
 <table border="1">
-  <tr><th>Feature</th><th>Description</th></tr>
-  <tr><td><b>Implementation</b></td><td>Code examples (cURL, Python, GET)</td></tr>
-  <tr><td><b>Usage Status</b></td><td>Live quota tracking &amp; reset timers</td></tr>
-  <tr><td><b>Documentation</b></td><td>Endpoint parameters &amp; responses</td></tr>
-</table>`,
+  <tr><th>🚀 Service</th><th>📖 Capabilities</th></tr>
+  <tr><td><b>🎥 Video Extraction</b></td><td>Direct mp4/webm streams, resolutions &amp; audio</td></tr>
+  <tr><td><b>🔍 YouTube Search</b></td><td>Instant query search with duration &amp; thumbnails</td></tr>
+  <tr><td><b>📊 Quota Dashboard</b></td><td>Real-time request metrics &amp; quota status</td></tr>
+  <tr><td><b>🔑 Key Management</b></td><td>View or cycle your authorization token</td></tr>
+</table>
+
+<tg-button-row>
+  <tg-button type="url" url="${apiUrl()}" style="primary">🌐 Open API Gateway</tg-button>
+  <tg-button type="url" url="${apiUrl('health')}" style="primary">🩺 System Health</tg-button>
+</tg-button-row>`,
     keyboard: buildMainMenuKeyboard(),
   };
 }
@@ -723,13 +815,12 @@ export function backMenu(): Card {
 export function buildMainMenuKeyboard(): InlineKeyboardMarkup {
   return keyboard([
     [
-      btn('🔧 API Implementation', { callback_data: 'api_implementation', style: ButtonStyle.PRIMARY }),
+      btn('🚀 Quick Start', { callback_data: 'impl_quick_ref', style: ButtonStyle.PRIMARY }),
       btn('📊 Usage Status', { callback_data: 'usage_status', style: ButtonStyle.PRIMARY }),
     ],
     [
-      btn('🔄 Revoke Token', { callback_data: 'revoke_token', style: ButtonStyle.DANGER }),
-      btn('❓ Help', { callback_data: 'help' }),
+      btn('📖 API Docs', { callback_data: 'api_docs', style: ButtonStyle.PRIMARY }),
+      btn('❓ Help & Guide', { callback_data: 'help' }),
     ],
-    [btn('📖 API Docs', { callback_data: 'api_docs', style: ButtonStyle.PRIMARY })],
   ]);
 }

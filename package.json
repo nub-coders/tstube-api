@@ -1,5 +1,5 @@
 {
-  "name": "gotube-api",
+  "name": "tstube-api",
   "version": "2026.3.12",
   "private": true,
   "type": "module",
@@ -16,7 +16,9 @@
     "test:watch": "vitest"
   },
   "dependencies": {
+    "grammy": "^1.46.0",
     "ioredis": "^5.4.1",
+    "undici": "^8.10.2",
     "youtubei.js": "18.0.0"
   },
   "devDependencies": {
