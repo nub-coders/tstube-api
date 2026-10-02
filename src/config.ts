@@ -74,12 +74,20 @@ export interface Config {
   // ── API Rate Limits ──────────────────────────────────────────
   DAILY_LIMIT: number;
   ADMIN_LIMIT: number;
+  ADMIN_API_KEY: string | null;
 
-  // ── Cookies ──────────────────────────────────────────────────
+  // ── Cookies & MongoDB Cookie Pool ────────────────────────────
   COOKIES_FILE: string;
+  COOKIES_TEXT: string | null;
   COOKIES_BROWSER: string;
   COOKIES_BOOTSTRAP_URL: string;
   COOKIES_REFRESH_HOURS: number;
+  MONGODB_URI: string | null;
+  MONGODB_DB: string;
+  MONGODB_COOKIES_COLLECTION: string;
+  COOKIE_SYNC_INTERVAL_SEC: number;
+  COOKIE_PROBE_INTERVAL_SEC: number;
+  COOKIE_PROBE_DELAY_MS: number;
 
   // ── Deployment ───────────────────────────────────────────────
   API_HOST: string;
@@ -133,18 +141,26 @@ export function loadConfig(): Config {
   let redisPort = getint('REDIS_PORT', 15440);
   let redisUsername = getenv('REDIS_USERNAME', 'default');
   let redisPassword = process.env.REDIS_PASSWORD || null;
-  const redisUrl = process.env.REDIS_URL || null;
+  let redisUrl = process.env.REDIS_URL || null;
 
   if (redisUrl) {
     try {
       const fixedUrl = redisUrl.replace(/^edis:\/\//, 'redis://');
-      const parsed = new URL(fixedUrl.startsWith('redis://') || fixedUrl.startsWith('rediss://') ? fixedUrl : `redis://${fixedUrl}`);
-      if (parsed.hostname) redisHost = parsed.hostname;
-      if (parsed.port) redisPort = Number.parseInt(parsed.port, 10);
-      if (parsed.username) redisUsername = decodeURIComponent(parsed.username);
-      if (parsed.password) redisPassword = decodeURIComponent(parsed.password);
+      const parsed = new URL(fixedUrl.includes('://') ? fixedUrl : `redis://${fixedUrl}`);
+      if (!['redis:', 'rediss:'].includes(parsed.protocol) || !parsed.hostname ||
+          (parsed.pathname && parsed.pathname !== '/' && !/^\/\d+$/.test(parsed.pathname))) {
+        throw new Error('invalid Redis URL');
+      }
+      // A URL is a complete connection definition; discrete values only apply
+      // when no URL is configured. Pass it intact to ioredis for TLS and DB.
+      redisUrl = parsed.toString();
+      redisHost = parsed.hostname;
+      redisPort = parsed.port ? Number.parseInt(parsed.port, 10) : 6379;
+      redisUsername = decodeURIComponent(parsed.username);
+      redisPassword = parsed.password ? decodeURIComponent(parsed.password) : null;
     } catch {
-      /* fallback to discrete env vars */
+      // Do not include the URL: it may contain a password.
+      throw new Error('REDIS_URL must be a valid redis:// or rediss:// connection URL');
     }
   }
 
@@ -168,14 +184,23 @@ export function loadConfig(): Config {
 
     DAILY_LIMIT: getint('DAILY_LIMIT', 1000),
     ADMIN_LIMIT: getint('ADMIN_LIMIT', 10000),
+    ADMIN_API_KEY: process.env.ADMIN_API_KEY || null,
 
     COOKIES_FILE: getenv('COOKIES_FILE', 'cookies.txt'),
+    COOKIES_TEXT: process.env.COOKIES_TEXT || process.env.YOUTUBE_COOKIES || process.env.COOKIES || null,
     COOKIES_BROWSER: getenv('COOKIES_BROWSER', 'firefox'),
     COOKIES_BOOTSTRAP_URL: getenv(
       'COOKIES_BOOTSTRAP_URL',
       'https://www.youtube.com',
     ),
     COOKIES_REFRESH_HOURS: cookiesRefresh,
+
+    MONGODB_URI: process.env.MONGODB_URI || process.env.MONGO_URL || null,
+    MONGODB_DB: getenv('MONGODB_DB', 'tstube'),
+    MONGODB_COOKIES_COLLECTION: getenv('MONGODB_COOKIES_COLLECTION', 'youtube_cookies'),
+    COOKIE_SYNC_INTERVAL_SEC: getint('COOKIE_SYNC_INTERVAL_SEC', 300),
+    COOKIE_PROBE_INTERVAL_SEC: getint('COOKIE_PROBE_INTERVAL_SEC', 900),
+    COOKIE_PROBE_DELAY_MS: getint('COOKIE_PROBE_DELAY_MS', 3000),
 
     API_HOST: apiHost,
     BASE_URL: getenv('BASE_URL', `https://${apiHost}`).replace(/\/+$/, ''),

@@ -23,17 +23,15 @@ import {
 } from './tools.js';
 import { argsFor, validateQuery, paramsFor, type QueryValues, type ValidationDetail } from './routeArgs.js';
 import { HttpError } from './httpError.js';
-import { BoundedCache } from './boundedCache.js';
+import { nextUtcMidnightEpoch } from './quota.js';
 
 const log = getLogger('ytube_api.http');
-
-/** Short-lived in-process token→userId cache to avoid a Redis round-trip per request. */
-const AUTH_CACHE = new BoundedCache<number>(1024, 2);
 
 const ASSET_DIR = join(dirname(fileURLToPath(import.meta.url)), 'assets');
 
 const FREE_PATHS = new Set([
   '/',
+  '/upload.sh',
   '/search',
   '/trending',
   '/suggest',
@@ -112,6 +110,8 @@ export interface Ctx {
   /** Parsed query values (populated by `requireArgs`). */
   values: QueryValues;
   method: string;
+  /** Aborted when the client disconnects, including while awaiting upstream headers. */
+  signal?: AbortSignal;
 }
 
 export type Handler = (ctx: Ctx) => Promise<Result> | Result;
@@ -127,14 +127,14 @@ interface Route {
 export class Router {
   private routes: Route[] = [];
 
-  get(template: string, handler: Handler): void {
+  add(method: string, template: string, handler: Handler): void {
     const keys: string[] = [];
     const pattern = template.replace(/\{([^}]+)\}/g, (_m, name: string) => {
       keys.push(name);
       return '([^/]+)';
     });
     this.routes.push({
-      method: 'GET',
+      method: method.toUpperCase(),
       template,
       regex: new RegExp(`^${pattern}$`),
       keys,
@@ -142,16 +142,28 @@ export class Router {
     });
   }
 
+  get(template: string, handler: Handler): void {
+    this.add('GET', template, handler);
+  }
+
+  post(template: string, handler: Handler): void {
+    this.add('POST', template, handler);
+  }
+
   /** Match path; HEAD falls back to the GET route (Starlette auto-adds HEAD). */
   match(method: string, pathname: string): { route: Route; params: Record<string, string> } | null {
-    const want = method === 'HEAD' ? 'GET' : method;
+    const want = method === 'HEAD' ? 'GET' : method.toUpperCase();
     for (const route of this.routes) {
       if (route.method !== want) continue;
       const m = route.regex.exec(pathname);
       if (!m) continue;
       const params: Record<string, string> = {};
       route.keys.forEach((k, i) => {
-        params[k] = decodeURIComponent(m[i + 1] ?? '');
+        try {
+          params[k] = decodeURIComponent(m[i + 1] ?? '');
+        } catch {
+          throw new HttpError(400, { error: 'Invalid path encoding' });
+        }
       });
       return { route, params };
     }
@@ -186,6 +198,100 @@ export function requireToken(ctx: Ctx): number {
     });
   }
   return ctx.authUserId;
+}
+
+/**
+ * Check if the caller is an authenticated administrator.
+ * Supports either ADMIN_API_KEY from Authorization: Bearer <key>
+ * or an admin Telegram user token.
+ */
+export function isCallerAdmin(ctx: Ctx): boolean {
+  try {
+    const cfg = config();
+    if (cfg.ADMIN_API_KEY && ctx.token && ctx.token === cfg.ADMIN_API_KEY) {
+      return true;
+    }
+    if (ctx.authUserId !== null && ctx.authUserId !== undefined && isAdmin(ctx.authUserId)) {
+      return true;
+    }
+  } catch {
+    /* config not loaded in isolated tests */
+  }
+  return false;
+}
+
+/**
+ * Require admin privileges. Throws 401 if unauthenticated, 403 if unauthorized.
+ */
+export function requireAdmin(ctx: Ctx): void {
+  if (!ctx.token && ctx.authUserId === null) {
+    throw new HttpError(401, {
+      error: 'Token required',
+      message: "Admin authorization required. Provide token via 'Authorization: Bearer <token>'",
+    });
+  }
+  if (!isCallerAdmin(ctx)) {
+    throw new HttpError(403, {
+      error: 'Forbidden',
+      message: 'Admin privileges required for this endpoint.',
+    });
+  }
+}
+
+/**
+ * Read and parse JSON request body with a size limit guard (default 5MB)
+ * to prevent denial of service (DoS) and buffer overflow vulnerabilities.
+ */
+export async function readJsonBody<T = unknown>(ctx: Ctx, maxBytes = 5 * 1024 * 1024): Promise<T> {
+  const req = ctx.req;
+  return new Promise<T>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let received = 0;
+
+    const cleanup = () => {
+      req.off('data', onData);
+      req.off('end', onEnd);
+      req.off('error', onError);
+    };
+
+    const onData = (chunk: Buffer) => {
+      received += chunk.length;
+      if (received > maxBytes) {
+        cleanup();
+        reject(
+          new HttpError(413, {
+            error: 'Payload Too Large',
+            message: `Body exceeds limit of ${maxBytes} bytes`,
+          }),
+        );
+      } else {
+        chunks.push(chunk);
+      }
+    };
+
+    const onEnd = () => {
+      cleanup();
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (!raw.trim()) {
+          resolve({} as T);
+          return;
+        }
+        resolve(JSON.parse(raw) as T);
+      } catch {
+        reject(new HttpError(400, { error: 'Invalid JSON body' }));
+      }
+    };
+
+    const onError = (err: Error) => {
+      cleanup();
+      reject(new HttpError(400, { error: 'Request body read error', details: err.message }));
+    };
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+  });
 }
 
 /**
@@ -230,6 +336,14 @@ function writeResult(res: ServerResponse, result: Result, headOnly: boolean): vo
     headers['content-type'] = result.contentType;
   }
   if (result.stream) {
+    const bodyStream = result.stream;
+    const stop = () => bodyStream.destroy();
+    res.once('close', stop);
+    bodyStream.once('close', () => res.off('close', stop));
+    if (res.destroyed) {
+      bodyStream.destroy();
+      return;
+    }
     res.writeHead(result.status, headers);
     if (headOnly) {
       result.stream.destroy();
@@ -268,78 +382,106 @@ function extractError(body: Buffer): string {
   }
 }
 
-/** Epoch seconds of the next local midnight (matches datetime.combine on today()).
- */
-function localMidnightEpoch(): number {
-  const d = new Date();
-  d.setDate(d.getDate() + 1);
-  d.setHours(0, 0, 0, 0);
-  return Math.floor(d.getTime() / 1000);
-}
-
-// ── Server ──────────────────────────────────────────────────────
+export type RouteSpec =
+  | [template: string, handler: Handler]
+  | [method: string, template: string, handler: Handler];
 
 export interface ServerDeps {
-  routes: Array<[string, Handler]>;
+  routes: RouteSpec[];
 }
 
 export function createAppServer(deps: ServerDeps): http.Server {
   const router = new Router();
-  for (const [template, handler] of deps.routes) router.get(template, handler);
+  for (const entry of deps.routes) {
+    if (entry.length === 2) {
+      router.get(entry[0], entry[1]);
+    } else {
+      router.add(entry[0], entry[1], entry[2]);
+    }
+  }
 
   return http.createServer((req, res) => {
-    void handle(req, res, router);
+    void handle(req, res, router).catch((error) => {
+      log.error('[HTTP] request failed outside response handler', { err: String(error) });
+      try {
+        if (!res.headersSent && !res.destroyed) {
+          writeResult(res, json(500, { error: 'Internal Server Error' }), req.method === 'HEAD');
+        } else {
+          res.destroy();
+        }
+      } catch {
+        res.destroy();
+      }
+    });
   });
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse, router: Router): Promise<void> {
   const started = Date.now();
   const method = req.method ?? 'GET';
-  let pathname: string;
-  let url: URL;
-  try {
-    url = new URL(req.url ?? '/', 'http://localhost');
-    pathname = url.pathname;
-  } catch {
-    pathname = '/';
-    url = new URL('http://localhost/');
-  }
-
-  const matched = router.match(method, pathname);
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  req.once('aborted', abort);
+  res.once('close', () => {
+    req.off('aborted', abort);
+    abort();
+  });
+  const url = new URL('http://localhost/');
+  let metricPath = 'unmatched';
   const ctx: Ctx = {
     req,
     url,
-    pathname,
-    params: matched?.params ?? {},
-    routePath: matched?.route.template ?? pathname,
-    matched: matched !== null,
+    pathname: '/',
+    params: {},
+    routePath: '/',
+    matched: false,
     query: url.searchParams,
     token: null,
     authUserId: null,
     values: {},
     method,
+    signal: controller.signal,
   };
-  ctx.token = tokenFromRequest(ctx);
 
   let result: Result;
   try {
+    try {
+      ctx.url = new URL(req.url ?? '/', 'http://localhost');
+    } catch {
+      throw new HttpError(400, { error: 'Invalid request URL' });
+    }
+    ctx.pathname = ctx.url.pathname;
+    ctx.query = ctx.url.searchParams;
+    const matched = router.match(method, ctx.pathname);
+    ctx.params = matched?.params ?? {};
+    ctx.routePath = matched?.route.template ?? ctx.pathname;
+    ctx.matched = matched !== null;
+    ctx.token = tokenFromRequest(ctx);
+    metricPath = matched?.route.template ?? 'unmatched';
     result = await runPipeline(ctx, router, matched);
   } catch (e) {
     if (e instanceof HttpError) {
       result = json(e.status, e.payload);
     } else {
-      log.error(`[HTTP] unhandled error for ${method} ${pathname}`, { err: String(e) });
+      log.error(`[HTTP] unhandled error for ${method} ${ctx.pathname}`, { err: String(e) });
       result = json(500, { error: String(e) });
     }
   }
 
   const duration = (Date.now() - started) / 1000;
-  metrics.record(method, ctx.routePath, result.status, duration);
+  // Only registered templates reach metric labels; never arbitrary request paths.
+  metrics.record(method, metricPath, result.status, duration);
+
+  if (res.destroyed) {
+    result.stream?.destroy();
+    return;
+  }
 
   try {
     writeResult(res, result, method === 'HEAD');
   } catch (e) {
-    log.error(`[HTTP] failed to write response for ${method} ${pathname}`, { err: String(e) });
+    result.stream?.destroy();
+    log.error(`[HTTP] failed to write response for ${method} ${ctx.pathname}`, { err: String(e) });
     try {
       res.destroy();
     } catch {
@@ -359,13 +501,16 @@ async function runPipeline(
 
   // ── RateLimitMiddleware ──
   if (ctx.token) {
-    const cached = AUTH_CACHE.get(ctx.token);
-    if (cached !== undefined) {
-      ctx.authUserId = cached;
-    } else {
-      ctx.authUserId = await getUserByToken(ctx.token);
-      if (ctx.authUserId) {
-        AUTH_CACHE.set(ctx.token, ctx.authUserId);
+    // Revocations and legacy orphan cleanup take effect on the next request.
+    ctx.authUserId = await getUserByToken(ctx.token);
+    if (!ctx.authUserId) {
+      try {
+        const cfg = config();
+        if (cfg.ADMIN_API_KEY && ctx.token === cfg.ADMIN_API_KEY) {
+          ctx.authUserId = cfg.ADMIN_IDS[0] ?? -1;
+        }
+      } catch {
+        /* config not loaded in isolated tests */
       }
     }
   }
@@ -380,11 +525,16 @@ async function runPipeline(
     });
   }
 
-  const cfg = config();
-  const userLimit = isAdmin(ctx.authUserId) ? cfg.ADMIN_LIMIT : cfg.DAILY_LIMIT;
+  let userLimit = 1000;
+  try {
+    const cfg = config();
+    userLimit = isCallerAdmin(ctx) ? cfg.ADMIN_LIMIT : cfg.DAILY_LIMIT;
+  } catch {
+    /* fallback to default */
+  }
 
   // Increment optimistically; only reject if we've now gone over.
-  const newCount = await incrementUserRequests(ctx.authUserId);
+  const newCount = ctx.authUserId > 0 ? await incrementUserRequests(ctx.authUserId) : 1;
   if (newCount > userLimit) {
     return json(429, {
       error: 'Daily limit exceeded',
@@ -409,7 +559,7 @@ async function runPipeline(
   const remaining = Math.max(0, userLimit - newCount);
   result.headers['X-RateLimit-Limit'] = String(userLimit);
   result.headers['X-RateLimit-Remaining'] = String(remaining);
-  result.headers['X-RateLimit-Reset'] = String(localMidnightEpoch());
+  result.headers['X-RateLimit-Reset'] = String(nextUtcMidnightEpoch());
   return result;
 }
 

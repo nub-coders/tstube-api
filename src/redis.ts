@@ -8,10 +8,6 @@ let client: Redis | null = null;
 
 export function createRedis(cfg: Config): Redis {
   const options = {
-    host: cfg.REDIS_HOST,
-    port: cfg.REDIS_PORT,
-    username: cfg.REDIS_USERNAME || undefined,
-    password: cfg.REDIS_PASSWORD || undefined,
     lazyConnect: false,
     // Finite so a dead Redis rejects commands (caught per-call) instead of
     // queueing them forever. We use no blocking commands, so ioredis does not
@@ -22,7 +18,15 @@ export function createRedis(cfg: Config): Redis {
     commandTimeout: 10_000,
     retryStrategy: (times: number) => Math.min(times * 200, 3_000),
   };
-  client = new Redis(options);
+  client = cfg.REDIS_URL
+    ? new Redis(cfg.REDIS_URL, options)
+    : new Redis({
+        ...options,
+        host: cfg.REDIS_HOST,
+        port: cfg.REDIS_PORT,
+        username: cfg.REDIS_USERNAME || undefined,
+        password: cfg.REDIS_PASSWORD || undefined,
+      });
 
   // ioredis emits 'error' for transient connection issues; without a listener
   // Node treats it as an unhandled error and crashes the process.

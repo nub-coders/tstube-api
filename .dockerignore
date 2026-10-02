@@ -2,6 +2,9 @@
 # important one: `COPY . .` would otherwise bake API_HASH, BOT_TOKEN and
 # REDIS_PASSWORD into a layer.
 .env
+.env.*
+**/*cookies*.txt*
+**/.cache/
 *.session
 cache*.db
 
@@ -16,8 +19,10 @@ node_modules/
 bin/
 dist/
 coverage/
+cf-worker-test/
 
 Dockerfile
 docker-compose.yml
+docker-compose.*.yml
 .dockerignore
 README.md

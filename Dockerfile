@@ -47,7 +47,7 @@ WORKDIR /app
 COPY --from=build /src/package.json ./package.json
 COPY --from=build /src/node_modules ./node_modules
 COPY --from=build /src/dist ./dist
-COPY cookies.txt* ./
+COPY --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/tstube-entrypoint
 
 # Non-root: the process writes COOKIES_FILE and yt-dlp's cache into its home.
 RUN useradd --create-home --shell /usr/sbin/nologin app \
@@ -64,4 +64,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
 # API and bot are one process: START_BOT decides which halves run. Configure by
 # env (see .env.example). A missing BOT_TOKEN leaves the process serving the API
 # standalone rather than exiting.
+ENTRYPOINT ["tstube-entrypoint"]
 CMD ["node", "dist/index.js"]

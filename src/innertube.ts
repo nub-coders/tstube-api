@@ -9,6 +9,7 @@ import { getLogger } from './logger.js';
 import { config } from './config.js';
 import { onCookiesUpdated } from './cookies.js';
 import { BoundedCache } from './boundedCache.js';
+import { cookiePool } from './cookiePool.js';
 
 (Platform.shim as any).eval = async (d: any) => new Function(d.output)();
 
@@ -56,20 +57,124 @@ export function extractId(value: string): string | null {
   return BARE_ID_RE.test(v) ? v : null;
 }
 
-function parseCookieFile(path: string): string | null {
-  if (!path || !existsSync(path)) return null;
-  try {
-    const raw = readFileSync(path, 'utf8');
+/**
+ * Parse cookies from any format:
+ * - Netscape tab-separated text (cookies.txt format)
+ * - Semicolon-separated HTTP cookie header ('SID=xxx; HSID=yyy')
+ * - Line-separated 'key=value' pairs
+ * - Base64 encoded version of any of the above
+ */
+export function parseCookies(input: string | null | undefined): string | null {
+  if (!input || typeof input !== 'string') return null;
+  let text = input.trim();
+  if (!text) return null;
+
+  // Handle base64 encoded input
+  if (!text.includes('\t') && !text.includes('\n') && /^[A-Za-z0-9+/=]+$/.test(text) && text.length > 50) {
+    try {
+      const decoded = Buffer.from(text, 'base64').toString('utf8');
+      if (decoded.includes('=') || decoded.includes('\t')) {
+        text = decoded.trim();
+      }
+    } catch {
+      /* not base64 */
+    }
+  }
+
+  // Netscape tab-separated format
+  if (text.includes('\t')) {
     const cookies: string[] = [];
-    for (const line of raw.split('\n')) {
+    const seen = new Set<string>();
+    for (const line of text.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) continue;
       const parts = line.split('\t');
       if (parts.length >= 7) {
-        cookies.push(`${parts[5]}=${parts[6]!.trim()}`);
+        const domain = parts[0]!.trim().toLowerCase();
+        if (domain !== '.youtube.com' && domain !== 'youtube.com' && !domain.endsWith('.youtube.com')) {
+          continue;
+        }
+        const name = parts[5]!.trim();
+        const value = parts[6]!.trim();
+        if (name && !seen.has(name)) {
+          seen.add(name);
+          cookies.push(`${name}=${value}`);
+        }
       }
     }
     return cookies.length ? cookies.join('; ') : null;
+  }
+
+  // Semicolon or newline-separated key=value pairs
+  if (text.includes('=')) {
+    const items = text
+      .split(/[;\r\n]+/)
+      .map((s) => s.trim())
+      .filter((s) => s && s.includes('=') && !s.startsWith('#'));
+    return items.length ? items.join('; ') : null;
+  }
+
+  return null;
+}
+
+/**
+ * Strip non-YouTube domains from Netscape cookie format.
+ * Guarantees that accounts.google.com and external domains are discarded.
+ */
+export function sanitizeNetscapeCookies(text: string): string {
+  const lines = text.split(/\r?\n/);
+  const out: string[] = ['# Netscape HTTP Cookie File'];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const parts = line.split('\t');
+    if (parts.length >= 7) {
+      const domain = parts[0]!.trim().toLowerCase();
+      if (domain === '.youtube.com' || domain === 'youtube.com' || domain.endsWith('.youtube.com')) {
+        out.push(line);
+      }
+    }
+  }
+  return out.join('\n');
+}
+
+/**
+ * Check if critical YouTube session cookies in a Netscape jar have expired by timestamp.
+ */
+export function isCookieExpired(text: string): { expired: boolean; reason?: string; expiresAt?: Date } {
+  if (!text || !text.includes('\t')) return { expired: false };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const lines = text.split(/\r?\n/);
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const parts = line.split('\t');
+    if (parts.length >= 7) {
+      const name = parts[5]!.trim();
+      const exp = Number(parts[4]);
+      // Check YouTube session and authentication cookies
+      if (/^(SAPISID|LOGIN_INFO|__Secure-[13]PSID|SID)$/i.test(name)) {
+        if (!Number.isNaN(exp) && exp > 0 && exp < nowSec) {
+          const expiresAt = new Date(exp * 1000);
+          return {
+            expired: true,
+            reason: `Cookie "${name}" expired on ${expiresAt.toISOString()}`,
+            expiresAt,
+          };
+        }
+      }
+    }
+  }
+
+  return { expired: false };
+}
+
+export function parseCookieFile(path: string): string | null {
+  if (!path || !existsSync(path)) return null;
+  try {
+    return parseCookies(readFileSync(path, 'utf8'));
   } catch (e) {
     log.warning(`[YTJS] Failed reading cookies from ${path}`, { err: String(e) });
     return null;
@@ -87,18 +192,45 @@ export function resetInnertube(): void {
   ytPromise = null;
 }
 
-export async function getInnertube(): Promise<Innertube> {
+const INNERTUBE_POOL = new BoundedCache<Innertube>(100, 3600);
+
+export async function getInnertube(customCookies?: string | null): Promise<Innertube> {
+  if (customCookies) {
+    const cookieStr = parseCookies(customCookies);
+    if (!cookieStr) {
+      return getInnertube();
+    }
+    const cached = INNERTUBE_POOL.get(cookieStr);
+    if (cached) return cached;
+
+    const instance = await Innertube.create({ cookie: cookieStr });
+    INNERTUBE_POOL.set(cookieStr, instance);
+    return instance;
+  }
+
   if (!ytPromise) {
     ytPromise = (async () => {
       let cookieStr: string | null = null;
       try {
+        let text: string | null | undefined;
         let cPath: string | undefined;
         try {
-          cPath = config().COOKIES_FILE;
+          const cfg = config();
+          text = cfg.COOKIES_TEXT;
+          cPath = cfg.COOKIES_FILE;
         } catch {
+          text = process.env.COOKIES_TEXT || process.env.YOUTUBE_COOKIES || process.env.COOKIES;
           cPath = process.env.COOKIES_FILE || 'cookies.txt';
         }
-        if (cPath) cookieStr = parseCookieFile(cPath);
+
+        if (text) {
+          cookieStr = parseCookies(text);
+          if (cookieStr) log.info('[YTJS] Loaded cookies from COOKIES_TEXT environment variable');
+        }
+        if (!cookieStr && cPath) {
+          cookieStr = parseCookieFile(cPath);
+          if (cookieStr) log.info(`[YTJS] Loaded cookies from ${cPath}`);
+        }
       } catch {
         /* ignore if config() not yet loaded */
       }
@@ -151,17 +283,20 @@ export function pickMuxed(sd: InnertubeStreamingData): string | null {
   return (pick.url as string) || null;
 }
 
-async function fetchInfo(vid: string): Promise<any | null> {
-  const cached = INFO_CACHE.get(vid);
+const RESOLVED_STREAM_CACHE = new BoundedCache<[string | null, string | null]>(2048, 1800);
+
+async function fetchInfo(vid: string, cookies?: string | null): Promise<any | null> {
+  const cacheKey = cookies ? `${vid}:${cookies.slice(0, 32)}` : vid;
+  const cached = INFO_CACHE.get(cacheKey);
   if (cached !== undefined) return cached;
 
-  const yt = await getInnertube();
-  // Working client ladder: ANDROID first, then TV_SIMPLY, then MWEB
-  for (const client of ['ANDROID', 'TV_SIMPLY', 'MWEB'] as const) {
+  const yt = await getInnertube(cookies);
+  // Working client ladder for metadata
+  for (const client of ['TV_SIMPLY', 'MWEB', 'ANDROID', 'WEB', 'IOS'] as const) {
     try {
       const info = await yt.getBasicInfo(vid, { client });
-      if (info.playability_status?.status === 'OK') {
-        INFO_CACHE.set(vid, info);
+      if (info.basic_info?.title || info.playability_status?.status === 'OK') {
+        INFO_CACHE.set(cacheKey, info);
         return info;
       }
       log.info(`[YTJS] ${vid} ${client} playability status: ${info.playability_status?.status} (${info.playability_status?.reason || 'no reason'})`);
@@ -172,46 +307,126 @@ async function fetchInfo(vid: string): Promise<any | null> {
   return null;
 }
 
+interface ResolveAttempt {
+  urls: [string | null, string | null];
+  lastError?: string;
+}
+
+async function attemptResolveWithCookie(
+  vid: string,
+  cookies?: string | null,
+): Promise<ResolveAttempt> {
+  let yt: Innertube;
+  try {
+    yt = await getInnertube(cookies);
+  } catch (e) {
+    log.warning(`[YTJS] Failed initializing Innertube for cookie: ${String(e)}`);
+    return { urls: [null, null], lastError: `Innertube init failed: ${String(e)}` };
+  }
+
+  const clients = ['TV_SIMPLY', 'MWEB', 'IOS', 'WEB', 'ANDROID'] as const;
+  let lastError = 'No stream formats returned';
+
+  for (const client of clients) {
+    try {
+      const info = await yt.getBasicInfo(vid, { client });
+      if (info.playability_status?.status !== 'OK') {
+        const st = info.playability_status?.status || 'STATUS_NOT_OK';
+        const reason = info.playability_status?.reason || '';
+        lastError = `${st}: ${reason}`.trim();
+        continue;
+      }
+
+      let muxedUrl: string | null = null;
+      let audioUrl: string | null = null;
+
+      try {
+        const f = info.chooseFormat({ type: 'video+audio', quality: 'best', format: 'any' });
+        if (f) {
+          muxedUrl = (await f.decipher(yt.session.player)) || f.url || null;
+        }
+      } catch {
+        /* ignore */
+      }
+
+      try {
+        const f = info.chooseFormat({ type: 'audio', quality: 'best' });
+        if (f) {
+          audioUrl = (await f.decipher(yt.session.player)) || f.url || null;
+        }
+      } catch {
+        /* ignore */
+      }
+
+      const sd: InnertubeStreamingData = info.streaming_data ?? {};
+      if (!muxedUrl) muxedUrl = pickMuxed(sd);
+      if (!audioUrl) audioUrl = pickAudio(sd);
+
+      if (muxedUrl || audioUrl) {
+        INFO_CACHE.set(vid, info);
+        return { urls: [muxedUrl, audioUrl] };
+      }
+    } catch (e) {
+      lastError = `${client} error: ${String(e)}`;
+      log.warning(`[YTJS] ${vid} ${client} resolution failed: ${String(e)}`);
+    }
+  }
+
+  return { urls: [null, null], lastError };
+}
+
 export async function resolveBoth(
   urlOrId: string,
+  cookies?: string | null,
 ): Promise<[string | null, string | null]> {
   const vid = extractId(urlOrId);
   if (!vid) return [null, null];
 
-  const info = await fetchInfo(vid);
-  if (!info) return [null, null];
-
-  const yt = await getInnertube();
-  let muxedUrl: string | null = null;
-  let audioUrl: string | null = null;
-
-  try {
-    const f = info.chooseFormat({ type: 'video+audio', quality: 'best', format: 'any' });
-    if (f) {
-      muxedUrl = (await f.decipher(yt.session.player)) || f.url || null;
-    }
-  } catch {
-    /* ignore */
+  if (!cookies) {
+    const cached = RESOLVED_STREAM_CACHE.get(vid);
+    if (cached) return cached;
   }
 
-  try {
-    const f = info.chooseFormat({ type: 'audio', quality: 'best' });
-    if (f) {
-      audioUrl = (await f.decipher(yt.session.player)) || f.url || null;
-    }
-  } catch {
-    /* ignore */
+  // If specific cookies were explicitly passed, use them directly
+  if (cookies) {
+    const attempt = await attemptResolveWithCookie(vid, cookies);
+    return attempt.urls;
   }
 
-  const sd: InnertubeStreamingData = info.streaming_data ?? {};
-  if (!muxedUrl) muxedUrl = pickMuxed(sd);
-  if (!audioUrl) audioUrl = pickAudio(sd);
+  // If the dynamic MongoDB cookie pool has active accounts, rotate with failover
+  if (cookiePool.size > 0) {
+    const active = cookiePool.getAllActive();
+    const primary = cookiePool.nextCookie();
+    const candidates = primary
+      ? [primary, ...active.filter((c) => c.id !== primary.id)]
+      : active;
 
-  return [muxedUrl, audioUrl];
+    for (const item of candidates) {
+      const attempt = await attemptResolveWithCookie(vid, item.cookieString);
+      if (attempt.urls[0] || attempt.urls[1]) {
+        void cookiePool.reportSuccess(item.id);
+        RESOLVED_STREAM_CACHE.set(vid, attempt.urls);
+        return attempt.urls;
+      } else {
+        void cookiePool.reportFailure(item.id, attempt.lastError || 'No stream formats returned');
+      }
+    }
+  }
+
+  // Fallback to default instance (COOKIES_TEXT / COOKIES_FILE / anonymous)
+  const defaultAttempt = await attemptResolveWithCookie(vid, null);
+  if (defaultAttempt.urls[0] || defaultAttempt.urls[1]) {
+    RESOLVED_STREAM_CACHE.set(vid, defaultAttempt.urls);
+  }
+  return defaultAttempt.urls;
 }
 
-export async function resolve(urlOrId: string, kind: 'audio' | 'muxed'): Promise<string | null> {
-  const [muxed, audio] = await resolveBoth(urlOrId);
+export async function resolve(
+  urlOrId: string,
+  kind: 'audio' | 'muxed',
+  cookies?: string | null,
+): Promise<string | null> {
+  const [muxed, audio] = await resolveBoth(urlOrId, cookies);
   return kind === 'audio' ? audio : muxed;
 }
 

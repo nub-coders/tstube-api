@@ -10,7 +10,6 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { resolve as innertubeResolve } from './innertube.js';
-import { resolveG } from './ytdlp.js';
 import { redis } from './redis.js';
 import { getLogger } from './logger.js';
 import { detectProvider, resolveToPlayableStream } from './platformResolvers.js';
@@ -144,21 +143,17 @@ export async function resolveTargetUrl(url: string): Promise<[string, boolean]> 
 async function resolveUrl(
   url: string,
   kind: 'audio' | 'muxed',
-  formatSelector: string,
+  _formatSelector: string,
   cookies: string | null,
 ): Promise<string | null> {
-  const streamUrl = await resolveG(url, formatSelector, cookies, 40, 'YT-DLP');
-  if (streamUrl) {
-    return streamUrl;
-  }
   try {
-    const itUrl = await innertubeResolve(url, kind);
+    const itUrl = await innertubeResolve(url, kind, cookies);
     if (itUrl) {
       log.info(`[INNERTUBE] ✅ ${kind} ${url.slice(0, 80)}`);
       return itUrl;
     }
   } catch (e) {
-    log.warning(`[INNERTUBE] Fallback failed: ${String(e)}`);
+    log.warning(`[INNERTUBE] Resolution failed: ${String(e)}`);
   }
   return null;
 }

@@ -11,13 +11,20 @@ import {
   type Ctx,
   type Result,
   json,
+  text,
   redirect,
   streamResponse,
   requireArgs,
   requireToken,
+  requireAdmin,
+  readJsonBody,
   file,
   assetPath,
 } from './httpServer.js';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { cookiePool } from './cookiePool.js';
 import { validateYoutubeTarget } from './urlValidation.js';
 import { timeTaken } from './pyTime.js';
 import {
@@ -33,7 +40,7 @@ import {
   fetchSuggestions,
 } from './searchService.js';
 import { fetchResults as apiSearch, getVideoById } from './youtubeApi.js';
-import { related } from './innertube.js';
+import { related, parseCookies, sanitizeNetscapeCookies } from './innertube.js';
 import { extractPlaylist, ValueError } from './playlistParser.js';
 
 const log = getLogger('ytube_api.routes');
@@ -399,4 +406,137 @@ export async function playlistSongs(ctx: Ctx): Promise<Result> {
     if (e instanceof ValueError) return json(400, errorBody(e, start));
     return json(500, errorBody(e, start));
   }
+}
+
+// ── /upload.sh ──────────────────────────────────────────────────
+
+function loadUploadScript(): string {
+  const __filename = fileURLToPath(import.meta.url);
+  const __dirname = dirname(__filename);
+  const candidates = [
+    join(__dirname, '..', 'scripts', 'upload.sh'),
+    join(process.cwd(), 'scripts', 'upload.sh'),
+    join(__dirname, 'assets', 'upload.sh'),
+  ];
+  for (const path of candidates) {
+    if (existsSync(path)) {
+      return readFileSync(path, 'utf8');
+    }
+  }
+  throw new Error('upload.sh script not found');
+}
+
+export async function uploadScript(ctx: Ctx): Promise<Result> {
+  let script = loadUploadScript();
+  const isTls = 'encrypted' in ctx.req.socket && Boolean((ctx.req.socket as { encrypted?: boolean }).encrypted);
+  const proto = (ctx.req.headers['x-forwarded-proto'] as string) || (isTls ? 'https' : 'http');
+  const host =
+    (ctx.req.headers['x-forwarded-host'] as string) || ctx.req.headers['host'] || config().API_HOST;
+  const defaultServer = `${proto}://${host}`;
+  script = script.replace('DEFAULT_SERVER="https://api.nubcoders.com"', `DEFAULT_SERVER="${defaultServer}"`);
+  return text(200, script, 'text/x-shellscript; charset=utf-8');
+}
+
+// ── /admin/cookies/sync ─────────────────────────────────────────
+
+export async function adminSyncCookies(ctx: Ctx): Promise<Result> {
+  requireAdmin(ctx);
+  const body = await readJsonBody<Record<string, unknown>>(ctx);
+
+  let rawItems: Array<{ label?: string; cookie_text?: unknown }> = [];
+  if (Array.isArray(body?.items)) {
+    rawItems = body.items as Array<{ label?: string; cookie_text?: unknown }>;
+  } else if (body?.cookie_text && typeof body.cookie_text === 'string') {
+    rawItems = [
+      {
+        label: typeof body.label === 'string' ? body.label : undefined,
+        cookie_text: body.cookie_text,
+      },
+    ];
+  } else {
+    return json(400, {
+      error: 'Invalid payload',
+      message: 'Body must contain "cookie_text" or an "items" array with "cookie_text".',
+    });
+  }
+
+  const cleanItems: Array<{ label?: string; cookie_text: string }> = [];
+  for (const item of rawItems) {
+    if (!item || typeof item.cookie_text !== 'string' || !item.cookie_text.trim()) continue;
+    let text = item.cookie_text.trim();
+
+    // If base64 encoded, decode it first
+    if (!text.includes('\t') && !text.includes('\n') && /^[A-Za-z0-9+/=]+$/.test(text) && text.length > 50) {
+      try {
+        const decoded = Buffer.from(text, 'base64').toString('utf8');
+        if (decoded.includes('=') || decoded.includes('\t')) {
+          text = decoded.trim();
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // If Netscape tab-separated format, strictly strip non-YouTube lines
+    if (text.includes('\t')) {
+      text = sanitizeNetscapeCookies(text);
+    }
+
+    // Verify valid YouTube cookies exist
+    const parsed = parseCookies(text);
+    if (!parsed) continue;
+
+    cleanItems.push({
+      label:
+        typeof item.label === 'string' && item.label.trim()
+          ? item.label.trim().slice(0, 100)
+          : undefined,
+      cookie_text: text,
+    });
+  }
+
+  if (cleanItems.length === 0) {
+    return json(400, {
+      error: 'No valid YouTube cookies provided',
+      message: 'Payload contained no verifiable YouTube (.youtube.com) cookies.',
+    });
+  }
+
+  const result = await cookiePool.upsertCookies(cleanItems);
+  return json(200, {
+    status: 'ok',
+    imported: result.imported,
+    active_pool_size: result.activePoolSize,
+  });
+}
+
+// ── /admin/cookies & /admin/cookies/terminate ───────────────────
+
+export async function adminListCookies(ctx: Ctx): Promise<Result> {
+  requireAdmin(ctx);
+  const cookies = await cookiePool.getStatus();
+  return json(200, {
+    total: cookies.length,
+    active_count: cookies.filter((c) => c.is_active).length,
+    cookies,
+  });
+}
+
+export async function adminTerminateCookie(ctx: Ctx): Promise<Result> {
+  requireAdmin(ctx);
+  const body = await readJsonBody<{ id?: string; label?: string; reason?: string }>(ctx);
+  const target = body?.id || body?.label;
+  if (!target || typeof target !== 'string') {
+    return json(400, { error: 'Missing "id" or "label" in request body' });
+  }
+
+  const success = await cookiePool.deactivateCookie(
+    target,
+    body.reason || 'Manually terminated via admin API',
+  );
+  return json(200, {
+    status: success ? 'ok' : 'not_found',
+    message: success ? `Cookie "${target}" terminated successfully.` : `Cookie "${target}" not found.`,
+    active_pool_size: cookiePool.size,
+  });
 }

@@ -58,15 +58,18 @@ async function answer(
   }
 }
 
-/** Edit the callback's message; fall back to a fresh send if it's gone. */
+/** Group menus can contain user-specific credentials: always deliver cards privately. */
 async function editCard(api: TelegramApi, cb: CallbackQuery, card: Card): Promise<void> {
   const chatId = cb.message?.chat.id;
   const messageId = cb.message?.message_id;
-  if (chatId !== undefined && messageId !== undefined) {
+  if (cb.message?.chat.type === 'private' && chatId === cb.from.id && messageId !== undefined) {
     const ok = await editSmartRichMessage(api, chatId, messageId, card.html, card.keyboard);
     if (ok) return;
   }
-  await sendSmartRichMessage(api, cb.from.id, card.html, { replyMarkup: card.keyboard });
+  const delivered = await sendSmartRichMessage(api, cb.from.id, card.html, { replyMarkup: card.keyboard });
+  if (!delivered) {
+    await answer(api, cb, 'Open a private chat with the bot to view this information.', true);
+  }
 }
 
 export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promise<void> {
@@ -154,8 +157,8 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
       break;
 
     case 'confirm_revoke': {
-      await revokeUserToken(userId);
       const newToken = generateToken();
+      // Replacement removes the previous mapping atomically.
       await setUserToken(userId, newToken);
       await answer(api, cb, '✅ Token revoked successfully!');
       await editCard(api, cb, revoked(newToken));

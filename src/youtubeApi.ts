@@ -6,7 +6,6 @@
  */
 import { config } from './config.js';
 import { metadata } from './innertube.js';
-import { fetchJson } from './ytdlp.js';
 import { formatInd, formatSeconds, parseDur, processVideo, extractArtist } from './formatters.js';
 import type { ProcessedVideo } from './formatters.js';
 import { getLogger } from './logger.js';
@@ -97,36 +96,13 @@ export async function fetchResults(query: string, limit = 1): Promise<ProcessedV
 
 export async function getVideoById(videoId: string): Promise<VideoInfo> {
   if (!getAvailableKeys().length) {
-    // Innertube first (~0.15s, no key needed).
     try {
       const info = await metadata(videoId);
       if (info) return info;
-    } catch {
-      /* fall back */
-    }
-    // Fallback: yt-dlp -j.
-    try {
-      const info = await fetchJson(videoId, 40);
-      if (!info) return {};
-      const title: string = info.title ?? '';
-      const uploader: string = info.uploader ?? '';
-      const durationSec: number = info.duration ?? 0;
-      const views: number = info.view_count ?? 0;
-      const thumbnail: string = info.thumbnail ?? '';
-      return {
-        title,
-        url: `https://www.youtube.com/watch?v=${videoId}`,
-        artist_name: extractArtist(title) || uploader,
-        channel_name: uploader,
-        views: formatInd(views),
-        duration: formatSeconds(durationSec),
-        thumbnail,
-        video_id: videoId,
-      };
     } catch (e) {
-      log.warning(`[YOUTUBE_API] yt-dlp metadata failed for ${videoId}`, { err: String(e) });
-      return {};
+      log.warning(`[YOUTUBE_API] Innertube metadata failed for ${videoId}`, { err: String(e) });
     }
+    return {};
   }
 
   const res = await getJson(DETAILS_URL, {

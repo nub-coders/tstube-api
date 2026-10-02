@@ -12,7 +12,7 @@
  *   failed_log              -> LPUSH list, trimmed to 100
  */
 import { randomInt } from 'node:crypto';
-import { config, isAdmin } from './config.js';
+import { isAdmin } from './config.js';
 import { redis } from './redis.js';
 import { getLogger } from './logger.js';
 
@@ -38,27 +38,43 @@ export async function getUserToken(userId: number | string): Promise<string | nu
 }
 
 export async function setUserToken(userId: number | string, token: string): Promise<void> {
-  await redis()
-    .multi()
-    .set(`user_token:${userId}`, token)
-    .set(`token_user:${token}`, String(userId))
-    .exec();
+  await redis().eval(`
+    local owner = redis.call('GET', KEYS[2])
+    if owner and owner ~= ARGV[1] then return redis.error_reply('Token already in use') end
+    local old = redis.call('GET', KEYS[1])
+    if old and old ~= ARGV[2] and redis.call('GET', 'token_user:' .. old) == ARGV[1] then
+      redis.call('DEL', 'token_user:' .. old)
+    end
+    redis.call('SET', KEYS[1], ARGV[2])
+    redis.call('SET', KEYS[2], ARGV[1])
+    return 1
+  `, 2, `user_token:${userId}`, `token_user:${token}`, String(userId), token);
 }
 
 export async function revokeUserToken(userId: number | string): Promise<void> {
-  const r = redis();
-  const old = await r.get(`user_token:${userId}`);
-  const pipe = r.multi();
-  if (old) pipe.del(`token_user:${old}`);
-  pipe.del(`user_token:${userId}`);
-  await pipe.exec();
+  await redis().eval(`
+    local old = redis.call('GET', KEYS[1])
+    if old and redis.call('GET', 'token_user:' .. old) == ARGV[1] then
+      redis.call('DEL', 'token_user:' .. old)
+    end
+    return redis.call('DEL', KEYS[1])
+  `, 1, `user_token:${userId}`, String(userId));
 }
 
 export async function getUserByToken(token: string | null | undefined): Promise<number | null> {
   if (!token) return null;
   try {
-    const uid = await redis().get(`token_user:${token}`);
-    return uid ? Number.parseInt(uid, 10) : null;
+    const uid = await redis().eval(`
+      local uid = redis.call('GET', KEYS[1])
+      if not uid then return false end
+      if redis.call('GET', 'user_token:' .. uid) ~= ARGV[1] then
+        redis.call('DEL', KEYS[1])
+        return false
+      end
+      return uid
+    `, 1, `token_user:${token}`, token);
+    const id = Number(uid);
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
   } catch {
     return null;
   }
@@ -70,18 +86,37 @@ export async function getUserRequestCount(userId: number | string): Promise<numb
 }
 
 export async function setUserRequestCount(userId: number | string, count: number): Promise<void> {
-  await redis().setex(`user_requests:${userId}`, 86400, String(count));
+  if (!Number.isSafeInteger(count) || count < 0) throw new Error('Invalid request count');
+  await redis().eval(`
+    local now = tonumber(redis.call('TIME')[1])
+    local reset = (math.floor(now / 86400) + 1) * 86400
+    return redis.call('SET', KEYS[1], ARGV[1], 'EXAT', reset)
+  `, 1, `user_requests:${userId}`, String(count));
 }
 
-/** INCR is atomic; TTL is set only on the first increment so it isn't reset mid-day. */
+/** Increment and UTC expiry share one Redis transaction, including legacy counters. */
 export async function incrementUserRequests(userId: number | string): Promise<number> {
-  const r = redis();
-  const key = `user_requests:${userId}`;
-  const res = await r.multi().incr(key).ttl(key).exec();
-  const newCount = Number(res?.[0]?.[1] ?? 0);
-  const ttl = Number(res?.[1]?.[1] ?? -1);
-  if (ttl < 0) await r.expire(key, 86400);
-  return newCount;
+  return Number(await redis().eval(`
+    local now = tonumber(redis.call('TIME')[1])
+    local reset = (math.floor(now / 86400) + 1) * 86400
+    local count = redis.call('INCR', KEYS[1])
+    redis.call('EXPIREAT', KEYS[1], reset)
+    return count
+  `, 1, `user_requests:${userId}`));
+}
+
+/** Grant quota without overwriting increments from concurrent API requests. */
+export async function grantUserRequests(userId: number | string, amount: number): Promise<[number, number]> {
+  if (!Number.isSafeInteger(amount) || amount < 0) throw new Error('Invalid grant amount');
+  const result = await redis().eval(`
+    local now = tonumber(redis.call('TIME')[1])
+    local reset = (math.floor(now / 86400) + 1) * 86400
+    local previous = tonumber(redis.call('GET', KEYS[1]) or '0')
+    local current = math.max(0, previous - tonumber(ARGV[1]))
+    redis.call('SET', KEYS[1], current, 'EXAT', reset)
+    return {previous, current}
+  `, 1, `user_requests:${userId}`, amount) as [number, number];
+  return result;
 }
 
 export interface ErrorLogEntry {

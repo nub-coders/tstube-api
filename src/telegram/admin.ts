@@ -22,7 +22,7 @@ import {
   getUserRequestCount,
   getUserToken,
   revokeUserToken,
-  setUserRequestCount,
+  grantUserRequests,
 } from '../tools.js';
 import { redis, scanKeys } from '../redis.js';
 import { comma } from '../pyTime.js';
@@ -67,6 +67,7 @@ export async function cmdStats(api: TelegramApi, msg: TgMessage): Promise<void> 
 }
 
 export async function cmdUser(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (msg.chat.type !== 'private') return;
   if (!isAdmin(msg.from!.id)) return deny(api, msg);
   try {
     const targetUserId = msg.text!.split(/\s+/)[1]!;
@@ -93,14 +94,13 @@ export async function cmdUser(api: TelegramApi, msg: TgMessage): Promise<void> {
 }
 
 export async function cmdGrant(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (msg.chat.type !== 'private') return;
   if (!isAdmin(msg.from!.id)) return deny(api, msg);
   try {
     const parts = msg.text!.split(/\s+/);
     const targetUserId = Number.parseInt(parts[1]!, 10);
     const amount = Number.parseInt(parts[2]!, 10);
-    const currentCount = await getUserRequestCount(targetUserId);
-    const newCount = Math.max(0, currentCount - amount); // Reduce count to grant more
-    await setUserRequestCount(targetUserId, newCount);
+    const [currentCount, newCount] = await grantUserRequests(targetUserId, amount);
     await sendSmartRichMessage(api, msg.chat.id, grantCard(targetUserId, amount, currentCount, newCount));
   } catch (e) {
     await sendSmartRichMessage(
@@ -112,6 +112,7 @@ export async function cmdGrant(api: TelegramApi, msg: TgMessage): Promise<void> 
 }
 
 export async function cmdRevokeAdmin(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (msg.chat.type !== 'private') return;
   if (!isAdmin(msg.from!.id)) return deny(api, msg);
   try {
     const targetUserId = Number.parseInt(msg.text!.split(/\s+/)[1]!, 10);
@@ -294,7 +295,7 @@ export async function cmdBroadcast(api: TelegramApi, msg: TgMessage): Promise<vo
         const errStr = String(e).toLowerCase();
         if (BROADCAST_BLOCKED.some((k) => errStr.includes(k))) {
           try {
-            await redis().del(`user_token:${target}`);
+            await revokeUserToken(target);
             await redis().del(`user_requests:${target}`);
             removedUsers += 1;
           } catch {

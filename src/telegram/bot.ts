@@ -28,7 +28,7 @@ const USER_RE = /^\/user\s+\d+/;
 const GRANT_RE = /^\/grant\s+\d+\s+\d+/;
 const REVOKE_ID_RE = /^\/revoke\s+\d+/;
 
-const PRIVATE_ONLY = new Set(['stats', 'listusers', 'adminhelp', 'errors', 'broadcast']);
+const PRIVATE_ONLY = new Set(['stats', 'user', 'grant', 'revoke', 'listusers', 'adminhelp', 'errors', 'broadcast']);
 
 export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise<void> {
   if (!msg.from || msg.from.is_bot) return;

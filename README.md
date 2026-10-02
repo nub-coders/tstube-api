@@ -46,7 +46,29 @@ Configuration is environment-only (see `.env.example`). A `.env` file is loaded
 with `setdefault` semantics, so real environment variables win. A missing
 `BOT_TOKEN` leaves the process serving the HTTP API standalone.
 
+`REDIS_URL`, when set, defines the whole Redis connection and overrides the
+discrete Redis settings. Use `rediss://` for TLS and a path such as `/2` for the
+database. A URL without a port uses 6379; discrete settings retain their own
+configured port. Invalid connection URLs fail at startup without logging credentials.
+
+Docker images contain no cookie jar. To provide an existing jar, run:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.cookies.yml up -d --build
+```
+
+The override mounts `COOKIES_SOURCE_FILE` (default `./cookies.txt`) read-only and
+copies it to a private writable jar when each container starts. The source file
+must exist and be readable by the image's `app` user; grant that user access
+without making the jar world-readable. Without this override, the existing
+browser-cookie bootstrap or anonymous extraction is used. Cookie jars are
+excluded from the Docker build context. Existing images that contain cookies
+must be replaced; invalidate the session if an old image exposed it.
+
 ## Behavior notes
+
+- Quotas and their reset headers use the next midnight UTC. Granting quota does
+  not extend the current day's window.
 
 - **Auth runs before routing.** An unauthenticated request to any protected path
   (or an unknown path) returns the middleware's `401`, never a `404`/`422`.
@@ -58,4 +80,3 @@ with `setdefault` semantics, so real environment variables win. A missing
 - **Bot UI degrades.** If rich messages are unsupported (or the bot isn't a group
   admin, so ephemeral delivery is rejected), the same card is sent as classic
   HTML + inline keyboard rather than being lost.
-

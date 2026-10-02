@@ -19,6 +19,7 @@ let upstreamConnectSlow = 0;
 let streamBytesTotal = 0;
 let streamActive = 0;
 const streamErrors = new Map<string, number>();
+const HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'CONNECT', 'TRACE']);
 
 const SLOW_CONNECT_S = 1.0;
 
@@ -27,6 +28,7 @@ function inc(map: Map<string, number>, key: string, n = 1): void {
 }
 
 export function record(method: string, path: string, status: number, duration: number): void {
+  method = HTTP_METHODS.has(method) ? method : 'OTHER';
   inc(reqTotal, `${method}\u0000${path}\u0000${status}`);
   inc(latencySum, `${method}\u0000${path}`, duration);
   inc(latencyCount, `${method}\u0000${path}`);
