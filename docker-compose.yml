@@ -58,7 +58,7 @@ services:
       START_BOT: "false"
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.tstube-api.rule=Host(`${API_HOST:-apitest.nubcoders.com}`)"
+      - "traefik.http.routers.tstube-api.rule=Host(`${API_HOST:-api.nubcoders.com}`) || Host(`apitest.nubcoders.com`)"
       - "traefik.http.routers.tstube-api.entrypoints=websecure"
       - "traefik.http.routers.tstube-api.tls.certresolver=letsencrypt"
       - "traefik.http.services.tstube-api.loadbalancer.server.port=8000"
