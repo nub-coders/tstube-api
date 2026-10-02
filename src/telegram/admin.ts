@@ -1,7 +1,3 @@
-/**
- * Admin handlers — port of plugins/admin.py and plugins/broadcast.py.
- * All commands here are private-only (Python applies `filters.private`).
- */
 import type { TelegramApi, TgMessage } from './api.js';
 import { btn, keyboard, ButtonStyle, sendSmartRichMessage, sendRichDraft, escapeHtml } from './rich.js';
 import {
@@ -9,6 +5,8 @@ import {
   ACCESS_DENIED_STATS,
   adminHelpCard,
   buildStats,
+  buildCookieStatus,
+  cookieUploadCommandCard,
   errorLogCards,
   grantCard,
   listUsersCard,
@@ -26,6 +24,7 @@ import {
 } from '../tools.js';
 import { redis, scanKeys } from '../redis.js';
 import { comma } from '../pyTime.js';
+import { cookiePool } from '../cookiePool.js';
 
 async function deny(api: TelegramApi, msg: TgMessage): Promise<void> {
   const userId = msg.from!.id;
@@ -143,6 +142,151 @@ export async function cmdListUsers(api: TelegramApi, msg: TgMessage): Promise<vo
 export async function cmdAdminHelp(api: TelegramApi, msg: TgMessage): Promise<void> {
   if (!isAdmin(msg.from!.id)) return deny(api, msg);
   await sendSmartRichMessage(api, msg.chat.id, adminHelpCard());
+}
+
+// ── /cookies — cookie pool management ────────────────────────────
+
+export async function cmdCookies(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (!isAdmin(msg.from!.id)) return deny(api, msg);
+
+  const chatId = msg.chat.id;
+  const draftId = api.rndId();
+
+  try {
+    await sendRichDraft(
+      api,
+      chatId,
+      draftId,
+      '<blockquote>⏳ <b>Loading cookie pool status...</b></blockquote>',
+    );
+    const statusHtml = await buildCookieStatus();
+    await sendSmartRichMessage(api, chatId, statusHtml, {
+      replyMarkup: keyboard([
+        [
+          btn('🔄 Refresh', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY }),
+          btn('📤 Upload Command', { callback_data: 'admin_cookies_upload', style: ButtonStyle.SUCCESS }),
+        ],
+        [
+          btn('🔍 Force Probe', { callback_data: 'admin_cookies_probe', style: ButtonStyle.PRIMARY }),
+        ],
+      ]),
+    });
+  } catch (e) {
+    await sendSmartRichMessage(
+      api,
+      chatId,
+      `<blockquote>❌ <b>Error loading cookie status:</b> ${escapeHtml(String(e))}</blockquote>`,
+    );
+  }
+}
+
+/** /cookie_terminate <label|id> */
+export async function cmdCookieTerminate(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (!isAdmin(msg.from!.id)) return deny(api, msg);
+
+  const parts = msg.text!.split(/\s+/);
+  const target = parts.slice(1).join(' ').trim();
+
+  if (!target) {
+    await sendSmartRichMessage(
+      api,
+      msg.chat.id,
+      '<blockquote>❌ <b>Usage:</b> <code>/cookie_terminate &lt;label_or_id&gt;</code></blockquote>',
+    );
+    return;
+  }
+
+  try {
+    const ok = await cookiePool.deactivateCookie(target, 'Manually terminated via Telegram bot');
+    if (ok) {
+      await sendSmartRichMessage(
+        api,
+        msg.chat.id,
+        `<blockquote>✅ <b>Cookie Terminated</b><br/>Cookie <code>${escapeHtml(target)}</code> has been deactivated and removed from the rotation pool.<br/>Active pool size: <b>${comma(cookiePool.size)}</b></blockquote>`,
+      );
+    } else {
+      await sendSmartRichMessage(
+        api,
+        msg.chat.id,
+        `<blockquote>⚠️ <b>Not Found:</b> Cookie <code>${escapeHtml(target)}</code> was not found in the pool.</blockquote>`,
+      );
+    }
+  } catch (e) {
+    await sendSmartRichMessage(
+      api,
+      msg.chat.id,
+      `<blockquote>❌ <b>Error:</b> ${escapeHtml(String(e))}</blockquote>`,
+    );
+  }
+}
+
+/** /cookie_probe — trigger background health probe immediately */
+export async function cmdCookieProbe(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (!isAdmin(msg.from!.id)) return deny(api, msg);
+
+  const chatId = msg.chat.id;
+  const draftId = api.rndId();
+
+  try {
+    await sendRichDraft(
+      api,
+      chatId,
+      draftId,
+      `<blockquote>🔍 <b>Health Probe Started</b><br/>Testing ${comma(cookiePool.size)} active cookie(s) against YouTube...</blockquote>`,
+    );
+
+    // Run probe in background — don't await to avoid Telegram timeout
+    void cookiePool.probeActiveCookiesWithDelay(1000).then(async () => {
+      try {
+        const statusHtml = await buildCookieStatus();
+        await sendSmartRichMessage(api, chatId, statusHtml, {
+          replyMarkup: keyboard([
+            [
+              btn('🔄 Refresh', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY }),
+              btn('📤 Upload Command', { callback_data: 'admin_cookies_upload', style: ButtonStyle.SUCCESS }),
+            ],
+          ]),
+        });
+      } catch { /* ignore */ }
+    });
+
+    await sendRichDraft(
+      api,
+      chatId,
+      draftId,
+      `<blockquote>✅ <b>Probe Running</b><br/>Health check started for ${comma(cookiePool.size)} cookie(s). Results will appear when complete.</blockquote>`,
+    );
+  } catch (e) {
+    await sendSmartRichMessage(
+      api,
+      chatId,
+      `<blockquote>❌ <b>Error:</b> ${escapeHtml(String(e))}</blockquote>`,
+    );
+  }
+}
+
+/** /cookie_upload — show full upload curl command with admin key */
+export async function cmdCookieUpload(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (!isAdmin(msg.from!.id)) return deny(api, msg);
+
+  const userId = msg.from!.id;
+  const token = await getUserToken(userId) ?? 'YOUR_ADMIN_TOKEN';
+
+  try {
+    const cardHtml = cookieUploadCommandCard(token);
+    await sendSmartRichMessage(api, msg.chat.id, cardHtml, {
+      receiverUserId: userId, // send ephemerally if in a group
+      replyMarkup: keyboard([
+        [btn('🍪 View Cookie Status', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY })],
+      ]),
+    });
+  } catch (e) {
+    await sendSmartRichMessage(
+      api,
+      msg.chat.id,
+      `<blockquote>❌ <b>Error:</b> ${escapeHtml(String(e))}</blockquote>`,
+    );
+  }
 }
 
 export async function cmdErrors(api: TelegramApi, msg: TgMessage): Promise<void> {

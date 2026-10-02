@@ -81,16 +81,16 @@ export function startExisting(username: string, token: string, isGrp: boolean): 
 </table>`;
 
   const richButtons = (rawToken: string): string => `<tg-button-row>
-  <tg-button type="url" url="${apiUrl('info')}?token=${escapeHtml(rawToken)}&amp;q=https://youtube.com/watch?v=dQw4w9WgXcQ" style="primary">▶️ Test Video Info</tg-button>
+  <tg-button type="url" url="${apiUrl('info')}?token=${escapeHtml(rawToken)}&amp;q=${encodeURIComponent(config().COOKIES_BOOTSTRAP_URL)}" style="primary">▶️ Test Video Info</tg-button>
   <tg-button type="url" url="${apiUrl('search')}?token=${escapeHtml(rawToken)}&amp;q=lofi+hip+hop" style="primary">🔍 Test Search</tg-button>
 </tg-button-row>`;
 
   const quickStart = (tokenDisplay: string): string => `<blockquote expandable>
 <b>⚡ Interactive Quick Start:</b><br/>
 • <b>Video &amp; Audio Stream Metadata (Bearer Header):</b><br/>
-<code>curl -s -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=https://youtu.be/dQw4w9WgXcQ"</code><br/><br/>
+<code>curl -s -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/><br/>
 • <b>Direct Media Stream Pipe (Seekable Range):</b><br/>
-<code>curl -L -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('stream')}?q=https://youtu.be/dQw4w9WgXcQ"</code><br/><br/>
+<code>curl -L -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('stream')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/><br/>
 • <b>Instant Multi-Platform Search:</b><br/>
 <code>curl -s "${apiUrl('search')}?token=${tokenDisplay}&amp;q=lofi+hip+hop&amp;max_results=5"</code>
 </blockquote>`;
@@ -145,14 +145,14 @@ export function startNew(username: string, token: string, isGrp: boolean): RichC
 </table>`;
 
   const richButtons = (rawToken: string): string => `<tg-button-row>
-  <tg-button type="url" url="${apiUrl('info')}?token=${escapeHtml(rawToken)}&amp;q=https://youtube.com/watch?v=dQw4w9WgXcQ" style="primary">▶️ Test Video Info</tg-button>
+  <tg-button type="url" url="${apiUrl('info')}?token=${escapeHtml(rawToken)}&amp;q=${encodeURIComponent(config().COOKIES_BOOTSTRAP_URL)}" style="primary">▶️ Test Video Info</tg-button>
   <tg-button type="url" url="${apiUrl('search')}?token=${escapeHtml(rawToken)}&amp;q=lofi+hip+hop" style="primary">🔍 Test Search</tg-button>
 </tg-button-row>`;
 
   const quickStart = (tokenDisplay: string): string => `<blockquote expandable>
 <b>🚀 Quick Setup:</b><br/>
 Pass your token via query parameter or Authorization Bearer header:<br/>
-• <b>Video Info:</b> <code>curl -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=https://youtu.be/dQw4w9WgXcQ"</code><br/>
+• <b>Video Info:</b> <code>curl -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/>
 • <b>Search:</b> <code>curl -s "${apiUrl('search')}?token=${tokenDisplay}&amp;q=lofi+hip+hop"</code>
 </blockquote>`;
 

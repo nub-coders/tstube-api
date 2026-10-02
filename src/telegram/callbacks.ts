@@ -34,10 +34,11 @@ import {
   viewTokenGroup,
   type Card,
 } from './callbackContent.js';
-import { buildStats, ACCESS_DENIED } from './adminContent.js';
+import { buildStats, buildCookieStatus, cookieUploadCommandCard, ACCESS_DENIED } from './adminContent.js';
 import { generateToken, getUserRequestCount, getUserToken, revokeUserToken, setUserToken } from '../tools.js';
-import { isAdmin } from '../config.js';
+import { isAdmin, config } from '../config.js';
 import { getLogger } from '../logger.js';
+import { cookiePool } from '../cookiePool.js';
 
 const log = getLogger('ytube_api.bot');
 
@@ -252,6 +253,75 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
           html: `<blockquote>❌ <b>Refresh failed:</b> ${String(e)}</blockquote>`,
         });
       }
+      break;
+    }
+
+    case 'admin_cookies_refresh': {
+      if (!isAdmin(userId)) {
+        await answer(api, cb, '❌ Admin only.', true);
+        return;
+      }
+      await answer(api, cb, '🔄 Refreshing cookie status...');
+      try {
+        const statusHtml = await buildCookieStatus();
+        const kbd = keyboard([
+          [
+            btn('🔄 Refresh', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY }),
+            btn('📤 Upload Command', { callback_data: 'admin_cookies_upload', style: ButtonStyle.SUCCESS }),
+          ],
+          [
+            btn('🔍 Force Probe', { callback_data: 'admin_cookies_probe', style: ButtonStyle.PRIMARY }),
+          ],
+        ]);
+        await editCard(api, cb, { html: statusHtml, keyboard: kbd });
+      } catch (e) {
+        await editCard(api, cb, {
+          html: `<blockquote>❌ <b>Refresh failed:</b> ${String(e)}</blockquote>`,
+        });
+      }
+      break;
+    }
+
+    case 'admin_cookies_upload': {
+      if (!isAdmin(userId)) {
+        await answer(api, cb, '❌ Admin only.', true);
+        return;
+      }
+      await answer(api, cb);
+      const uploadToken = (await getUserToken(userId)) ?? 'YOUR_ADMIN_TOKEN';
+      const cfg = config();
+      const effectiveKey = cfg.ADMIN_API_KEY || uploadToken;
+      const cardHtml = cookieUploadCommandCard(effectiveKey);
+      await editCard(api, cb, {
+        html: cardHtml,
+        keyboard: keyboard([
+          [btn('🍪 Back to Cookie Status', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY })],
+        ]),
+      });
+      break;
+    }
+
+    case 'admin_cookies_probe': {
+      if (!isAdmin(userId)) {
+        await answer(api, cb, '❌ Admin only.', true);
+        return;
+      }
+      await answer(api, cb, `🔍 Probing ${cookiePool.size} cookie(s)...`);
+      // Run probe in background then post updated status
+      const probeChatId = cb.message?.chat.id ?? userId;
+      void cookiePool.probeActiveCookiesWithDelay(1000).then(async () => {
+        try {
+          const statusHtml = await buildCookieStatus();
+          await sendSmartRichMessage(api, probeChatId, statusHtml, {
+            replyMarkup: keyboard([
+              [
+                btn('🔄 Refresh', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY }),
+                btn('📤 Upload Command', { callback_data: 'admin_cookies_upload', style: ButtonStyle.SUCCESS }),
+              ],
+            ]),
+          });
+        } catch { /* ignore */ }
+      });
       break;
     }
 
