@@ -271,6 +271,7 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
           ],
           [
             btn('🔍 Force Probe', { callback_data: 'admin_cookies_probe', style: ButtonStyle.PRIMARY }),
+            btn('🗑 Purge Expired', { callback_data: 'admin_cookies_purge', style: ButtonStyle.DANGER }),
           ],
         ]);
         await editCard(api, cb, { html: statusHtml, keyboard: kbd });
@@ -318,10 +319,73 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
                 btn('🔄 Refresh', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY }),
                 btn('📤 Upload Command', { callback_data: 'admin_cookies_upload', style: ButtonStyle.SUCCESS }),
               ],
+              [
+                btn('🗑 Purge Expired', { callback_data: 'admin_cookies_purge', style: ButtonStyle.DANGER }),
+              ],
             ]),
           });
         } catch { /* ignore */ }
       });
+      break;
+    }
+
+    case 'admin_cookies_purge': {
+      if (!isAdmin(userId)) {
+        await answer(api, cb, '❌ Admin only.', true);
+        return;
+      }
+      await answer(api, cb, '🗑 Purging expired cookies...');
+      const purgeChatId = cb.message?.chat.id ?? userId;
+      try {
+        const { deleted, purgedLabels } = await cookiePool.purgeExpiredCookies();
+        if (deleted === 0) {
+          await sendSmartRichMessage(
+            api,
+            purgeChatId,
+            `<blockquote>✅ <b>Nothing to Purge</b><br/>No expired or inactive cookies found.<br/>Active pool size: <b>${cookiePool.size}</b></blockquote>`,
+            {
+              replyMarkup: keyboard([
+                [btn('🍪 View Status', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY })],
+              ]),
+            },
+          );
+        } else {
+          const labelList = purgedLabels
+            .slice(0, 20)
+            .map((l) => `• <code>${l}</code>`)
+            .join('<br/>');
+          const more = purgedLabels.length > 20 ? `<br/><i>...and ${purgedLabels.length - 20} more</i>` : '';
+          await sendSmartRichMessage(
+            api,
+            purgeChatId,
+            `<h1>🗑 Cookie Purge Complete</h1>
+<blockquote>Removed all expired and inactive cookies.</blockquote>
+<table border="1">
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td><b>Cookies Deleted</b></td><td><b>${deleted}</b></td></tr>
+  <tr><td><b>Active Pool Size</b></td><td><b>${cookiePool.size}</b></td></tr>
+</table>
+<details>
+  <summary><b>Purged Cookies</b></summary>
+  ${labelList}${more}
+</details>`,
+            {
+              replyMarkup: keyboard([
+                [
+                  btn('🍪 View Status', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY }),
+                  btn('📤 Upload New', { callback_data: 'admin_cookies_upload', style: ButtonStyle.SUCCESS }),
+                ],
+              ]),
+            },
+          );
+        }
+      } catch (e) {
+        await sendSmartRichMessage(
+          api,
+          purgeChatId,
+          `<blockquote>❌ <b>Purge failed:</b> ${String(e)}</blockquote>`,
+        );
+      }
       break;
     }
 

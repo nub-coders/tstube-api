@@ -12,6 +12,7 @@ import {
   cmdAdminHelp,
   cmdBroadcast,
   cmdCookieProbe,
+  cmdCookiePurge,
   cmdCookies,
   cmdCookieTerminate,
   cmdCookieUpload,
@@ -32,7 +33,7 @@ const USER_RE = /^\/user\s+\d+/;
 const GRANT_RE = /^\/grant\s+\d+\s+\d+/;
 const REVOKE_ID_RE = /^\/revoke\s+\d+/;
 
-const PRIVATE_ONLY = new Set(['stats', 'user', 'grant', 'revoke', 'listusers', 'adminhelp', 'errors', 'broadcast', 'cookies', 'cookie_terminate', 'cookie_probe', 'cookie_upload']);
+const PRIVATE_ONLY = new Set(['stats', 'user', 'grant', 'revoke', 'listusers', 'adminhelp', 'errors', 'broadcast', 'cookies', 'cookie_terminate', 'cookie_probe', 'cookie_upload', 'cookie_purge']);
 
 export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise<void> {
   if (!msg.from || msg.from.is_bot) return;
@@ -84,6 +85,8 @@ export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise
       return cmdCookieProbe(api, msg);
     case 'cookie_upload':
       return cmdCookieUpload(api, msg);
+    case 'cookie_purge':
+      return cmdCookiePurge(api, msg);
     default:
       // /help and /revoke (bare) advertise in the command menu but have no
       // handlers in Python — intentionally left as no-ops for parity.

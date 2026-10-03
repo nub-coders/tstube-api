@@ -168,6 +168,7 @@ export async function cmdCookies(api: TelegramApi, msg: TgMessage): Promise<void
         ],
         [
           btn('🔍 Force Probe', { callback_data: 'admin_cookies_probe', style: ButtonStyle.PRIMARY }),
+          btn('🗑 Purge Expired', { callback_data: 'admin_cookies_purge', style: ButtonStyle.DANGER }),
         ],
       ]),
     });
@@ -285,6 +286,78 @@ export async function cmdCookieUpload(api: TelegramApi, msg: TgMessage): Promise
       api,
       msg.chat.id,
       `<blockquote>❌ <b>Error:</b> ${escapeHtml(String(e))}</blockquote>`,
+    );
+  }
+}
+
+/** /cookie_purge — hard-delete all expired and inactive cookies */
+export async function cmdCookiePurge(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (!isAdmin(msg.from!.id)) return deny(api, msg);
+
+  const chatId = msg.chat.id;
+  const draftId = api.rndId();
+
+  try {
+    // Show a progress draft while we scan + delete
+    await sendRichDraft(
+      api,
+      chatId,
+      draftId,
+      '<blockquote>🗑 <b>Purging expired cookies...</b><br/>Scanning pool for expired and inactive entries...</blockquote>',
+    );
+
+    const { deleted, purgedLabels } = await cookiePool.purgeExpiredCookies();
+
+    if (deleted === 0) {
+      await sendSmartRichMessage(
+        api,
+        chatId,
+        `<blockquote>✅ <b>Nothing to Purge</b><br/>No expired or inactive cookies found in the pool.<br/>Active pool size: <b>${comma(cookiePool.size)}</b></blockquote>`,
+        {
+          replyMarkup: keyboard([
+            [btn('🍪 View Status', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY })],
+          ]),
+        },
+      );
+      return;
+    }
+
+    const labelList = purgedLabels
+      .slice(0, 20)
+      .map((l) => `• <code>${escapeHtml(l)}</code>`)
+      .join('<br/>');
+    const more = purgedLabels.length > 20 ? `<br/><i>...and ${purgedLabels.length - 20} more</i>` : '';
+
+    await sendSmartRichMessage(
+      api,
+      chatId,
+      `<h1>🗑 Cookie Purge Complete</h1>
+<blockquote>Successfully removed all expired and inactive cookies from the pool.</blockquote>
+
+<table border="1">
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td><b>Cookies Deleted</b></td><td><b>${comma(deleted)}</b></td></tr>
+  <tr><td><b>Active Pool Size</b></td><td><b>${comma(cookiePool.size)}</b></td></tr>
+</table>
+
+<details>
+  <summary><b>Purged Cookies</b></summary>
+  ${labelList}${more}
+</details>`,
+      {
+        replyMarkup: keyboard([
+          [
+            btn('🍪 View Status', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.PRIMARY }),
+            btn('📤 Upload New', { callback_data: 'admin_cookies_upload', style: ButtonStyle.SUCCESS }),
+          ],
+        ]),
+      },
+    );
+  } catch (e) {
+    await sendSmartRichMessage(
+      api,
+      chatId,
+      `<blockquote>❌ <b>Purge failed:</b> ${escapeHtml(String(e))}</blockquote>`,
     );
   }
 }

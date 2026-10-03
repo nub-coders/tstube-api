@@ -406,6 +406,7 @@ export function adminHelpCard(): string {
   <tr><td><code>/cookie_terminate &lt;label&gt;</code></td><td>🗑 Terminate a cookie by label/ID</td></tr>
   <tr><td><code>/cookie_probe</code></td><td>🔍 Force background health probe on all cookies</td></tr>
   <tr><td><code>/cookie_upload</code></td><td>📤 Show the full cookie upload command with your key</td></tr>
+  <tr><td><code>/cookie_purge</code></td><td>🗑 Hard-delete all expired and inactive cookies</td></tr>
 </table>
 
 <details>
