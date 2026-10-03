@@ -17,6 +17,7 @@ import {
   tokenHas,
   tokenNone,
 } from './content.js';
+import { help, platformsCard, revokeConfirm } from './callbackContent.js';
 import { config, isAdmin } from '../config.js';
 import { generateToken, getUserToken, setUserToken, getUserRequestCount } from '../tools.js';
 
@@ -164,10 +165,44 @@ export async function cmdToken(api: TelegramApi, msg: TgMessage): Promise<void> 
   });
 }
 
+export async function cmdHelp(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (!msg.from) return;
+  const userId = msg.from.id;
+  const token = (await getUserToken(userId)) ?? 'YOUR_TOKEN';
+  const isGrp = isGroupChat(msg.chat);
+  const card = help(token);
+  await sendSmartRichMessage(api, msg.chat.id, card.html, {
+    receiverUserId: isGrp ? userId : null,
+    replyMarkup: card.keyboard ?? startKeyboard(),
+  });
+}
+
+export async function cmdRevoke(api: TelegramApi, msg: TgMessage): Promise<void> {
+  if (!msg.from) return;
+  const isGrp = isGroupChat(msg.chat);
+  const receiverUid = isGrp ? msg.from.id : null;
+  const card = revokeConfirm();
+  await sendSmartRichMessage(api, msg.chat.id, card.html, {
+    receiverUserId: receiverUid,
+    replyMarkup: card.keyboard,
+  });
+}
+
+export async function cmdPlatforms(api: TelegramApi, msg: TgMessage): Promise<void> {
+  const card = platformsCard();
+  const isGrp = isGroupChat(msg.chat);
+  const receiverUid = isGrp && msg.from ? msg.from.id : null;
+  await sendSmartRichMessage(api, msg.chat.id, card.html, {
+    receiverUserId: receiverUid,
+    replyMarkup: card.keyboard,
+  });
+}
+
 // Re-exported for command-menu setup.
 export const BOT_COMMANDS = [
   { command: 'start', description: '🚀 Get your API token and welcome message' },
   { command: 'menu', description: '📋 Show main menu with options' },
+  { command: 'platforms', description: '🎬 View all supported platforms & formats' },
   { command: 'ping', description: '🏓 Check bot latency' },
   { command: 'status', description: '📊 Check your usage statistics' },
   { command: 'token', description: '🔑 View your current API token' },

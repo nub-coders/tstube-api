@@ -7,7 +7,7 @@
  */
 import { Bot } from 'grammy';
 import { TelegramApi, type CallbackQuery, type TgMessage } from './api.js';
-import { BOT_COMMANDS, cmdMenu, cmdPing, cmdStart, cmdStatus, cmdToken } from './commands.js';
+import { BOT_COMMANDS, cmdHelp, cmdMenu, cmdPing, cmdPlatforms, cmdRevoke, cmdStart, cmdStatus, cmdToken } from './commands.js';
 import {
   cmdAdminHelp,
   cmdBroadcast,
@@ -87,9 +87,13 @@ export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise
       return cmdCookieUpload(api, msg);
     case 'cookie_purge':
       return cmdCookiePurge(api, msg);
+    case 'platforms':
+      return cmdPlatforms(api, msg);
+    case 'help':
+      return cmdHelp(api, msg);
+    case 'revoke':
+      return cmdRevoke(api, msg);
     default:
-      // /help and /revoke (bare) advertise in the command menu but have no
-      // handlers in Python — intentionally left as no-ops for parity.
       return;
   }
 }

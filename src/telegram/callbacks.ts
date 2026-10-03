@@ -6,28 +6,11 @@ import type { CallbackQuery, TelegramApi } from './api.js';
 import { btn, keyboard, ButtonStyle, sendSmartRichMessage, editSmartRichMessage } from './rich.js';
 import {
   apiDocs,
-  apiHealth,
-  apiHealthGet,
-  apiHealthPython,
-  apiImplementation,
-  apiInfo,
   apiInfoGet,
-  apiInfoPython,
-  apiRateLimit,
-  apiRateLimitGet,
-  apiRateLimitPython,
-  apiSearch,
-  apiSearchGet,
-  apiSearchPython,
   backMenu,
   help,
-  implGetAll,
-  implPythonAdvanced,
-  implPythonAll,
-  implPythonErrors,
-  implPythonExamples,
-  implPythonPart2,
   implQuickRef,
+  platformsCard,
   revoked,
   revokeConfirm,
   usageCallback,
@@ -127,17 +110,6 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
       break;
     }
 
-    case 'api_implementation': {
-      const token = await getUserToken(userId);
-      if (!token) {
-        await answer(api, cb, '❌ No token found. Use /start to generate one.', true);
-        break;
-      }
-      await answer(api, cb);
-      await editCard(api, cb, apiImplementation(token));
-      break;
-    }
-
     case 'usage_status': {
       const token = await getUserToken(userId);
       if (!token) {
@@ -173,55 +145,39 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
       break;
     }
 
-    // Token-bearing informational cards.
+    // Documentation, quick reference, and endpoint reference cards
+    case 'api_docs':
+    case 'impl_quick_ref':
+    case 'api_implementation':
     case 'impl_get_all':
     case 'impl_python_all':
     case 'impl_python_part2':
     case 'impl_python_examples':
     case 'impl_python_advanced':
     case 'impl_python_errors':
-    case 'impl_quick_ref':
     case 'api_info':
     case 'api_info_get':
     case 'api_info_python':
     case 'api_ratelimit':
     case 'api_ratelimit_get':
-    case 'api_ratelimit_python': {
+    case 'api_ratelimit_python':
+    case 'api_search':
+    case 'api_search_get':
+    case 'api_search_python':
+    case 'api_health':
+    case 'api_health_get':
+    case 'api_health_python': {
       const token = (await getUserToken(userId)) ?? 'YOUR_TOKEN';
       await answer(api, cb);
       await editCard(api, cb, tokenCard(data, token));
       break;
     }
 
-    // Static informational cards.
-    case 'api_search':
+    case 'supported_platforms':
       await answer(api, cb);
-      await editCard(api, cb, apiSearch());
+      await editCard(api, cb, platformsCard());
       break;
-    case 'api_search_get':
-      await answer(api, cb);
-      await editCard(api, cb, apiSearchGet());
-      break;
-    case 'api_search_python':
-      await answer(api, cb);
-      await editCard(api, cb, apiSearchPython());
-      break;
-    case 'api_health':
-      await answer(api, cb);
-      await editCard(api, cb, apiHealth());
-      break;
-    case 'api_health_get':
-      await answer(api, cb);
-      await editCard(api, cb, apiHealthGet());
-      break;
-    case 'api_health_python':
-      await answer(api, cb);
-      await editCard(api, cb, apiHealthPython());
-      break;
-    case 'api_docs':
-      await answer(api, cb);
-      await editCard(api, cb, apiDocs());
-      break;
+
     case 'back_menu':
       await answer(api, cb);
       await editCard(api, cb, backMenu());
@@ -397,33 +353,19 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
 
 function tokenCard(data: string, token: string): Card {
   switch (data) {
-    case 'impl_get_all':
-      return implGetAll(token);
-    case 'impl_python_all':
-      return implPythonAll(token);
-    case 'impl_python_part2':
-      return implPythonPart2();
-    case 'impl_python_examples':
-      return implPythonExamples(token);
-    case 'impl_python_advanced':
-      return implPythonAdvanced();
-    case 'impl_python_errors':
-      return implPythonErrors();
-    case 'impl_quick_ref':
-      return implQuickRef(token);
-    case 'api_info':
-      return apiInfo();
     case 'api_info_get':
       return apiInfoGet(token);
+    case 'impl_quick_ref':
+    case 'api_implementation':
+    case 'impl_get_all':
+    case 'impl_python_all':
+    case 'impl_python_examples':
     case 'api_info_python':
-      return apiInfoPython(token);
-    case 'api_ratelimit':
-      return apiRateLimit();
     case 'api_ratelimit_get':
-      return apiRateLimitGet(token);
     case 'api_ratelimit_python':
-      return apiRateLimitPython(token);
+      return implQuickRef(token);
+    case 'api_docs':
     default:
-      return backMenu();
+      return apiDocs(token);
   }
 }

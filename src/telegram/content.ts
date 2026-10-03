@@ -10,6 +10,7 @@ import { config } from '../config.js';
 import { maskToken } from '../tools.js';
 import { escapeHtml } from './rich.js';
 import { comma, pyRoundStr } from '../pyTime.js';
+import { cookiePool } from '../cookiePool.js';
 
 export interface RichContent {
   html: string;
@@ -59,24 +60,29 @@ const GROUP_PRIVACY_FOOTER =
 
 // ── /start ──────────────────────────────────────────────────────
 
-export function startExisting(username: string, token: string, isGrp: boolean): RichContent {
+function buildStartCard(
+  username: string,
+  token: string,
+  isGrp: boolean,
+  isNew: boolean,
+): RichContent {
   const name = escapeHtml(username);
   const masked = maskToken(token);
 
   const table = (tokenDisplay: string, rawToken?: string): string => `<table border="1">
   <tr><th>⚡ System Property</th><th>📋 Configuration &amp; Status</th></tr>
   <tr><td><b>👤 Account</b></td><td>@${name}</td></tr>
-  <tr><td><b>🔑 Active Token</b></td><td>${
+  <tr><td><b>🔑 ${isNew ? 'Provisioned Token' : 'Active Token'}</b></td><td>${
     rawToken
       ? `<tg-button type="copy_text" text="${escapeHtml(rawToken)}" style="success">🔑 ${escapeHtml(tokenDisplay)}</tg-button>`
       : `<code>${tokenDisplay}</code>`
   }</td></tr>
-  <tr><td><b>🌐 API Gateway</b></td><td><tg-button type="url" url="${apiUrl()}" style="primary">🌐 ${apiUrl().replace(/^https?:\/\//, '')}</tg-button></td></tr>
-  <tr><td><b>🎬 Supported Platforms</b></td><td>YouTube · TikTok · Bilibili · Douyin</td></tr>
-  <tr><td><b>⚡ Dual Resolvers</b></td><td>Innertube Player API (&lt;100ms) + yt-dlp fallback</td></tr>
-  <tr><td><b>📊 Daily Allocation</b></td><td>1,000 req/day (Media) · Unlimited (Search)</td></tr>
-  <tr><td><b>🛡 Rate Limiter</b></td><td>10 req/s burst · Automatic reset at 00:00 UTC</td></tr>
-  <tr><td><b>🍪 Cookies Pool</b></td><td>🟢 Active &amp; Rotated (Every 6h)</td></tr>
+  <tr><td><b>🌐 ${isNew ? 'Base Endpoint' : 'API Gateway'}</b></td><td><tg-button type="url" url="${apiUrl()}" style="primary">🌐 ${apiUrl().replace(/^https?:\/\//, '')}</tg-button></td></tr>
+  <tr><td><b>🎬 Supported Platforms</b></td><td>YouTube · Spotify · Apple Music · SoundCloud · JioSaavn · Amazon Music</td></tr>
+  <tr><td><b>⚡ Stream Engine</b></td><td>youtubei.js Innertube (&lt;100ms) · Multi-Client Failover</td></tr>
+  <tr><td><b>📊 ${isNew ? 'Tier Limit' : 'Daily Allocation'}</b></td><td>${isNew ? '1,000 req/day (Free Tier) · Unlimited Search' : '1,000 req/day (Media) · Unlimited (Search)'}</td></tr>
+  <tr><td><b>🛡 ${isNew ? 'Rate Guard' : 'Rate Limiter'}</b></td><td>10 req/s burst · Automatic reset at 00:00 UTC</td></tr>
+  <tr><td><b>🍪 Cookies Pool</b></td><td>🟢 Dynamic MongoDB Pool (${cookiePool.size} active · Auto-rotated)</td></tr>
   <tr><td><b>🚀 Engine Status</b></td><td><b>🟢 100% Operational (v2026.3.12)</b></td></tr>
 </table>`;
 
@@ -85,7 +91,15 @@ export function startExisting(username: string, token: string, isGrp: boolean): 
   <tg-button type="url" url="${apiUrl('search')}?token=${escapeHtml(rawToken)}&amp;q=lofi+hip+hop" style="primary">🔍 Test Search</tg-button>
 </tg-button-row>`;
 
-  const quickStart = (tokenDisplay: string): string => `<blockquote expandable>
+  const quickStart = (tokenDisplay: string): string =>
+    isNew
+      ? `<blockquote expandable>
+<b>🚀 Quick Setup:</b><br/>
+Pass your token via query parameter or Authorization Bearer header:<br/>
+• <b>Video Info:</b> <code>curl -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/>
+• <b>Search:</b> <code>curl -s "${apiUrl('search')}?token=${tokenDisplay}&amp;q=lofi+hip+hop"</code>
+</blockquote>`
+      : `<blockquote expandable>
 <b>⚡ Interactive Quick Start:</b><br/>
 • <b>Video &amp; Audio Stream Metadata (Bearer Header):</b><br/>
 <code>curl -s -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/><br/>
@@ -95,9 +109,14 @@ export function startExisting(username: string, token: string, isGrp: boolean): 
 <code>curl -s "${apiUrl('search')}?token=${tokenDisplay}&amp;q=lofi+hip+hop&amp;max_results=5"</code>
 </blockquote>`;
 
+  const header = isNew ? '⚡ Welcome to NuB YT API!' : '⚡ NuB YT API • Dashboard';
+  const subtitle = isNew
+    ? `Hello, <b>${name}</b>! Your personal API key has been provisioned and is ready for production use.`
+    : `Welcome back, <b>${name}</b>! Your high-performance YouTube extraction integration is active and ready.`;
+
   const ephemeral =
-    `<h1>⚡ NuB YT API • Dashboard</h1>
-<blockquote>Welcome back, <b>${name}</b>! Your high-performance YouTube extraction integration is active and ready.</blockquote>
+    `<h1>${header}</h1>
+<blockquote>${subtitle}</blockquote>
 
 ${table(token, token)}
 
@@ -109,8 +128,8 @@ ${quickStart(token)}` +
       : '');
 
   const fallback =
-    `<h1>⚡ NuB YT API • Dashboard</h1>
-<blockquote>Welcome back, <b>${name}</b>! Your high-performance YouTube extraction integration is active and ready.</blockquote>
+    `<h1>${header}</h1>
+<blockquote>${subtitle}</blockquote>
 
 ${table(masked)}
 
@@ -123,70 +142,17 @@ ${quickStart(masked)}` + GROUP_PRIVACY_FOOTER;
   return { html: ephemeral, fallback };
 }
 
+export function startExisting(username: string, token: string, isGrp: boolean): RichContent {
+  return buildStartCard(username, token, isGrp, false);
+}
+
 export function startNew(username: string, token: string, isGrp: boolean): RichContent {
-  const name = escapeHtml(username);
-  const masked = maskToken(token);
-
-  const table = (tokenDisplay: string, rawToken?: string): string => `<table border="1">
-  <tr><th>⚡ System Property</th><th>📋 Configuration &amp; Status</th></tr>
-  <tr><td><b>👤 Account</b></td><td>@${name}</td></tr>
-  <tr><td><b>🔑 Provisioned Token</b></td><td>${
-    rawToken
-      ? `<tg-button type="copy_text" text="${escapeHtml(rawToken)}" style="success">🔑 ${escapeHtml(tokenDisplay)}</tg-button>`
-      : `<code>${tokenDisplay}</code>`
-  }</td></tr>
-  <tr><td><b>🌐 Base Endpoint</b></td><td><tg-button type="url" url="${apiUrl()}" style="primary">🌐 ${apiUrl().replace(/^https?:\/\//, '')}</tg-button></td></tr>
-  <tr><td><b>🎬 Supported Platforms</b></td><td>YouTube · TikTok · Bilibili · Douyin</td></tr>
-  <tr><td><b>⚡ Dual Resolvers</b></td><td>Innertube Player API (&lt;100ms) + yt-dlp fallback</td></tr>
-  <tr><td><b>📊 Tier Limit</b></td><td>1,000 req/day (Free Tier) · Unlimited Search</td></tr>
-  <tr><td><b>🛡 Rate Guard</b></td><td>10 req/s burst · Automatic reset at 00:00 UTC</td></tr>
-  <tr><td><b>🍪 Cookies Pool</b></td><td>🟢 Active &amp; Rotated (Every 6h)</td></tr>
-  <tr><td><b>🚀 Engine Status</b></td><td><b>🟢 100% Operational (v2026.3.12)</b></td></tr>
-</table>`;
-
-  const richButtons = (rawToken: string): string => `<tg-button-row>
-  <tg-button type="url" url="${apiUrl('info')}?token=${escapeHtml(rawToken)}&amp;q=${encodeURIComponent(config().COOKIES_BOOTSTRAP_URL)}" style="primary">▶️ Test Video Info</tg-button>
-  <tg-button type="url" url="${apiUrl('search')}?token=${escapeHtml(rawToken)}&amp;q=lofi+hip+hop" style="primary">🔍 Test Search</tg-button>
-</tg-button-row>`;
-
-  const quickStart = (tokenDisplay: string): string => `<blockquote expandable>
-<b>🚀 Quick Setup:</b><br/>
-Pass your token via query parameter or Authorization Bearer header:<br/>
-• <b>Video Info:</b> <code>curl -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/>
-• <b>Search:</b> <code>curl -s "${apiUrl('search')}?token=${tokenDisplay}&amp;q=lofi+hip+hop"</code>
-</blockquote>`;
-
-  const ephemeral =
-    `<h1>⚡ Welcome to NuB YT API!</h1>
-<blockquote>Hello, <b>${name}</b>! Your personal API key has been provisioned and is ready for production use.</blockquote>
-
-${table(token, token)}
-
-${richButtons(token)}
-
-${quickStart(token)}` +
-    (isGrp
-      ? '<blockquote>🔒 <b>Ephemeral Message:</b> This message and your API token are only visible to you in this group.</blockquote>'
-      : '');
-
-  const fallback =
-    `<h1>⚡ Welcome to NuB YT API!</h1>
-<blockquote>Hello, <b>${name}</b>! Your personal API key has been provisioned and is ready for production use.</blockquote>
-
-${table(masked)}
-
-<tg-button-row>
-  <tg-button type="url" url="${apiUrl()}" style="primary">🌐 Open API Gateway</tg-button>
-</tg-button-row>
-
-${quickStart(masked)}` + GROUP_PRIVACY_FOOTER;
-
-  return { html: ephemeral, fallback };
+  return buildStartCard(username, token, isGrp, true);
 }
 
 // ── /menu ───────────────────────────────────────────────────────
 
-const MENU_BODY = `<h1>⚡ NuB YT API • Control Center</h1>
+export const MENU_BODY = `<h1>⚡ NuB YT API • Control Center</h1>
 <blockquote>Explore real-time media extraction endpoints, streaming pipes, search discovery, and system telemetry:</blockquote>
 
 <table border="1">
@@ -227,8 +193,8 @@ export function pingContent(elapsedMs: number, uptime: string): string {
   <tr><td><b>⏱ Server Uptime</b></td><td><code>${uptime}</code></td></tr>
   <tr><td><b>🤖 Telegram Bot Core</b></td><td><b>grammY v1.40.2 (Bot API 10.3)</b></td></tr>
   <tr><td><b>🧠 Primary Resolver</b></td><td><b>youtubei.js v18 (Player API &lt;100ms)</b></td></tr>
-  <tr><td><b>🛡 Fallback Resolver</b></td><td><b>yt-dlp latest (Multi-extractor)</b></td></tr>
-  <tr><td><b>🍪 Cookies Engine</b></td><td><b>🟢 Active (Snap Firefox 6h auto-sync)</b></td></tr>
+  <tr><td><b>🛡 Platform Resolvers</b></td><td><b>Odesli (Spotify/Apple/SoundCloud/JioSaavn)</b></td></tr>
+  <tr><td><b>🍪 Cookies Engine</b></td><td><b>🟢 MongoDB Pool (${cookiePool.size} active)</b></td></tr>
   <tr><td><b>🌐 DNS Infrastructure</b></td><td><b>Cloudflare (1.1.1.1 pinned, 0% drop)</b></td></tr>
   <tr><td><b>🚦 Redis State Cache</b></td><td><b>🟢 Connected &amp; Persistent</b></td></tr>
   <tr><td><b>🟢 Overall Health</b></td><td><b>100% Operational</b></td></tr>
