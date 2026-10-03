@@ -497,8 +497,11 @@ export async function adminSyncCookies(ctx: Ctx): Promise<Result> {
 
   if (cleanItems.length === 0) {
     return json(400, {
-      error: 'No valid YouTube cookies provided',
-      message: 'Payload contained no verifiable YouTube (.youtube.com) cookies.',
+      error: 'No authenticated YouTube cookies provided',
+      message:
+        'Payload contained no authenticated YouTube cookies. ' +
+        'Cookies must include a valid session token (SAPISID, __Secure-1PSID, __Secure-3PSID, LOGIN_INFO, or SID). ' +
+        'Anonymous or non-authenticated cookie jars are not accepted.',
     });
   }
 

@@ -2,7 +2,7 @@
  * Fast YouTube resolver powered by youtubei.js (ytjs).
  * Primary stream resolver; yt-dlp is the fallback.
  */
-import { Innertube, Platform } from 'youtubei.js';
+import { Innertube, Platform, Parser, Helpers } from 'youtubei.js';
 import { readFileSync, existsSync } from 'node:fs';
 import { extractArtist, formatInd } from './formatters.js';
 import { getLogger } from './logger.js';
@@ -14,6 +14,71 @@ import { cookiePool } from './cookiePool.js';
 (Platform.shim as any).eval = async (d: any) => new Function(d.output)();
 
 const log = getLogger('ytube_api.innertube');
+
+// Runtime parsers for YouTube nodes not yet in upstream youtubei.js
+class InterstitialView extends Helpers.YTNode {
+  static override readonly type = 'InterstitialView';
+
+  title?: {
+    content?: string;
+  };
+  description?: {
+    content?: string;
+  };
+  primary_button?: any;
+  secondary_button?: any;
+  logging_directives?: any;
+  icon?: any;
+
+  constructor(data: any) {
+    super();
+    this.title = {
+      content: data?.title?.content,
+    };
+    this.description = {
+      content: data?.description?.content,
+    };
+    this.primary_button = Parser.parseItem(data?.primaryButton);
+    this.secondary_button = Parser.parseItem(data?.secondaryButton);
+    this.logging_directives = {
+      tracking_params: data?.loggingDirectives?.trackingParams,
+      visibility: {
+        types: data?.loggingDirectives?.visibility?.types,
+      },
+    };
+    if (data?.icon) {
+      this.icon = data.icon;
+    }
+  }
+}
+
+class PlayerInterstitial extends Helpers.YTNode {
+  static override readonly type = 'PlayerInterstitial';
+
+  content?: any;
+  state_entity_store_key?: string;
+
+  constructor(data: any) {
+    super();
+    this.content = Parser.parseItem(data?.content);
+    this.state_entity_store_key = data?.stateEntityStoreKey;
+  }
+}
+
+Parser.addRuntimeParser('InterstitialView', InterstitialView as any);
+Parser.addRuntimeParser('PlayerInterstitial', PlayerInterstitial as any);
+
+// Silence verbose multi-line JIT dumps for any other unmapped YouTube nodes
+Parser.setParserErrorHandler((error) => {
+  if (error.error_type === 'class_not_found') {
+    log.warning(`[YTJS] Unregistered parser node: ${error.classname}`);
+    return;
+  }
+  if (error.error_type === 'class_changed') {
+    log.warning(`[YTJS] Node structure changed: ${error.classname}`);
+    return;
+  }
+});
 
 const ID_RE = /(?:v=|\/shorts\/|youtu\.be\/|\/embed\/|\/v\/|\/live\/)([A-Za-z0-9_-]{11})/;
 const BARE_ID_RE = /^[A-Za-z0-9_-]{11}$/;
@@ -63,6 +128,10 @@ export function extractId(value: string): string | null {
  * - Semicolon-separated HTTP cookie header ('SID=xxx; HSID=yyy')
  * - Line-separated 'key=value' pairs
  * - Base64 encoded version of any of the above
+ *
+ * Returns null if the result does not contain authenticated YouTube session
+ * cookies (SAPISID, __Secure-1PSID, __Secure-3PSID, LOGIN_INFO, or SID).
+ * Only authenticated cookies are accepted.
  */
 export function parseCookies(input: string | null | undefined): string | null {
   if (!input || typeof input !== 'string') return null;
@@ -80,6 +149,8 @@ export function parseCookies(input: string | null | undefined): string | null {
       /* not base64 */
     }
   }
+
+  let result: string | null = null;
 
   // Netscape tab-separated format
   if (text.includes('\t')) {
@@ -102,19 +173,36 @@ export function parseCookies(input: string | null | undefined): string | null {
         }
       }
     }
-    return cookies.length ? cookies.join('; ') : null;
-  }
-
-  // Semicolon or newline-separated key=value pairs
-  if (text.includes('=')) {
+    result = cookies.length ? cookies.join('; ') : null;
+  } else if (text.includes('=')) {
+    // Semicolon or newline-separated key=value pairs
     const items = text
       .split(/[;\r\n]+/)
       .map((s) => s.trim())
       .filter((s) => s && s.includes('=') && !s.startsWith('#'));
-    return items.length ? items.join('; ') : null;
+    result = items.length ? items.join('; ') : null;
   }
 
-  return null;
+  if (!result) return null;
+
+  // Only accept authenticated cookies — must contain at least one YouTube session token
+  if (!isAuthenticatedCookieString(result)) {
+    log.warning('[YTJS] Rejecting unauthenticated cookie string (no session tokens found)');
+    return null;
+  }
+
+  return result;
+}
+
+/**
+ * Returns true if the given semicolon-separated cookie string contains at least
+ * one recognised YouTube authentication token that indicates a logged-in session.
+ *
+ * Recognised tokens: SAPISID, __Secure-1PSID, __Secure-3PSID, LOGIN_INFO, SID
+ */
+export function isAuthenticatedCookieString(cookieStr: string): boolean {
+  // Match cookie name at start of string or after "; "
+  return /(?:^|;\s*)(?:SAPISID|__Secure-1PSID|__Secure-3PSID|LOGIN_INFO|SID)=/i.test(cookieStr);
 }
 
 /**
