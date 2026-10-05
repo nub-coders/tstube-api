@@ -14,6 +14,7 @@ import { bootstrap as bootstrapCookies, startRefresh, stopRefresh } from './cook
 import { setDefaultResultOrder } from 'node:dns';
 import { getInnertube } from './innertube.js';
 import { cookiePool } from './cookiePool.js';
+import { websharePool } from './proxy.js';
 import { fetchTrending } from './searchService.js';
 import { setGlobalDispatcher, Agent } from 'undici';
 
@@ -76,6 +77,9 @@ async function main(): Promise<void> {
         log.warning(`[STARTUP] Cookie bootstrap skipped: ${String(e)}`);
       }
     })();
+
+    // Geo-bypass proxy pool (no-op unless WEBSHARE_API_KEY is set).
+    websharePool.init();
   }
 
   const server = createAppServer({ routes: routeTable });
@@ -125,6 +129,7 @@ async function main(): Promise<void> {
     }
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await cookiePool.close();
+    await websharePool.close();
     await closeRedis();
     process.exit(0);
   };

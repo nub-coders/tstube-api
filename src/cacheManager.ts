@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolve as innertubeResolve } from './innertube.js';
+import { resolveWithMeta as innertubeResolveMeta } from './innertube.js';
 import { redis } from './redis.js';
 import { getLogger } from './logger.js';
 import { detectProvider, resolveToPlayableStream } from './platformResolvers.js';
@@ -35,6 +35,36 @@ function cachePath(url: string, prefix: string): string {
   return join(CACHE_DIR, md5(prefix + url) + '.json');
 }
 
+export interface CachedStream {
+  url: string;
+  /** Webshare proxy URL the stream is IP-locked to, when resolved via the geo-bypass tier. */
+  proxyUrl: string | null;
+}
+
+/**
+ * Cache envelope. New entries are JSON `{u, p}` so the proxy binding travels
+ * with the URL through Redis and the file cache across replicas; pre-envelope
+ * entries (plain URL strings) read back as direct streams.
+ */
+export function encodeCached(value: CachedStream): string {
+  return JSON.stringify(value.proxyUrl ? { u: value.url, p: value.proxyUrl } : { u: value.url });
+}
+
+export function decodeCached(raw: string): CachedStream | null {
+  if (raw.startsWith('{')) {
+    try {
+      const o = JSON.parse(raw) as { u?: unknown; p?: unknown };
+      if (typeof o.u === 'string' && o.u) {
+        return { url: o.u, proxyUrl: typeof o.p === 'string' && o.p ? o.p : null };
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+  return raw ? { url: raw, proxyUrl: null } : null;
+}
+
 export function extractExpire(streamUrl: string): number | null {
   try {
     const parsed = new URL(streamUrl);
@@ -45,17 +75,17 @@ export function extractExpire(streamUrl: string): number | null {
   }
 }
 
-/** Read cache, returning (url, remainingTtl). TTL -1 means expired/missing. */
-function readCache(url: string, prefix: string): [string | null, number] {
+/** Read cache, returning (url, remainingTtl, proxyUrl). TTL -1 means expired/missing. */
+function readCache(url: string, prefix: string): [string | null, number, string | null] {
   const path = cachePath(url, prefix);
-  if (!existsSync(path)) return [null, -1];
+  if (!existsSync(path)) return [null, -1, null];
   try {
-    const data = JSON.parse(readFileSync(path, 'utf8')) as { url?: string; expire?: number };
+    const data = JSON.parse(readFileSync(path, 'utf8')) as { url?: string; expire?: number; proxy?: string };
     const expire = data.expire ?? 0;
     const remaining = expire - Date.now() / 1000;
     if (remaining > 15) {
       log.debug(`[CACHE HIT] ${prefix}${url.slice(0, 80)}...`);
-      return [data.url ?? null, Math.floor(remaining)];
+      return [data.url ?? null, Math.floor(remaining), data.proxy ?? null];
     }
     try {
       rmSync(path);
@@ -69,10 +99,10 @@ function readCache(url: string, prefix: string): [string | null, number] {
       /* ignore */
     }
   }
-  return [null, -1];
+  return [null, -1, null];
 }
 
-function writeCache(url: string, streamUrl: string, prefix: string): void {
+function writeCache(url: string, streamUrl: string, prefix: string, proxyUrl: string | null = null): void {
   const expire = extractExpire(streamUrl);
   if (!expire) {
     log.warning(`[CACHE SKIP] No expire found in stream URL for ${url.slice(0, 80)}`);
@@ -80,7 +110,10 @@ function writeCache(url: string, streamUrl: string, prefix: string): void {
   }
   ensureCacheDir();
   try {
-    writeFileSync(cachePath(url, prefix), JSON.stringify({ url: streamUrl, expire }));
+    writeFileSync(
+      cachePath(url, prefix),
+      JSON.stringify(proxyUrl ? { url: streamUrl, expire, proxy: proxyUrl } : { url: streamUrl, expire }),
+    );
     log.info(
       `[CACHE WRITE] ${prefix}${url.slice(0, 80)}... (expires in ${Math.floor(expire - Date.now() / 1000)}s)`,
     );
@@ -145,12 +178,12 @@ async function resolveUrl(
   kind: 'audio' | 'muxed',
   _formatSelector: string,
   cookies: string | null,
-): Promise<string | null> {
+): Promise<CachedStream | null> {
   try {
-    const itUrl = await innertubeResolve(url, kind, cookies);
-    if (itUrl) {
+    const res = await innertubeResolveMeta(url, kind, cookies);
+    if (res.url) {
       log.info(`[INNERTUBE] ✅ ${kind} ${url.slice(0, 80)}`);
-      return itUrl;
+      return { url: res.url, proxyUrl: res.proxyUrl };
     }
   } catch (e) {
     log.warning(`[INNERTUBE] Resolution failed: ${String(e)}`);
@@ -164,57 +197,63 @@ async function getStreamFor(
   kind: 'audio' | 'muxed',
   formatSelector: string,
   cookies: string | null,
-): Promise<string | null> {
+): Promise<CachedStream | null> {
   // 1. Redis
   try {
     const cached = await redis().get(`cache:${prefix}${url}`);
     if (cached) {
-      log.info(`[REDIS CACHE HIT] ${prefix}${url.slice(0, 80)}...`);
-      return cached;
+      const decoded = decodeCached(cached);
+      if (decoded) {
+        log.info(`[REDIS CACHE HIT] ${prefix}${url.slice(0, 80)}...`);
+        return decoded;
+      }
     }
   } catch (e) {
     log.error(`[REDIS GET ERROR] ${String(e)}`);
   }
 
   // 2. Local file cache
-  const [fileUrl, remaining] = readCache(url, prefix);
+  const [fileUrl, remaining, fileProxy] = readCache(url, prefix);
   if (fileUrl) {
+    const entry: CachedStream = { url: fileUrl, proxyUrl: fileProxy };
     try {
-      await redis().setex(`cache:${prefix}${url}`, remaining, fileUrl);
+      await redis().setex(`cache:${prefix}${url}`, remaining, encodeCached(entry));
     } catch {
       /* ignore */
     }
-    return fileUrl;
+    return entry;
   }
 
   // 3. Resolve target & stream URL
   const [targetUrl, isDirect] = await resolveTargetUrl(url);
-  const streamUrl = isDirect ? targetUrl : await resolveUrl(targetUrl, kind, formatSelector, cookies);
-  if (streamUrl) {
-    writeCache(url, streamUrl, prefix);
-    const expire = extractExpire(streamUrl);
+  const stream = isDirect
+    ? ({ url: targetUrl, proxyUrl: null } as CachedStream)
+    : await resolveUrl(targetUrl, kind, formatSelector, cookies);
+  if (stream) {
+    writeCache(url, stream.url, prefix, stream.proxyUrl);
+    const expire = extractExpire(stream.url);
     if (expire) {
       const ttl = Math.floor(expire - Date.now() / 1000);
       if (ttl > 0) {
         try {
-          await redis().setex(`cache:${prefix}${url}`, ttl, streamUrl);
+          await redis().setex(`cache:${prefix}${url}`, ttl, encodeCached(stream));
         } catch {
           /* ignore */
         }
       }
     }
   }
-  return streamUrl;
+  return stream;
 }
 
-export function getStream(url: string, cookies: string | null = null): Promise<string | null> {
+export function getStream(url: string, cookies: string | null = null): Promise<CachedStream | null> {
   return getStreamFor(url, 'audio:', 'audio', '251/250/140/bestaudio[ext=m4a]/bestaudio/best', cookies);
 }
 
 export function getVideoStream(
   url: string,
   cookies: string | null = null,
-): Promise<string | null> {
+): Promise<CachedStream | null> {
   return getStreamFor(url, 'video:', 'muxed', 'best[ext=mp4]/22/18/best', cookies);
 }
 

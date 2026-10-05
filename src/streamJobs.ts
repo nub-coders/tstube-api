@@ -32,6 +32,8 @@ export interface StreamJob {
   mode: 'audio' | 'video';
   extracted_url: string | null;
   extracted_time: number | null;
+  /** Webshare proxy URL the extracted stream is IP-locked to (null = direct). */
+  proxy_url?: string | null;
 }
 
 const JOB_MEMO = new BoundedCache<StreamJob>(2048, JOB_MEMO_TTL);
@@ -149,16 +151,18 @@ async function jobSet(streamId: string, job: StreamJob, onlyIfExists = false): P
 function startBackgroundExtraction(streamId: string, url: string, mode: 'audio' | 'video'): void {
   void (async () => {
     try {
-      const streamUrl = mode === 'video' ? await getVideoStream(url) : await getStream(url);
-      if (!streamUrl) {
+      const extracted =
+        mode === 'video' ? await getVideoStream(url) : await getStream(url);
+      if (!extracted?.url) {
         log.error(`[STREAM_RESOLVER] Failed to extract ${mode} for ${streamId}`);
         return;
       }
       const job: StreamJob = {
         url,
         mode,
-        extracted_url: streamUrl,
+        extracted_url: extracted.url,
         extracted_time: Date.now() / 1000,
+        proxy_url: extracted.proxyUrl ?? null,
       };
       // Wake local waiters first, then persist.
       jobPublishLocal(streamId, job);
@@ -269,7 +273,7 @@ export async function refreshStreamUrl(
       log.error(`[STREAM_PROXY] Cache invalidation failed for ${streamId}: ${String(e)}`);
     }
 
-    const pending: StreamJob = { ...job, extracted_url: null, extracted_time: null };
+    const pending: StreamJob = { ...job, extracted_url: null, extracted_time: null, proxy_url: null };
     await jobSet(streamId, pending);
     startBackgroundExtraction(streamId, url, mode);
     return awaitExtracted(streamId, REFRESH_WAIT_S);

@@ -89,6 +89,11 @@ export interface Config {
   COOKIE_PROBE_INTERVAL_SEC: number;
   COOKIE_PROBE_DELAY_MS: number;
 
+  // ── Webshare geo-bypass proxy pool ───────────────────────────
+  WEBSHARE_API_KEY: string | null;
+  WEBSHARE_PROXY_COUNTRIES: string;
+  WEBSHARE_REFRESH_SEC: number;
+
   // ── Deployment ───────────────────────────────────────────────
   API_HOST: string;
   BASE_URL: string;
@@ -201,6 +206,10 @@ export function loadConfig(): Config {
     COOKIE_SYNC_INTERVAL_SEC: getint('COOKIE_SYNC_INTERVAL_SEC', 300),
     COOKIE_PROBE_INTERVAL_SEC: getint('COOKIE_PROBE_INTERVAL_SEC', 900),
     COOKIE_PROBE_DELAY_MS: getint('COOKIE_PROBE_DELAY_MS', 3000),
+
+    WEBSHARE_API_KEY: process.env.WEBSHARE_API_KEY || null,
+    WEBSHARE_PROXY_COUNTRIES: (process.env.WEBSHARE_PROXY_COUNTRIES ?? '').toUpperCase(),
+    WEBSHARE_REFRESH_SEC: getint('WEBSHARE_REFRESH_SEC', 600),
 
     API_HOST: apiHost,
     BASE_URL: getenv('BASE_URL', `https://${apiHost}`).replace(/\/+$/, ''),

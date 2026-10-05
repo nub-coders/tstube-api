@@ -3,13 +3,17 @@
  * Primary stream resolver; yt-dlp is the fallback.
  */
 import { Innertube, Platform, Parser, Helpers } from 'youtubei.js';
+import { ProxyAgent } from 'undici';
 import { readFileSync, existsSync } from 'node:fs';
 import { extractArtist, formatInd } from './formatters.js';
 import { getLogger } from './logger.js';
 import { config } from './config.js';
-import { onCookiesUpdated } from './cookies.js';
+import { onCookiesUpdated, isSafeCookiePath } from './cookies.js';
 import { BoundedCache } from './boundedCache.js';
 import { cookiePool } from './cookiePool.js';
+import { websharePool } from './proxy.js';
+import { resolveViaProxy } from './ytdlp.js';
+import type { WebshareProxy } from './proxy.js';
 
 (Platform.shim as any).eval = async (d: any) => new Function(d.output)();
 
@@ -261,6 +265,10 @@ export function isCookieExpired(text: string): { expired: boolean; reason?: stri
 
 export function parseCookieFile(path: string): string | null {
   if (!path || !existsSync(path)) return null;
+  if (!isSafeCookiePath(path)) {
+    log.warning(`[YTJS] Cookie path rejected (relative ".." segment): ${path}`);
+    return null;
+  }
   try {
     return parseCookies(readFileSync(path, 'utf8'));
   } catch (e) {
@@ -282,6 +290,65 @@ export function resetInnertube(): void {
 
 const INNERTUBE_POOL = new BoundedCache<Innertube>(100, 3600);
 
+// Innertube instances whose HTTP traffic is bound to one Webshare exit — one
+// per proxy URL, so the googlevideo URLs they return stay playable through it.
+const PROXIED_INNERTUBE_POOL = new BoundedCache<Innertube>(20, 3600);
+
+function makeProxiedFetch(dispatcher: ProxyAgent): typeof fetch {
+  // globalThis.fetch (not npm-undici's): youtubei.js passes globalThis.Request
+  // instances, and only the global fetch recognizes that class. The
+  // non-standard `dispatcher` init option scopes the proxy to this instance
+  // without touching any other fetch call in the process.
+  const proxied = (input: Parameters<typeof fetch>[0], init?: Record<string, unknown>) =>
+    globalThis.fetch(input, { ...(init ?? {}), dispatcher } as unknown as Parameters<typeof fetch>[1]);
+  return proxied as unknown as typeof fetch;
+}
+
+async function getProxiedInnertube(proxyUrl: string): Promise<Innertube> {
+  const cached = PROXIED_INNERTUBE_POOL.get(proxyUrl);
+  if (cached) return cached;
+  const cookieStr = defaultCookieString();
+  const instance = await Innertube.create({
+    ...(cookieStr ? { cookie: cookieStr } : {}),
+    fetch: makeProxiedFetch(new ProxyAgent(proxyUrl)),
+  });
+  PROXIED_INNERTUBE_POOL.set(proxyUrl, instance);
+  return instance;
+}
+
+/** Cookie string for the default session jar — COOKIES_TEXT first, then COOKIES_FILE. */
+function defaultCookieString(): string | null {
+  let text: string | null | undefined;
+  let cPath: string | undefined;
+  try {
+    const cfg = config();
+    text = cfg.COOKIES_TEXT;
+    cPath = cfg.COOKIES_FILE;
+  } catch {
+    text = process.env.COOKIES_TEXT || process.env.YOUTUBE_COOKIES || process.env.COOKIES;
+    cPath = process.env.COOKIES_FILE || 'cookies.txt';
+  }
+  try {
+    if (text) {
+      const parsed = parseCookies(text);
+      if (parsed) {
+        log.info('[YTJS] Loaded cookies from COOKIES_TEXT environment variable');
+        return parsed;
+      }
+    }
+    if (cPath) {
+      const parsed = parseCookieFile(cPath);
+      if (parsed) {
+        log.info(`[YTJS] Loaded cookies from ${cPath}`);
+        return parsed;
+      }
+    }
+  } catch {
+    /* ignore if config() not yet loaded */
+  }
+  return null;
+}
+
 export async function getInnertube(customCookies?: string | null): Promise<Innertube> {
   if (customCookies) {
     const cookieStr = parseCookies(customCookies);
@@ -298,30 +365,7 @@ export async function getInnertube(customCookies?: string | null): Promise<Inner
 
   if (!ytPromise) {
     ytPromise = (async () => {
-      let cookieStr: string | null = null;
-      try {
-        let text: string | null | undefined;
-        let cPath: string | undefined;
-        try {
-          const cfg = config();
-          text = cfg.COOKIES_TEXT;
-          cPath = cfg.COOKIES_FILE;
-        } catch {
-          text = process.env.COOKIES_TEXT || process.env.YOUTUBE_COOKIES || process.env.COOKIES;
-          cPath = process.env.COOKIES_FILE || 'cookies.txt';
-        }
-
-        if (text) {
-          cookieStr = parseCookies(text);
-          if (cookieStr) log.info('[YTJS] Loaded cookies from COOKIES_TEXT environment variable');
-        }
-        if (!cookieStr && cPath) {
-          cookieStr = parseCookieFile(cPath);
-          if (cookieStr) log.info(`[YTJS] Loaded cookies from ${cPath}`);
-        }
-      } catch {
-        /* ignore if config() not yet loaded */
-      }
+      const cookieStr = defaultCookieString();
 
       const instance = await Innertube.create({
         ...(cookieStr ? { cookie: cookieStr } : {}),
@@ -371,7 +415,13 @@ export function pickMuxed(sd: InnertubeStreamingData): string | null {
   return (pick.url as string) || null;
 }
 
-const RESOLVED_STREAM_CACHE = new BoundedCache<[string | null, string | null]>(2048, 1800);
+export interface ResolveMeta {
+  urls: [string | null, string | null];
+  /** Set when the URL was resolved through the Webshare geo-bypass proxy. */
+  proxyUrl: string | null;
+}
+
+const RESOLVED_STREAM_CACHE = new BoundedCache<ResolveMeta>(2048, 1800);
 
 async function fetchInfo(vid: string, cookies?: string | null): Promise<any | null> {
   const cacheKey = cookies ? `${vid}:${cookies.slice(0, 32)}` : vid;
@@ -400,6 +450,127 @@ interface ResolveAttempt {
   lastError?: string;
 }
 
+/** Pull the best muxed + audio URLs out of resolved player info. */
+async function extractStreamUrls(yt: Innertube, info: any): Promise<[string | null, string | null]> {
+  let muxedUrl: string | null = null;
+  let audioUrl: string | null = null;
+
+  try {
+    const f = info.chooseFormat({ type: 'video+audio', quality: 'best', format: 'any' });
+    if (f) {
+      muxedUrl = (await f.decipher(yt.session.player)) || f.url || null;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  try {
+    const f = info.chooseFormat({ type: 'audio', quality: 'best' });
+    if (f) {
+      audioUrl = (await f.decipher(yt.session.player)) || f.url || null;
+    }
+  } catch {
+    /* ignore */
+  }
+
+  const sd: InnertubeStreamingData = info.streaming_data ?? {};
+  if (!muxedUrl) muxedUrl = pickMuxed(sd);
+  if (!audioUrl) audioUrl = pickAudio(sd);
+  return [muxedUrl, audioUrl];
+}
+
+// Cookie-authenticated MWEB/WEB are the clients that actually pass on the
+// geo-bypass path — the app clients (ANDROID/IOS/TV_SIMPLY) answer 400 when
+// SAPISIDHASH auth rides along, so they come last here.
+const PROXY_CLIENT_LADDER = ['MWEB', 'WEB', 'TV_SIMPLY', 'IOS', 'ANDROID'] as const;
+
+/**
+ * Resolve through a proxied Innertube instance (stage A of the geo-bypass
+ * tier). Both URLs share the same proxy binding, so both are returned.
+ */
+async function attemptResolveWithProxiedInnertube(
+  vid: string,
+  proxyUrl: string,
+): Promise<ResolveMeta | null> {
+  const yt = await getProxiedInnertube(proxyUrl);
+  for (const client of PROXY_CLIENT_LADDER) {
+    try {
+      const info = await yt.getBasicInfo(vid, { client });
+      if (info.playability_status?.status !== 'OK') continue;
+      const [muxedUrl, audioUrl] = await extractStreamUrls(yt, info);
+      if (muxedUrl || audioUrl) {
+        return { urls: [muxedUrl, audioUrl], proxyUrl };
+      }
+    } catch {
+      /* next client */
+    }
+  }
+  return null;
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/**
+ * Tier 4 — Webshare geo-bypass, two stages:
+ *   A. youtubei.js through a scoped proxy dispatcher (fast, ~seconds)
+ *   B. yt-dlp through the same proxy (slower, battle-tested fallback)
+ * The result is pinned to one proxy exit and never written to
+ * RESOLVED_STREAM_CACHE (which holds direct, server-locked URL pairs).
+ */
+async function resolveViaProxyTier(vid: string, kind: 'audio' | 'muxed'): Promise<ResolveMeta | null> {
+  if (!websharePool.enabled) return null;
+  let proxy: WebshareProxy | null = null;
+  try {
+    proxy = await websharePool.getProxy();
+    if (!proxy) return null;
+    log.info(
+      `[YTJS] ${vid} trying Webshare proxy ${proxy.address}:${proxy.port} (${proxy.countryCode || '??'})`,
+    );
+
+    // Stage A — in-process Innertube through the proxy.
+    try {
+      const meta = await withTimeout(
+        attemptResolveWithProxiedInnertube(vid, proxy.url),
+        12_000,
+        'proxied innertube',
+      );
+      if (meta) {
+        websharePool.markOk(proxy.id);
+        log.info(`[YTJS] ✅ ${vid} resolved via Webshare proxy (youtubei.js)`);
+        return meta;
+      }
+    } catch (e) {
+      log.warning(`[YTJS] proxied innertube attempt failed: ${String(e)}`);
+    }
+
+    // Stage B — yt-dlp subprocess through the proxy.
+    const url = await resolveViaProxy(vid, kind, proxy.url);
+    if (url) {
+      websharePool.markOk(proxy.id);
+      log.info(`[YTJS] ✅ ${vid} resolved via Webshare proxy (yt-dlp)`);
+      return { urls: kind === 'audio' ? [null, url] : [url, null], proxyUrl: proxy.url };
+    }
+  } catch (e) {
+    log.warning(`[YTJS] Webshare proxy tier error: ${String(e)}`);
+  }
+  if (proxy) websharePool.markBad(proxy.id);
+  return null;
+}
+
 async function attemptResolveWithCookie(
   vid: string,
   cookies?: string | null,
@@ -425,31 +596,7 @@ async function attemptResolveWithCookie(
         continue;
       }
 
-      let muxedUrl: string | null = null;
-      let audioUrl: string | null = null;
-
-      try {
-        const f = info.chooseFormat({ type: 'video+audio', quality: 'best', format: 'any' });
-        if (f) {
-          muxedUrl = (await f.decipher(yt.session.player)) || f.url || null;
-        }
-      } catch {
-        /* ignore */
-      }
-
-      try {
-        const f = info.chooseFormat({ type: 'audio', quality: 'best' });
-        if (f) {
-          audioUrl = (await f.decipher(yt.session.player)) || f.url || null;
-        }
-      } catch {
-        /* ignore */
-      }
-
-      const sd: InnertubeStreamingData = info.streaming_data ?? {};
-      if (!muxedUrl) muxedUrl = pickMuxed(sd);
-      if (!audioUrl) audioUrl = pickAudio(sd);
-
+      const [muxedUrl, audioUrl] = await extractStreamUrls(yt, info);
       if (muxedUrl || audioUrl) {
         INFO_CACHE.set(vid, info);
         return { urls: [muxedUrl, audioUrl] };
@@ -463,12 +610,13 @@ async function attemptResolveWithCookie(
   return { urls: [null, null], lastError };
 }
 
-export async function resolveBoth(
+export async function resolveBothWithMeta(
   urlOrId: string,
   cookies?: string | null,
-): Promise<[string | null, string | null]> {
+  kind: 'audio' | 'muxed' = 'audio',
+): Promise<ResolveMeta> {
   const vid = extractId(urlOrId);
-  if (!vid) return [null, null];
+  if (!vid) return { urls: [null, null], proxyUrl: null };
 
   if (!cookies) {
     const cached = RESOLVED_STREAM_CACHE.get(vid);
@@ -478,8 +626,10 @@ export async function resolveBoth(
   // If specific cookies were explicitly passed, use them directly
   if (cookies) {
     const attempt = await attemptResolveWithCookie(vid, cookies);
-    return attempt.urls;
+    return { urls: attempt.urls, proxyUrl: null };
   }
+
+  let result: ResolveMeta | null = null;
 
   // If the dynamic MongoDB cookie pool has active accounts, rotate with failover
   if (cookiePool.size > 0) {
@@ -493,8 +643,8 @@ export async function resolveBoth(
       const attempt = await attemptResolveWithCookie(vid, item.cookieString);
       if (attempt.urls[0] || attempt.urls[1]) {
         void cookiePool.reportSuccess(item.id);
-        RESOLVED_STREAM_CACHE.set(vid, attempt.urls);
-        return attempt.urls;
+        result = { urls: attempt.urls, proxyUrl: null };
+        break;
       } else {
         void cookiePool.reportFailure(item.id, attempt.lastError || 'No stream formats returned');
       }
@@ -502,11 +652,39 @@ export async function resolveBoth(
   }
 
   // Fallback to default instance (COOKIES_TEXT / COOKIES_FILE / anonymous)
-  const defaultAttempt = await attemptResolveWithCookie(vid, null);
-  if (defaultAttempt.urls[0] || defaultAttempt.urls[1]) {
-    RESOLVED_STREAM_CACHE.set(vid, defaultAttempt.urls);
+  if (!result) {
+    const defaultAttempt = await attemptResolveWithCookie(vid, null);
+    result = { urls: defaultAttempt.urls, proxyUrl: null };
   }
-  return defaultAttempt.urls;
+
+  if (result.urls[0] || result.urls[1]) {
+    RESOLVED_STREAM_CACHE.set(vid, result);
+  } else {
+    // Tier 4: Webshare geo-bypass for videos YouTube refuses to serve from
+    // this server's IP. Result is kind-specific and pinned to one proxy exit.
+    const viaProxy = await resolveViaProxyTier(vid, kind);
+    if (viaProxy) result = viaProxy;
+  }
+  return result;
+}
+
+export async function resolveBoth(
+  urlOrId: string,
+  cookies?: string | null,
+): Promise<[string | null, string | null]> {
+  return (await resolveBothWithMeta(urlOrId, cookies)).urls;
+}
+
+/** Like `resolve`, but also reports the Webshare proxy the URL is locked to (null when direct). */
+export async function resolveWithMeta(
+  urlOrId: string,
+  kind: 'audio' | 'muxed',
+  cookies?: string | null,
+): Promise<{ url: string | null; proxyUrl: string | null }> {
+  const vid = extractId(urlOrId);
+  if (!vid) return { url: null, proxyUrl: null };
+  const meta = await resolveBothWithMeta(urlOrId, cookies, kind);
+  return { url: kind === 'audio' ? meta.urls[1] : meta.urls[0], proxyUrl: meta.proxyUrl };
 }
 
 export async function resolve(
@@ -514,8 +692,7 @@ export async function resolve(
   kind: 'audio' | 'muxed',
   cookies?: string | null,
 ): Promise<string | null> {
-  const [muxed, audio] = await resolveBoth(urlOrId, cookies);
-  return kind === 'audio' ? audio : muxed;
+  return (await resolveWithMeta(urlOrId, kind, cookies)).url;
 }
 
 export async function metadata(urlOrId: string): Promise<InnertubeMetadata | null> {
