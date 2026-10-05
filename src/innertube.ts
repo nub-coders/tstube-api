@@ -558,11 +558,19 @@ async function resolveViaProxyTier(vid: string, kind: 'audio' | 'muxed'): Promis
     }
 
     // Stage B — yt-dlp subprocess through the proxy.
-    const url = await resolveViaProxy(vid, kind, proxy.url);
+    let stderr = '';
+    const url = await resolveViaProxy(vid, kind, proxy.url, 18, (s) => {
+      stderr += s;
+    });
     if (url) {
       websharePool.markOk(proxy.id);
       log.info(`[YTJS] ✅ ${vid} resolved via Webshare proxy (yt-dlp)`);
       return { urls: kind === 'audio' ? [null, url] : [url, null], proxyUrl: proxy.url };
+    }
+    // HTTP 407 no_proxies_allocated — Webshare auto-replaced this proxy and
+    // our cached address is dead. Evict now and re-fetch the list.
+    if (/407|no_proxies_allocated/i.test(stderr)) {
+      websharePool.evictByUrl(proxy.url);
     }
   } catch (e) {
     log.warning(`[YTJS] Webshare proxy tier error: ${String(e)}`);

@@ -255,7 +255,21 @@ export async function streamResolver(ctx: Ctx): Promise<Result> {
 
   let upstream = await proxyFor(ctx, job.extracted_url, started, job.proxy_url ?? null);
   if (upstream.status === 502 && upstream.error) {
-    return json(502, upstream.error);
+    // A refused dial (HTTP 407 — Webshare replaced the proxy) is recoverable:
+    // the pool already evicted the dead exit, so re-extract through a fresh
+    // one and retry once, exactly like the revoked-URL path.
+    const proxyRefused = Boolean((upstream.error as { proxyRefused?: boolean }).proxyRefused);
+    if (proxyRefused && job.proxy_url) {
+      log.info(`[STREAM_PROXY] Proxy refused dial for ${streamId} — refreshing via a new exit...`);
+      const refreshed = await refreshStreamUrl(streamId, job);
+      const newUrl = refreshed?.extracted_url;
+      if (newUrl && newUrl !== job.extracted_url) {
+        upstream = await proxyFor(ctx, newUrl, started, refreshed?.proxy_url ?? null);
+      }
+    }
+    if (upstream.status === 502 && upstream.error) {
+      return json(502, upstream.error);
+    }
   }
 
   // Revoked-URL recovery, capped at a single retry: googlevideo answers 403/410

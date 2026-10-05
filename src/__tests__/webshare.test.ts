@@ -191,6 +191,19 @@ describe('WebsharePool rotation', () => {
     expect(pool.size).toBe(1);
   });
 
+  it('evictByUrl removes a replaced proxy immediately', async () => {
+    (pool as unknown as { _setCandidatesForTest: (l: WebshareProxy[]) => void })._setCandidatesForTest(
+      list(['gone', 'alive']),
+    );
+    const gone = (await pool.getProxy())!; // 'gone'
+    expect(pool.evictByUrl(gone.url)).toBe(true);
+    expect(pool.size).toBe(1);
+    const next = await pool.getProxy();
+    expect(next?.id).toBe('alive');
+    // Unknown proxy URLs are a no-op.
+    expect(pool.evictByUrl('http://u:p@0.0.0.1:1')).toBe(false);
+  });
+
   it('status() exposes no credentials', () => {
     (pool as unknown as { _setCandidatesForTest: (l: WebshareProxy[]) => void })._setCandidatesForTest(
       list(['s']),

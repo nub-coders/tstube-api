@@ -16,6 +16,7 @@ import tls from 'node:tls';
 import { Readable, PassThrough, type Duplex } from 'node:stream';
 import { getLogger } from './logger.js';
 import { isSafeProxyUrlSync, isPublicHost } from './urlValidation.js';
+import { websharePool } from './proxy.js';
 import * as metrics from './metrics.js';
 
 const log = getLogger('ytube_api.proxy');
@@ -46,7 +47,7 @@ export interface ProxyUpstream {
   /** Instrumented body stream, or null when the response is a JSON error. */
   body: Readable | null;
   /** Present for proxy-generated errors (502, connect failure). */
-  error?: { error: string; message?: string };
+  error?: { error: string; message?: string; /** The Webshare proxy refused the dial (e.g. 407 replaced proxy). */ proxyRefused?: boolean };
 }
 
 export interface ProxyOptions {
@@ -145,6 +146,12 @@ class TunnelAgent extends https.Agent {
         const statusLine = head.slice(0, head.indexOf('\r\n'));
         const statusCode = Number.parseInt(statusLine.split(' ')[1] ?? '', 10);
         if (statusCode !== 200) {
+          if (statusCode === 407) {
+            // no_proxies_allocated: Webshare replaced this proxy; the cached
+            // address (and often credentials) is dead until the list refreshes.
+            fail(new Error('tunnel: proxy no longer allocated (HTTP 407)'));
+            return;
+          }
           fail(new Error(`tunnel: proxy refused CONNECT (HTTP ${statusCode || '?'})`));
           return;
         }
@@ -334,6 +341,10 @@ function dialStream(parsed: URL, opts: ProxyOptions, startedMs: number): Promise
       metrics.recordUpstreamConnect((Date.now() - connectStarted) / 1000);
       metrics.recordStreamError('connect');
       log.error(`[STREAM_PROXY] Upstream connection error: ${String(e)}`);
+      const refused = isHttps && Boolean(proxy) && /no longer allocated|HTTP 407/i.test(String(e));
+      if (refused && opts.proxyUrl) {
+        void websharePool.evictByUrl(opts.proxyUrl);
+      }
       resolve({
         status: 502,
         headers: { 'content-type': 'application/json' },
@@ -341,6 +352,7 @@ function dialStream(parsed: URL, opts: ProxyOptions, startedMs: number): Promise
         error: {
           error: 'Bad Gateway',
           message: `Failed to connect to stream source: ${String(e)}`,
+          ...(refused ? { proxyRefused: true } : {}),
         },
       });
     });

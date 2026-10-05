@@ -284,6 +284,25 @@ export class WebsharePool {
     }
   }
 
+  /**
+   * Remove a proxy from rotation immediately — for HTTP 407
+   * `no_proxies_allocated`, i.e. Webshare auto-replaced it and our cached
+   * address is dead. Re-fetches the list in the background (rate-limited by
+   * the normal refresh guard) so rotation hands out only live exits.
+   */
+  evictByUrl(proxyUrl: string): boolean {
+    const before = this.candidates.length;
+    this.candidates = this.candidates.filter((p) => p.url !== proxyUrl);
+    if (this.candidates.length < before) {
+      log.warning(
+        `[WEBSHARE] Evicting replaced/stale proxy after 407 — ${this.candidates.length} left in pool, refreshing list`,
+      );
+      void this.refresh().catch(() => {});
+      return true;
+    }
+    return false;
+  }
+
   /** Test hook — replace the candidate list without touching the API. */
   _setCandidatesForTest(proxies: WebshareProxy[]): void {
     this.candidates = proxies;
