@@ -19,6 +19,15 @@ const log = getLogger('ytube_api.Stream');
 
 const CACHE_DIR = join(dirname(fileURLToPath(import.meta.url)), '.cache');
 
+/**
+ * Proxy-bound stream URLs are pinned to one Webshare exit, and Webshare can
+ * auto-replace exits at any time (407 no_proxies_allocated). Cap their cache
+ * lifetime well below the 4h googlevideo expiry so a stale pin costs at most
+ * an hour of occasional re-extraction instead of half a day of 407-recovery
+ * stalls.
+ */
+export const PROXY_STREAM_TTL_S = 3600;
+
 function ensureCacheDir(): void {
   try {
     mkdirSync(CACHE_DIR, { recursive: true });
@@ -102,12 +111,19 @@ function readCache(url: string, prefix: string): [string | null, number, string 
   return [null, -1, null];
 }
 
-function writeCache(url: string, streamUrl: string, prefix: string, proxyUrl: string | null = null): void {
-  const expire = extractExpire(streamUrl);
+function writeCache(
+  url: string,
+  streamUrl: string,
+  prefix: string,
+  proxyUrl: string | null = null,
+  maxTtlSec?: number,
+): void {
+  let expire = extractExpire(streamUrl);
   if (!expire) {
     log.warning(`[CACHE SKIP] No expire found in stream URL for ${url.slice(0, 80)}`);
     return;
   }
+  if (maxTtlSec) expire = Math.min(expire, Math.floor(Date.now() / 1000) + maxTtlSec);
   ensureCacheDir();
   try {
     writeFileSync(
@@ -230,10 +246,12 @@ async function getStreamFor(
     ? ({ url: targetUrl, proxyUrl: null } as CachedStream)
     : await resolveUrl(targetUrl, kind, formatSelector, cookies);
   if (stream) {
-    writeCache(url, stream.url, prefix, stream.proxyUrl);
+    const maxTtl = stream.proxyUrl ? PROXY_STREAM_TTL_S : undefined;
+    writeCache(url, stream.url, prefix, stream.proxyUrl, maxTtl);
     const expire = extractExpire(stream.url);
     if (expire) {
-      const ttl = Math.floor(expire - Date.now() / 1000);
+      let ttl = Math.floor(expire - Date.now() / 1000);
+      if (maxTtl) ttl = Math.min(ttl, maxTtl);
       if (ttl > 0) {
         try {
           await redis().setex(`cache:${prefix}${url}`, ttl, encodeCached(stream));

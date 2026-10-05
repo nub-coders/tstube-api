@@ -14,7 +14,7 @@
 import { createHash } from 'node:crypto';
 import { BoundedCache } from './boundedCache.js';
 import { redis } from './redis.js';
-import { getStream, getVideoStream, invalidate } from './cacheManager.js';
+import { getStream, getVideoStream, invalidate, PROXY_STREAM_TTL_S } from './cacheManager.js';
 import { validateYoutubeTarget } from './urlValidation.js';
 import { getLogger } from './logger.js';
 
@@ -139,9 +139,12 @@ function jobForgetLocal(streamId: string): void {
  */
 async function jobSet(streamId: string, job: StreamJob, onlyIfExists = false): Promise<boolean> {
   const payload = JSON.stringify(job);
+  // Proxy-pinned jobs expire with the pinned exit (Webshare can replace it);
+  // direct jobs keep the full googlevideo lifetime.
+  const ttl = job.proxy_url ? Math.min(STREAM_TTL, PROXY_STREAM_TTL_S) : STREAM_TTL;
   const stored = onlyIfExists
-    ? await redis().set(jobKey(streamId), payload, 'EX', STREAM_TTL, 'XX')
-    : await redis().set(jobKey(streamId), payload, 'EX', STREAM_TTL);
+    ? await redis().set(jobKey(streamId), payload, 'EX', ttl, 'XX')
+    : await redis().set(jobKey(streamId), payload, 'EX', ttl);
   if (onlyIfExists && stored === null) return false;
   if (job.extracted_url) jobPublishLocal(streamId, job);
   else jobForgetLocal(streamId);
