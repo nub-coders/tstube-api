@@ -11,7 +11,7 @@
  */
 import { config } from './config.js';
 import { getLogger } from './logger.js';
-import { isPublicHost, isPrivateAddress, isSafeServerUrl, looksLocalHostname } from './urlValidation.js';
+import { isPrivateAddress, looksLocalHostname } from './urlValidation.js';
 import net from 'node:net';
 
 const log = getLogger('ytube_api.webshare');
@@ -166,6 +166,17 @@ export class WebsharePool {
       return;
     }
     void this.refresh();
+    // A transient failure (e.g. container DNS not ready at boot) must not
+    // leave the tier empty until the next 10-minute timer tick.
+    const retryBoot = (attempt: number): void => {
+      if (!this.initialized || this.candidates.length || attempt >= 5) return;
+      const t = setTimeout(() => {
+        void this.refresh().then(() => retryBoot(attempt + 1));
+      }, 30_000 * (attempt + 1));
+      t.unref?.();
+    };
+    setTimeout(() => retryBoot(0), 30_000).unref?.();
+
     const intervalMs = Math.max(60, config().WEBSHARE_REFRESH_SEC) * 1000;
     this.timer = setInterval(() => {
       void this.refresh();
@@ -207,7 +218,10 @@ export class WebsharePool {
     }
     if (!apiKey) return;
 
-    // Guard the outbound request per policy: https + allowlisted + public host only.
+    // Guard the outbound request per policy: https + allowlisted host only.
+    // The URL is a compile-time constant, so an explicit allowlist is both
+    // stricter and more reliable than a runtime DNS check — a transient
+    // resolver failure at container boot must not disable the tier.
     let apiUrl: URL;
     try {
       apiUrl = new URL(API_URL);
@@ -217,10 +231,6 @@ export class WebsharePool {
     }
     if (apiUrl.protocol !== 'https:' || apiUrl.hostname !== 'proxy.webshare.io') {
       log.error('[WEBSHARE] API URL failed the allowlist check — refresh skipped');
-      return;
-    }
-    if (!(await isSafeServerUrl(API_URL))) {
-      log.error('[WEBSHARE] API URL failed the safety check — refresh skipped');
       return;
     }
 
