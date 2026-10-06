@@ -18,6 +18,10 @@ const HEADERS = {
 const YOUTUBE_SEARCH_URL = 'https://www.youtube.com/results?search_query=';
 const YT_REGEX = /ytInitialData\s*=\s*(\{.+?\});/s;
 
+// Bounded like every other outbound fetch: a hung YouTube or Upstash response
+// must not pin the handlers behind the free, unauthenticated endpoints.
+const FETCH_TIMEOUT_MS = 10_000;
+
 export interface SearchItem {
   title: string;
   video_id: string;
@@ -62,7 +66,7 @@ function safeGet(obj: any, ...keys: string[]): any {
 }
 
 async function fetchYtData(url: string): Promise<any | null> {
-  const res = await fetch(url, { headers: HEADERS });
+  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
   const text = await res.text();
   const m = YT_REGEX.exec(text);
   if (!m) return null;
@@ -81,7 +85,7 @@ async function redisGet(key: string): Promise<string | null> {
   try {
     const res = await fetch(
       `${cfg.UPSTASH_REDIS_REST_URL}/get/${encodeURIComponent(key)}`,
-      { headers: { Authorization: `Bearer ${cfg.UPSTASH_REDIS_REST_TOKEN ?? ''}` } },
+      { headers: { Authorization: `Bearer ${cfg.UPSTASH_REDIS_REST_TOKEN ?? ''}` }, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) },
     );
     if (res.status === 200) {
       const body = (await res.json()) as { result?: string | null };
@@ -103,6 +107,7 @@ async function redisSet(key: string, value: string): Promise<void> {
         Authorization: `Bearer ${cfg.UPSTASH_REDIS_REST_TOKEN ?? ''}`,
         'Content-Type': 'application/json',
       },
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       body: JSON.stringify({ value }),
     });
   } catch {
@@ -207,14 +212,14 @@ export async function fetchResults(query: string, limit = 1): Promise<SearchOutp
 export async function fetchTrending(limit = 10): Promise<SearchItem[]> {
   const key = 'trending_music_search';
   const cached = MEMORY_CACHE.get(key);
-  if (cached !== undefined) return cached.main_results;
+  if (cached !== undefined) return cached.main_results.slice(0, limit);
 
   const raw = await redisGet(key);
   if (raw) {
     try {
       const data = JSON.parse(raw) as SearchItem[];
       MEMORY_CACHE.set(key, { main_results: data, suggested: [] });
-      return data;
+      return data.slice(0, limit);
     } catch {
       /* fall through */
     }

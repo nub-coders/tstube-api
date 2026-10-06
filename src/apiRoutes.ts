@@ -26,11 +26,12 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { cookiePool } from './cookiePool.js';
 import { validateYoutubeTarget } from './urlValidation.js';
+import { HttpError } from './httpError.js';
 import { timeTaken } from './pyTime.js';
 import {
   ensureStreamJob,
   resolveMode,
-  awaitExtracted,
+  awaitStreamJob,
   refreshStreamUrl,
 } from './streamJobs.js';
 import { proxyStream } from './streamProxy.js';
@@ -53,10 +54,10 @@ const VERSION = '2026.3.12';
  * The resolver URL handed to clients. FastAPI's url_for uses the request Host;
  * scheme is forced to https. Falls back to BASE_URL when no Host is present.
  */
-function makeTempProxy(ctx: Ctx, streamId: string): string {
+function makeTempProxy(ctx: Ctx, streamToken: string): string {
   const host = ctx.req.headers.host;
-  if (host) return `https://${host}/stream/resolver/${streamId}`;
-  return `${config().BASE_URL}/stream/resolver/${streamId}`;
+  if (host) return `https://${host}/stream/resolver/${streamToken}`;
+  return `${config().BASE_URL}/stream/resolver/${streamToken}`;
 }
 
 /** main._resolve_stream_url_for_info — note the `redirect` arg is unused in Python. */
@@ -84,6 +85,19 @@ function extractVideoIdFromUrl(value: string): string | null {
 
 function errorBody(e: unknown, start: number): Record<string, unknown> {
   return { error: e instanceof Error ? e.message : String(e), time_taken: timeTaken(start) };
+}
+
+/**
+ * Shared catch-all translation for handler failures. Client-facing errors —
+ * HttpError from the guards, ValueError from the playlist parser — keep their
+ * status and message. Anything else is an internal fault: respond with a
+ * generic 500 and keep the detail in the server log, never the body.
+ */
+function failureResult(e: unknown, start: number): Result {
+  if (e instanceof HttpError) return json(e.status, e.payload);
+  if (e instanceof ValueError) return json(400, errorBody(e, start));
+  log.error(`[ROUTES] internal failure: ${String(e)}`);
+  return json(500, { error: 'Internal Server Error', time_taken: timeTaken(start) });
 }
 
 // ── Root / health / favicons ────────────────────────────────────
@@ -156,7 +170,7 @@ export async function searchSongs(ctx: Ctx): Promise<Result> {
       time_taken: timeTaken(start),
     });
   } catch (e) {
-    return json(400, errorBody(e, start));
+    return failureResult(e, start);
   }
 }
 
@@ -173,7 +187,7 @@ export async function trendingSongs(ctx: Ctx): Promise<Result> {
       time_taken: timeTaken(start),
     });
   } catch (e) {
-    return json(400, errorBody(e, start));
+    return failureResult(e, start);
   }
 }
 
@@ -192,7 +206,7 @@ export async function suggestSongs(ctx: Ctx): Promise<Result> {
       time_taken: timeTaken(start),
     });
   } catch (e) {
-    return json(400, errorBody(e, start));
+    return failureResult(e, start);
   }
 }
 
@@ -232,23 +246,26 @@ export async function streamUrl(ctx: Ctx): Promise<Result> {
     }
     return json(200, { url: q, stream_url: streamUrlValue, time_taken: elapsed });
   } catch (e) {
-    return json(400, errorBody(e, start));
+    return failureResult(e, start);
   }
 }
 
 // ── /stream/resolver/{id} and /stream/proxy/{id} ────────────────
 
 export async function streamResolver(ctx: Ctx): Promise<Result> {
-  const streamId = ctx.params.stream_id!;
   const started = Date.now();
-  const job = await awaitExtracted(streamId);
+  // Validate the "<id>.<secret>" capability before waiting: unknown ids and
+  // wrong secrets 404 identically, so job existence is not observable.
+  const resolved = await awaitStreamJob(ctx.params.stream_id!);
 
-  if (job === null) {
+  if (resolved === null) {
     return json(404, {
       error: 'Stream not found',
       hint: 'Use /stream or /stream/redirect to get a valid URL',
     });
   }
+  const { streamId, job } = resolved;
+
   if (!job.extracted_url) {
     return json(500, { error: 'Failed to extract stream URL', url: job.url });
   }
@@ -400,7 +417,7 @@ export async function videoInfo(ctx: Ctx): Promise<Result> {
       time_taken: timeTaken(start),
     });
   } catch (e) {
-    return json(400, errorBody(e, start));
+    return failureResult(e, start);
   }
 }
 
@@ -419,8 +436,8 @@ export async function playlistSongs(ctx: Ctx): Promise<Result> {
       time_taken: timeTaken(start),
     });
   } catch (e) {
-    if (e instanceof ValueError) return json(400, errorBody(e, start));
-    return json(500, errorBody(e, start));
+    // failureResult keeps the ValueError → 400 mapping from the Python port.
+    return failureResult(e, start);
   }
 }
 

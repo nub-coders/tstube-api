@@ -22,6 +22,8 @@ const FETCH_TIMEOUT_MS = 15_000;
 const MAX_FAILURES_PER_PROXY = 3;
 /** Never re-fetch more often than this (rate-limit headroom for the API). */
 const MIN_REFRESH_INTERVAL_MS = 30_000;
+/** How long an on-demand country-filtered fetch stays authoritative. */
+const COUNTRY_FETCH_TTL_MS = 5 * 60_000;
 
 export interface WebshareProxy {
   id: string;
@@ -58,6 +60,29 @@ function toEpoch(value: unknown): number {
   if (typeof value !== 'string' || !value) return 0;
   const t = Date.parse(value);
   return Number.isNaN(t) ? 0 : t / 1000;
+}
+
+function apiKey(): string | null {
+  try {
+    return config().WEBSHARE_API_KEY || null;
+  } catch {
+    return process.env.WEBSHARE_API_KEY || null;
+  }
+}
+
+/**
+ * The compile-time API URL, re-validated per request: https + the allowlisted
+ * host only (SSRF guard). Only query params may vary between calls (e.g. the
+ * country filter); the origin may not.
+ */
+function guardedApiUrl(): URL | null {
+  try {
+    const url = new URL(API_URL);
+    if (url.protocol === 'https:' && url.hostname === 'proxy.webshare.io') return url;
+  } catch {
+    /* fall through */
+  }
+  return null;
 }
 
 /** A proxy exit must be a public host — never an internal address. */
@@ -140,6 +165,7 @@ export class WebsharePool {
   private candidates: WebshareProxy[] = [];
   private rrIndex = 0;
   private failures = new Map<string, number>();
+  private countryFetches = new Map<string, { at: number; proxy: WebshareProxy | null; inflight?: Promise<WebshareProxy | null> }>();
   private timer: NodeJS.Timeout | null = null;
   private refreshInflight: Promise<void> | null = null;
   private lastRefreshAt = 0;
@@ -190,6 +216,7 @@ export class WebsharePool {
       this.timer = null;
     }
     this.candidates = [];
+    this.countryFetches.clear();
     this.initialized = false;
   }
 
@@ -207,36 +234,29 @@ export class WebsharePool {
     if (now - this.lastRefreshAt < MIN_REFRESH_INTERVAL_MS) return;
     this.lastRefreshAt = now;
 
-    let apiKey: string | null = null;
+    const apiKeyValue = apiKey();
+    if (!apiKeyValue) return;
+
     let countries = '';
     try {
-      apiKey = config().WEBSHARE_API_KEY;
       countries = config().WEBSHARE_PROXY_COUNTRIES;
     } catch {
-      apiKey = process.env.WEBSHARE_API_KEY || null;
       countries = (process.env.WEBSHARE_PROXY_COUNTRIES || '').toUpperCase();
     }
-    if (!apiKey) return;
 
     // Guard the outbound request per policy: https + allowlisted host only.
     // The URL is a compile-time constant, so an explicit allowlist is both
     // stricter and more reliable than a runtime DNS check — a transient
     // resolver failure at container boot must not disable the tier.
-    let apiUrl: URL;
-    try {
-      apiUrl = new URL(API_URL);
-    } catch {
-      log.error('[WEBSHARE] API URL is not parseable — refresh skipped');
-      return;
-    }
-    if (apiUrl.protocol !== 'https:' || apiUrl.hostname !== 'proxy.webshare.io') {
+    const apiUrl = guardedApiUrl();
+    if (!apiUrl) {
       log.error('[WEBSHARE] API URL failed the allowlist check — refresh skipped');
       return;
     }
 
     try {
-      const resp = await fetch(API_URL, {
-        headers: { Authorization: `Token ${apiKey}`, Accept: 'application/json' },
+      const resp = await fetch(apiUrl, {
+        headers: { Authorization: `Token ${apiKeyValue}`, Accept: 'application/json' },
         signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
       });
       if (!resp.ok) {
@@ -271,6 +291,154 @@ export class WebsharePool {
     const proxy = this.candidates[this.rrIndex % this.candidates.length]!;
     this.rrIndex = (this.rrIndex + 1) % this.candidates.length;
     return proxy;
+  }
+
+  /**
+   * Up to `limit` distinct pool exits for geo-targeted resolution,
+   * priority-ordered: for a whitelist, every allowed country keeps its place
+   * in the priority order and exits rotate within each country across calls;
+   * for a blacklist, the first `limit` exits outside the blocked set. Pool-only
+   * (no API calls) — callers fall back to on-demand country fetches when this
+   * returns empty. Webshare's country labels often disagree with Google's
+   * geo-IP view of datacenter IPs, so callers must be prepared to try more
+   * than one candidate.
+   */
+  getGeoCandidates(
+    codes: { allowed?: string[]; blocked?: string[] },
+    limit = 3,
+  ): WebshareProxy[] {
+    const out: WebshareProxy[] = [];
+    const push = (p: WebshareProxy): void => {
+      if (out.length < limit && !out.some((q) => q.id === p.id)) out.push(p);
+    };
+
+    if (codes.allowed?.length) {
+      const wanted = [...new Set(
+        codes.allowed.map((c) => c.trim().toUpperCase()).filter((c) => /^[A-Z]{2}$/.test(c)),
+      )];
+      for (const code of wanted) {
+        if (out.length >= limit) break;
+        const matches = this.candidates.filter((p) => p.countryCode === code);
+        if (!matches.length) continue;
+        // Rotate within the country so repeated jobs lead with different exits.
+        const start = this.rrIndex % matches.length;
+        for (const p of [...matches.slice(start), ...matches.slice(0, start)]) {
+          push(p);
+          if (out.length >= limit) break;
+        }
+      }
+      if (out.length) this.rrIndex = (this.rrIndex + 1) % Math.max(1, this.candidates.length);
+      return out;
+    }
+
+    if (codes.blocked?.length) {
+      const blocked = new Set(codes.blocked.map((c) => c.trim().toUpperCase()));
+      const matches = this.candidates.filter((p) => !blocked.has(p.countryCode));
+      const start = matches.length ? this.rrIndex % matches.length : 0;
+      for (const p of [...matches.slice(start), ...matches.slice(0, start)]) {
+        push(p);
+        if (out.length >= limit) break;
+      }
+      if (matches.length) this.rrIndex = (this.rrIndex + 1) % Math.max(1, this.candidates.length);
+    }
+    return out;
+  }
+
+  /**
+   * A proxy in one of `codes` — for videos geo-restricted to specific
+   * countries. Order: cached pool → one list refresh → on-demand
+   * country-filtered API fetch. null when nothing matches; callers fall
+   * back to plain rotation.
+   */
+  async getProxyForCountries(codes: string[]): Promise<WebshareProxy | null> {    const wanted = [...new Set(
+      codes.map((c) => c.trim().toUpperCase()).filter((c) => /^[A-Z]{2}$/.test(c)),
+    )];
+    if (!this.enabled || !wanted.length) return null;
+
+    const direct = this.pickForCountries(wanted);
+    if (direct) return direct;
+
+    if (Date.now() - this.lastRefreshAt >= MIN_REFRESH_INTERVAL_MS) {
+      await this.refresh().catch(() => {});
+      const refreshed = this.pickForCountries(wanted);
+      if (refreshed) return refreshed;
+    }
+
+    for (const code of wanted) {
+      const proxy = await this.fetchCountryProxy(code);
+      if (proxy) return proxy;
+    }
+    return null;
+  }
+
+  /**
+   * A cached exit NOT in `codes` — for blacklist-style restrictions
+   * (Data API regionRestriction.blocked). Pool-only: the API cannot
+   * enumerate the complement of a blocked list.
+   */
+  getProxyNotInCountries(codes: string[]): WebshareProxy | null {
+    const blocked = new Set(codes.map((c) => c.trim().toUpperCase()));
+    const matches = this.candidates.filter((p) => !blocked.has(p.countryCode));
+    if (!matches.length) return null;
+    const proxy = matches[this.rrIndex % matches.length]!;
+    this.rrIndex = (this.rrIndex + 1) % matches.length;
+    return proxy;
+  }
+
+  /** Rotate within the cached candidates restricted to `codes` (priority order). */
+  private pickForCountries(codes: string[]): WebshareProxy | null {
+    for (const code of codes) {
+      const matches = this.candidates.filter((p) => p.countryCode === code);
+      if (matches.length) {
+        const proxy = matches[this.rrIndex % matches.length]!;
+        this.rrIndex = (this.rrIndex + 1) % matches.length;
+        return proxy;
+      }
+    }
+    return null;
+  }
+
+  /** Country-filtered on-demand fetch (5-min cache, single-flight per country). */
+  private async fetchCountryProxy(code: string): Promise<WebshareProxy | null> {
+    const entry = this.countryFetches.get(code);
+    if (entry && Date.now() - entry.at < COUNTRY_FETCH_TTL_MS) return entry.proxy ?? null;
+    if (entry?.inflight) return entry.inflight;
+
+    const inflight = this.doCountryFetch(code).finally(() => {
+      const current = this.countryFetches.get(code);
+      if (current) current.inflight = undefined;
+    });
+    this.countryFetches.set(code, { at: Date.now(), proxy: null, inflight });
+    return inflight;
+  }
+
+  private async doCountryFetch(code: string): Promise<WebshareProxy | null> {
+    const key = apiKey();
+    const base = guardedApiUrl();
+    if (!key || !base) return null;
+    // Same guarded origin as the pool refresh; only the country filter varies.
+    base.searchParams.set('country_code', code);
+    try {
+      const resp = await fetch(base, {
+        headers: { Authorization: `Token ${key}`, Accept: 'application/json' },
+        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      });
+      if (!resp.ok) {
+        log.warning(`[WEBSHARE] Country fetch ${code} failed: HTTP ${resp.status}`);
+        return null;
+      }
+      const parsed = parseProxyList(await resp.json(), { countries: code });
+      const proxy = parsed.proxies[0] ?? null;
+      this.countryFetches.set(code, { at: Date.now(), proxy });
+      log.info(
+        `[WEBSHARE] Country fetch ${code}: ${parsed.proxies.length} proxy(ies)` +
+          (proxy ? ` — ${proxy.address}` : ''),
+      );
+      return proxy;
+    } catch (e) {
+      log.warning(`[WEBSHARE] Country fetch ${code} failed: ${String(e)}`);
+      return null;
+    }
   }
 
   /** A resolution succeeded through this proxy — clear its failure count. */
@@ -318,6 +486,7 @@ export class WebsharePool {
     this.candidates = proxies;
     this.rrIndex = 0;
     this.failures.clear();
+    this.countryFetches.clear();
   }
 
   /** Operational snapshot (no credentials). */

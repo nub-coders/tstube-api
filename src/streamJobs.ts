@@ -6,12 +6,18 @@
  * different replicas behind a non-sticky load balancer. TTL covers the 45s
  * resolver wait + buffer.
  *
+ * Resolver URLs are bearer capabilities: "<coreId>.<secret>". The coreId is
+ * sha256(mode:url) — derivable by anyone who knows the video URL — so the
+ * random secret stored in the job is what keeps the unauthenticated resolver
+ * endpoint from being an open stream for every known video. Only capability
+ * URLs the API issued to an authenticated caller resolve.
+ *
  * Three in-process caches mirror the Python globals:
  *   _JOB_MEMO      completed jobs only (a pending job is what waiters watch change)
  *   _JOB_EVENTS    wakes local waiters the instant extraction finishes
  *   _REFRESH_LOCKS coalesces concurrent 403 refreshes of the same id
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { BoundedCache } from './boundedCache.js';
 import { redis } from './redis.js';
 import { getStream, getVideoStream, invalidate, PROXY_STREAM_TTL_S } from './cacheManager.js';
@@ -34,6 +40,13 @@ export interface StreamJob {
   extracted_time: number | null;
   /** Webshare proxy URL the extracted stream is IP-locked to (null = direct). */
   proxy_url?: string | null;
+  /**
+   * Capability secret bound into resolver URLs ("<coreId>.<secret>"). Jobs are
+   * keyed by sha256(mode:url), which anyone can compute, so this secret is
+   * what makes a resolver URL unguessable. Absent only on jobs written by a
+   * pre-capability replica; ensureStreamJob backfills those on first touch.
+   */
+  secret?: string;
 }
 
 const JOB_MEMO = new BoundedCache<StreamJob>(2048, JOB_MEMO_TTL);
@@ -94,6 +107,27 @@ export function encodeStreamId(url: string, mode: string): string {
   return digest.toString('base64url');
 }
 
+/** 128-bit random capability secret, base64url (URL-safe, contains no dots). */
+function newStreamSecret(): string {
+  return randomBytes(16).toString('base64url');
+}
+
+/** The resolver URL token handed to clients: "<coreId>.<secret>". */
+export function streamCapability(streamId: string, secret: string): string {
+  return `${streamId}.${secret}`;
+}
+
+/**
+ * Split a resolver token into its core id and secret. Both halves are
+ * base64url (no dots), so the first dot is the separator; anything without
+ * one — including pre-capability bare ids — is malformed.
+ */
+export function parseStreamCapability(token: string): { streamId: string; secret: string } | null {
+  const dot = token.indexOf('.');
+  if (dot <= 0 || dot === token.length - 1) return null;
+  return { streamId: token.slice(0, dot), secret: token.slice(dot + 1) };
+}
+
 /** Mirrors main._resolve_mode. */
 export function resolveMode(mode: string): 'audio' | 'video' {
   return ['video', 'stream', 'muxed'].includes(String(mode).toLowerCase()) ? 'video' : 'audio';
@@ -151,7 +185,12 @@ async function jobSet(streamId: string, job: StreamJob, onlyIfExists = false): P
   return true;
 }
 
-function startBackgroundExtraction(streamId: string, url: string, mode: 'audio' | 'video'): void {
+function startBackgroundExtraction(
+  streamId: string,
+  url: string,
+  mode: 'audio' | 'video',
+  secret: string,
+): void {
   void (async () => {
     try {
       const extracted =
@@ -166,6 +205,7 @@ function startBackgroundExtraction(streamId: string, url: string, mode: 'audio' 
         extracted_url: extracted.url,
         extracted_time: Date.now() / 1000,
         proxy_url: extracted.proxyUrl ?? null,
+        secret,
       };
       // Wake local waiters first, then persist.
       jobPublishLocal(streamId, job);
@@ -188,8 +228,9 @@ export async function ensureStreamJob(url: string, mode: string): Promise<string
   validateYoutubeTarget(url); // SSRF guard: only YouTube targets reach yt-dlp
   const resolvedMode = resolveMode(mode);
   const streamId = encodeStreamId(url, resolvedMode);
+  let secret = newStreamSecret();
 
-  const pending: StreamJob = { url, mode: resolvedMode, extracted_url: null, extracted_time: null };
+  const pending: StreamJob = { url, mode: resolvedMode, extracted_url: null, extracted_time: null, secret };
   const created = await redis().set(
     jobKey(streamId),
     JSON.stringify(pending),
@@ -201,16 +242,32 @@ export async function ensureStreamJob(url: string, mode: string): Promise<string
   if (created) {
     // A fresh pending job supersedes anything this process remembers for that id.
     jobForgetLocal(streamId);
-    startBackgroundExtraction(streamId, url, resolvedMode);
+    startBackgroundExtraction(streamId, url, resolvedMode, secret);
   } else {
     // A long TTL means a job whose extraction failed would otherwise stay dead
     // for hours. Retry it — repeat resolves are cheap, the cache serves them.
     const job = await jobGet(streamId);
-    if (job !== null && job.extracted_url === null) {
-      startBackgroundExtraction(streamId, url, resolvedMode);
+    if (job === null) {
+      // Lost the claim but the key lapsed before we could read it: claim it
+      // outright so the capability returned below stays valid.
+      await redis().set(jobKey(streamId), JSON.stringify(pending), 'EX', STREAM_TTL);
+      startBackgroundExtraction(streamId, url, resolvedMode, secret);
+      return streamCapability(streamId, secret);
+    }
+    if (job.secret) {
+      // Same job everybody gets for this url+mode: reuse its capability.
+      secret = job.secret;
+    } else {
+      // Pre-capability job: backfill a secret so the URL issued now is the
+      // only valid resolver token for it. Bare-id URLs stay rejected.
+      secret = newStreamSecret();
+      await jobSet(streamId, { ...job, secret }, true);
+    }
+    if (job.extracted_url === null) {
+      startBackgroundExtraction(streamId, url, resolvedMode, secret);
     }
   }
-  return streamId;
+  return streamCapability(streamId, secret);
 }
 
 /** Wait (up to `timeout` seconds) for a job with extracted_url, or null if gone. */
@@ -231,6 +288,26 @@ export async function awaitExtracted(
     if (job === null || job.extracted_url) break;
   }
   return job;
+}
+
+/**
+ * Validate a resolver capability ("<coreId>.<secret>") and wait for its job.
+ * Malformed tokens, unknown ids and wrong secrets all return null — the
+ * resolver answers them identically, so job existence is not observable. The
+ * secret is checked before the extraction wait, so forged tokens 404
+ * immediately instead of holding the connection for the full timeout.
+ */
+export async function awaitStreamJob(
+  capability: string,
+  timeout = AWAIT_TIMEOUT_S,
+): Promise<{ streamId: string; job: StreamJob } | null> {
+  const parsed = parseStreamCapability(capability);
+  if (!parsed) return null;
+  const known = await jobGet(parsed.streamId);
+  if (known === null || known.secret !== parsed.secret) return null;
+  const job = await awaitExtracted(parsed.streamId, timeout);
+  if (job === null || job.secret !== parsed.secret) return null;
+  return { streamId: parsed.streamId, job };
 }
 
 /** Serialize refreshes per stream id (Python's per-id asyncio.Lock). */
@@ -262,6 +339,9 @@ export async function refreshStreamUrl(
   const { url, mode } = job;
   if (!url || !mode) return null;
   const deadUrl = job.extracted_url;
+  // Re-extractions keep the capability secret so the resolver URL issued for
+  // the original job keeps working across refreshes.
+  const secret = job.secret ?? newStreamSecret();
 
   return withRefreshLock(streamId, async () => {
     // A concurrent request may have already refreshed this while we queued.
@@ -276,9 +356,9 @@ export async function refreshStreamUrl(
       log.error(`[STREAM_PROXY] Cache invalidation failed for ${streamId}: ${String(e)}`);
     }
 
-    const pending: StreamJob = { ...job, extracted_url: null, extracted_time: null, proxy_url: null };
+    const pending: StreamJob = { ...job, extracted_url: null, extracted_time: null, proxy_url: null, secret };
     await jobSet(streamId, pending);
-    startBackgroundExtraction(streamId, url, mode);
+    startBackgroundExtraction(streamId, url, mode, secret);
     return awaitExtracted(streamId, REFRESH_WAIT_S);
   });
 }

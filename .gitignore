@@ -21,3 +21,6 @@ cf-worker-test/
 .mimosa/
 .v2c/
 .video_agent/
+.env.*
+!.env.example
+.tmp-qa/

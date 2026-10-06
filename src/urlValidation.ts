@@ -54,15 +54,6 @@ export function isAllowedTarget(value: string | null | undefined): boolean {
   return false;
 }
 
-export class InvalidTargetError extends Error {
-  readonly statusCode = 400;
-  readonly detail = 'Invalid target: only allowed streaming target URLs or search queries permitted';
-  constructor() {
-    super('Invalid target: only allowed streaming target URLs or search queries permitted');
-    this.name = 'InvalidTargetError';
-  }
-}
-
 /** Return `value` if it's an allowed target URL or search phrase, else raise a 400. */
 export function validateTarget(value: string): string {
   if (!isAllowedTarget(value)) {

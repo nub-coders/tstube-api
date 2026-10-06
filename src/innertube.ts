@@ -13,6 +13,7 @@ import { BoundedCache } from './boundedCache.js';
 import { cookiePool } from './cookiePool.js';
 import { websharePool } from './proxy.js';
 import { resolveViaProxy } from './ytdlp.js';
+import { fetchRegionRestriction } from './youtubeApi.js';
 import type { WebshareProxy } from './proxy.js';
 
 (Platform.shim as any).eval = async (d: any) => new Function(d.output)();
@@ -448,6 +449,38 @@ async function fetchInfo(vid: string, cookies?: string | null): Promise<any | nu
 interface ResolveAttempt {
   urls: [string | null, string | null];
   lastError?: string;
+  /** Set when a playability failure was classified as a geo-restriction. */
+  geoBlocked?: boolean;
+  /** availableCountries from the player microformat, when present. */
+  microCountries?: string[];
+}
+
+/** Allowlist/blacklist of countries a video is playable in. */
+interface GeoRestriction {
+  allowed: string[];
+  blocked: string[];
+}
+
+/**
+ * True when a playability failure means the video is region-restricted from
+ * this server's location — the one failure class where retrying through a
+ * proxy in an allowed country is the fix rather than another attempt.
+ * "available in your country" covers both "has not made this video available…"
+ * and "is not available…" wordings; that phrase only ever appears in
+ * region-availability errors.
+ */
+export function isGeoBlockedError(error: string): boolean {
+  return /available in (?:your|this) country|blocked it in your country|geo-?restrict/i.test(error);
+}
+
+/** ISO codes where the video is playable, per the player microformat (often absent). */
+export function extractGeoCountries(info: unknown): string[] {
+  const mf = (info as { microformat?: { available_countries?: unknown } } | null)?.microformat;
+  const raw = (mf as { available_countries?: unknown } | null | undefined)?.available_countries;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((c): c is string => typeof c === 'string' && /^[A-Za-z]{2}$/.test(c))
+    .map((c) => c.toUpperCase());
 }
 
 /** Pull the best muxed + audio URLs out of resolved player info. */
@@ -528,24 +561,61 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
  * Tier 4 — Webshare geo-bypass, two stages:
  *   A. youtubei.js through a scoped proxy dispatcher (fast, ~seconds)
  *   B. yt-dlp through the same proxy (slower, battle-tested fallback)
+ * When the failure was classified as a geo-restriction, the proxy is targeted
+ * at a country where the video is playable (whitelist) or at least outside
+ * the blocked set (blacklist); everything else keeps plain round-robin.
+ * Webshare's country labels often disagree with Google's geo-IP view of
+ * datacenter IPs (live: 1 of 4 whitelist-matched exits actually worked), so
+ * up to PROXY_CANDIDATES exits are tried under a time budget before giving up.
  * The result is pinned to one proxy exit and never written to
  * RESOLVED_STREAM_CACHE (which holds direct, server-locked URL pairs).
  */
-async function resolveViaProxyTier(vid: string, kind: 'audio' | 'muxed'): Promise<ResolveMeta | null> {
+const PROXY_CANDIDATES = 3;
+const TIER_BUDGET_MS = 35_000;
+const PROXY_STAGE_A_TIMEOUT_MS = 8_000;
+const PROXY_STAGE_B_TIMEOUT_S = 10;
+
+async function resolveViaProxyTier(
+  vid: string,
+  kind: 'audio' | 'muxed',
+  geo?: GeoRestriction,
+): Promise<ResolveMeta | null> {
   if (!websharePool.enabled) return null;
-  let proxy: WebshareProxy | null = null;
-  try {
-    proxy = await websharePool.getProxy();
-    if (!proxy) return null;
+
+  let candidates: WebshareProxy[] = [];
+  if (geo?.allowed?.length) {
+    candidates = websharePool.getGeoCandidates({ allowed: geo.allowed }, PROXY_CANDIDATES);
+    if (!candidates.length) {
+      // Pool has no exit in any allowed country — try the on-demand fetch.
+      const p = await websharePool.getProxyForCountries(geo.allowed).catch(() => null);
+      if (p) candidates.push(p);
+    }
+  } else if (geo?.blocked?.length) {
+    candidates = websharePool.getGeoCandidates({ blocked: geo.blocked }, PROXY_CANDIDATES);
+  }
+  if (!candidates.length) {
+    while (candidates.length < PROXY_CANDIDATES) {
+      const p = await websharePool.getProxy();
+      if (!p || candidates.some((c) => c.id === p.id)) break;
+      candidates.push(p);
+    }
+  }
+  if (!candidates.length) return null;
+
+  const deadline = Date.now() + TIER_BUDGET_MS;
+  for (let i = 0; i < candidates.length; i++) {
+    const proxy = candidates[i]!;
     log.info(
-      `[YTJS] ${vid} trying Webshare proxy ${proxy.address}:${proxy.port} (${proxy.countryCode || '??'})`,
+      `[YTJS] ${vid} Webshare candidate ${i + 1}/${candidates.length}: ${proxy.address}:${proxy.port} (${proxy.countryCode || '??'})` +
+        (geo ? ` — geo target [${geo.allowed.join(',') || 'any'}], avoid [${geo.blocked.join(',') || 'none'}]` : ''),
     );
 
     // Stage A — in-process Innertube through the proxy.
     try {
+      const budget = Math.min(PROXY_STAGE_A_TIMEOUT_MS, Math.max(1_000, deadline - Date.now()));
       const meta = await withTimeout(
         attemptResolveWithProxiedInnertube(vid, proxy.url),
-        12_000,
+        budget,
         'proxied innertube',
       );
       if (meta) {
@@ -556,26 +626,26 @@ async function resolveViaProxyTier(vid: string, kind: 'audio' | 'muxed'): Promis
     } catch (e) {
       log.warning(`[YTJS] proxied innertube attempt failed: ${String(e)}`);
     }
+    if (Date.now() >= deadline) break;
 
     // Stage B — yt-dlp subprocess through the proxy.
     let stderr = '';
-    const url = await resolveViaProxy(vid, kind, proxy.url, 18, (s) => {
+    const budgetS = Math.max(5, Math.min(PROXY_STAGE_B_TIMEOUT_S, Math.ceil((deadline - Date.now()) / 1000)));
+    const url = await resolveViaProxy(vid, kind, proxy.url, budgetS, (s) => {
       stderr += s;
     });
     if (url) {
       websharePool.markOk(proxy.id);
       log.info(`[YTJS] ✅ ${vid} resolved via Webshare proxy (yt-dlp)`);
-      return { urls: kind === 'audio' ? [null, url] : [url, null], proxyUrl: proxy.url };
+      return kind === 'audio' ? { urls: [null, url], proxyUrl: proxy.url } : { urls: [url, null], proxyUrl: proxy.url };
     }
     // HTTP 407 no_proxies_allocated — Webshare auto-replaced this proxy and
     // our cached address is dead. Evict now and re-fetch the list.
     if (/407|no_proxies_allocated/i.test(stderr)) {
       websharePool.evictByUrl(proxy.url);
     }
-  } catch (e) {
-    log.warning(`[YTJS] Webshare proxy tier error: ${String(e)}`);
+    websharePool.markBad(proxy.id);
   }
-  if (proxy) websharePool.markBad(proxy.id);
   return null;
 }
 
@@ -593,6 +663,8 @@ async function attemptResolveWithCookie(
 
   const clients = ['TV_SIMPLY', 'MWEB', 'IOS', 'WEB', 'ANDROID'] as const;
   let lastError = 'No stream formats returned';
+  let geoBlocked = false;
+  let microCountries: string[] = [];
 
   for (const client of clients) {
     try {
@@ -601,6 +673,12 @@ async function attemptResolveWithCookie(
         const st = info.playability_status?.status || 'STATUS_NOT_OK';
         const reason = info.playability_status?.reason || '';
         lastError = `${st}: ${reason}`.trim();
+        // A geo restriction is server-IP dependent: once any client reports
+        // it, a proxy from an allowed country is the targeted next step.
+        if (!geoBlocked && isGeoBlockedError(lastError)) {
+          geoBlocked = true;
+          microCountries = extractGeoCountries(info);
+        }
         continue;
       }
 
@@ -615,7 +693,14 @@ async function attemptResolveWithCookie(
     }
   }
 
-  return { urls: [null, null], lastError };
+  return { urls: [null, null], lastError, geoBlocked, microCountries };
+}
+
+/** First geo-classified failure fixes the restriction (allowlist + blacklist). */
+function geoFromAttempt(attempt: ResolveAttempt): GeoRestriction | null {
+  return attempt.geoBlocked
+    ? { allowed: attempt.microCountries ?? [], blocked: [] }
+    : null;
 }
 
 export async function resolveBothWithMeta(
@@ -639,6 +724,11 @@ export async function resolveBothWithMeta(
 
   let result: ResolveMeta | null = null;
 
+  // Geo-restriction observed by any direct attempt: the official Data API is
+  // the authoritative source when keys exist (1 quota unit); the player
+  // microformat's availableCountries is the keyless fallback.
+  let geo: GeoRestriction | null = null;
+
   // If the dynamic MongoDB cookie pool has active accounts, rotate with failover
   if (cookiePool.size > 0) {
     const active = cookiePool.getAllActive();
@@ -654,6 +744,7 @@ export async function resolveBothWithMeta(
         result = { urls: attempt.urls, proxyUrl: null };
         break;
       } else {
+        geo ??= geoFromAttempt(attempt);
         void cookiePool.reportFailure(item.id, attempt.lastError || 'No stream formats returned');
       }
     }
@@ -662,7 +753,21 @@ export async function resolveBothWithMeta(
   // Fallback to default instance (COOKIES_TEXT / COOKIES_FILE / anonymous)
   if (!result) {
     const defaultAttempt = await attemptResolveWithCookie(vid, null);
+    geo ??= geoFromAttempt(defaultAttempt);
     result = { urls: defaultAttempt.urls, proxyUrl: null };
+  }
+
+  if (geo) {
+    const official = await fetchRegionRestriction(vid).catch(() => null);
+    if (official) {
+      geo = {
+        allowed: [...new Set([...geo.allowed, ...(official.allowed ?? [])])],
+        blocked: official.blocked ?? [],
+      };
+    }
+    log.info(
+      `[YTJS] ${vid} geo-restricted — targeting proxy in [${geo.allowed.join(',') || 'any'}], avoiding [${geo.blocked.join(',') || 'none'}]`,
+    );
   }
 
   if (result.urls[0] || result.urls[1]) {
@@ -670,7 +775,7 @@ export async function resolveBothWithMeta(
   } else {
     // Tier 4: Webshare geo-bypass for videos YouTube refuses to serve from
     // this server's IP. Result is kind-specific and pinned to one proxy exit.
-    const viaProxy = await resolveViaProxyTier(vid, kind);
+    const viaProxy = await resolveViaProxyTier(vid, kind, geo ?? undefined);
     if (viaProxy) result = viaProxy;
   }
   return result;

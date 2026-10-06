@@ -463,8 +463,10 @@ async function handle(req: IncomingMessage, res: ServerResponse, router: Router)
     if (e instanceof HttpError) {
       result = json(e.status, e.payload);
     } else {
+      // Internal faults must not carry their details to clients: exception
+      // text can include Redis endpoints, file paths, driver internals.
       log.error(`[HTTP] unhandled error for ${method} ${ctx.pathname}`, { err: String(e) });
-      result = json(500, { error: String(e) });
+      result = json(500, { error: 'Internal Server Error' });
     }
   }
 
