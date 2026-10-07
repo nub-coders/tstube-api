@@ -79,11 +79,8 @@ function buildStartCard(
   }</td></tr>
   <tr><td><b>🌐 ${isNew ? 'Base Endpoint' : 'API Gateway'}</b></td><td><tg-button type="url" url="${apiUrl()}" style="primary">🌐 ${apiUrl().replace(/^https?:\/\//, '')}</tg-button></td></tr>
   <tr><td><b>🎬 Supported Platforms</b></td><td>YouTube · Spotify · Apple Music · SoundCloud · JioSaavn · Amazon Music</td></tr>
-  <tr><td><b>⚡ Stream Engine</b></td><td>youtubei.js Innertube (&lt;100ms) · Multi-Client Failover</td></tr>
-  <tr><td><b>📊 ${isNew ? 'Tier Limit' : 'Daily Allocation'}</b></td><td>${isNew ? '1,000 req/day (Free Tier) · Unlimited Search' : '1,000 req/day (Media) · Unlimited (Search)'}</td></tr>
+  <tr><td><b>📊 ${isNew ? 'Tier Limit' : 'Daily Allocation'}</b></td><td>${isNew ? `${comma(config().DAILY_LIMIT)} req/day (Free Tier) · Unlimited Search` : `${comma(config().DAILY_LIMIT)} req/day (Media) · Unlimited (Search)`}</td></tr>
   <tr><td><b>🛡 ${isNew ? 'Rate Guard' : 'Rate Limiter'}</b></td><td>10 req/s burst · Automatic reset at 00:00 UTC</td></tr>
-  <tr><td><b>🍪 Cookies Pool</b></td><td>🟢 Dynamic MongoDB Pool (${cookiePool.size} active · Auto-rotated)</td></tr>
-  <tr><td><b>🚀 Engine Status</b></td><td><b>🟢 100% Operational (v2026.3.12)</b></td></tr>
 </table>`;
 
   const richButtons = (rawToken: string): string => `<tg-button-row>
@@ -99,34 +96,27 @@ Pass your token via query parameter or Authorization Bearer header:<br/>
 • <b>Video Info:</b> <code>curl -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/>
 • <b>Search:</b> <code>curl -s "${apiUrl('search')}?token=${tokenDisplay}&amp;q=lofi+hip+hop"</code>
 </blockquote>`
-      : `<blockquote expandable>
-<b>⚡ Interactive Quick Start:</b><br/>
-• <b>Video &amp; Audio Stream Metadata (Bearer Header):</b><br/>
-<code>curl -s -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/><br/>
-• <b>Direct Media Stream Pipe (Seekable Range):</b><br/>
-<code>curl -L -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('stream')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/><br/>
-• <b>Instant Multi-Platform Search:</b><br/>
-<code>curl -s "${apiUrl('search')}?token=${tokenDisplay}&amp;q=lofi+hip+hop&amp;max_results=5"</code>
-</blockquote>`;
+      : '';
 
   const header = isNew ? '⚡ Welcome to NuB YT API!' : '⚡ NuB YT API • Dashboard';
   const subtitle = isNew
     ? `Hello, <b>${name}</b>! Your personal API key has been provisioned and is ready for production use.`
     : `Welcome back, <b>${name}</b>! Your high-performance YouTube extraction integration is active and ready.`;
 
+  const quick = quickStart(token);
   const ephemeral =
     `<h1>${header}</h1>
 <blockquote>${subtitle}</blockquote>
 
 ${table(token, token)}
 
-${richButtons(token)}
-
-${quickStart(token)}` +
+${richButtons(token)}` +
+    (quick ? `\n\n${quick}` : '') +
     (isGrp
-      ? '<blockquote>🔒 <b>Ephemeral Message:</b> This message and your API token are only visible to you in this group.</blockquote>'
+      ? '\n\n<blockquote>🔒 <b>Ephemeral Message:</b> This message and your API token are only visible to you in this group.</blockquote>'
       : '');
 
+  const quickFb = quickStart(masked);
   const fallback =
     `<h1>${header}</h1>
 <blockquote>${subtitle}</blockquote>
@@ -135,9 +125,9 @@ ${table(masked)}
 
 <tg-button-row>
   <tg-button type="url" url="${apiUrl()}" style="primary">🌐 Open API Gateway</tg-button>
-</tg-button-row>
-
-${quickStart(masked)}` + GROUP_PRIVACY_FOOTER;
+</tg-button-row>` +
+    (quickFb ? `\n\n${quickFb}` : '') +
+    GROUP_PRIVACY_FOOTER;
 
   return { html: ephemeral, fallback };
 }
@@ -152,34 +142,15 @@ export function startNew(username: string, token: string, isGrp: boolean): RichC
 
 // ── /menu ───────────────────────────────────────────────────────
 
-export const MENU_BODY = `<h1>⚡ NuB YT API • Control Center</h1>
-<blockquote>Explore real-time media extraction endpoints, streaming pipes, search discovery, and system telemetry:</blockquote>
-
-<table border="1">
-  <tr><th>🚀 Service Endpoint</th><th>📖 Capabilities &amp; Formats</th></tr>
-  <tr><td><b>🎥 /info Video Extraction</b></td><td>Direct mp4/webm streams, audio tracks, resolutions &amp; subtitles</td></tr>
-  <tr><td><b>⚡ /stream Media Pipe</b></td><td>HTTP 206 Partial Content, Range headers &amp; seekable streaming</td></tr>
-  <tr><td><b>🔍 /search Multi-Platform</b></td><td>Instant query search with duration, views, thumbnails &amp; channel info</td></tr>
-  <tr><td><b>🔥 /trending Viral Feeds</b></td><td>Regional YouTube trending feeds by category (Music, Gaming, News)</td></tr>
-  <tr><td><b>🎼 /formats Stream Matrix</b></td><td>List all available video codecs, audio containers &amp; bitrates</td></tr>
-  <tr><td><b>📊 /rate-limit-status Quota</b></td><td>Real-time request metrics, remaining daily tokens &amp; reset countdown</td></tr>
-  <tr><td><b>🔑 /token Authorization</b></td><td>View active bearer credentials, cycle keys or revoke tokens</td></tr>
-  <tr><td><b>🩺 /health Diagnostics</b></td><td>HTTP 200 health probe for monitoring &amp; load balancer readiness</td></tr>
-</table>
-
-<tg-button-row>
-  <tg-button type="url" url="${apiUrl()}" style="primary">🌐 Open API Gateway</tg-button>
-  <tg-button type="url" url="${apiUrl('health')}" style="primary">🩺 System Health</tg-button>
-</tg-button-row>`;
-
-export function menuContent(isGrp: boolean): RichContent {
-  return {
-    html:
-      MENU_BODY +
-      (isGrp ? '<blockquote>🔒 <b>Ephemeral Message:</b> Only visible to you in this group.</blockquote>' : ''),
-    fallback: MENU_BODY,
-  };
+export function menuContent(
+  isGrp: boolean,
+  username = 'User',
+  token = 'YOUR_TOKEN',
+): RichContent {
+  return buildStartCard(username, token, isGrp, false);
 }
+
+export const MENU_BODY = buildStartCard('User', 'YOUR_TOKEN', false, false).html;
 
 // ── /ping ───────────────────────────────────────────────────────
 
@@ -235,7 +206,7 @@ export function statusWithToken(
   const remaining = Math.max(0, limit - requestCount);
   const progress = Math.min(Math.trunc((requestCount / limit) * 10), 10);
   const bar = '🟩'.repeat(progress) + '⬜'.repeat(10 - progress);
-  const adminBadge = isAdminUser ? '👑 Admin (10,000 req/day)' : '👤 Standard (1,000 req/day)';
+  const adminBadge = isAdminUser ? `👑 Admin (${comma(config().ADMIN_LIMIT)} req/day)` : `👤 Standard (${comma(config().DAILY_LIMIT)} req/day)`;
 
   const table = (tokenDisplay: string, rawToken?: string): string => `<table border="1">
   <tr><th>📈 Metric</th><th>📋 Current Value</th></tr>

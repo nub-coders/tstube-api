@@ -15,13 +15,24 @@ import { cookiePool } from '../cookiePool.js';
 
 export const ADMIN_BOT_START_TIME = Date.now();
 
+const usernameCache = new Map<string, string>();
+
 async function resolveUsername(api: TelegramApi, uid: string): Promise<string> {
+  const cached = usernameCache.get(uid);
+  if (cached) return cached;
   try {
-    const chat = await api.getChat(Number(uid));
-    const name = `${chat.first_name ?? ''} ${chat.last_name ?? ''}`.trim();
-    return name || `User ${uid}`;
+    const chatPromise = api.getChat(Number(uid));
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('getChat timeout')), 800),
+    );
+    const chat = await Promise.race([chatPromise, timeoutPromise]);
+    const name = `${chat.first_name ?? ''} ${chat.last_name ?? ''}`.trim() || `User ${uid}`;
+    usernameCache.set(uid, name);
+    return name;
   } catch {
-    return `User ${uid}`;
+    const fallback = `User ${uid}`;
+    usernameCache.set(uid, fallback);
+    return fallback;
   }
 }
 
@@ -54,10 +65,37 @@ async function intGet(key: string): Promise<number> {
   return v ? Number.parseInt(v, 10) : 0;
 }
 
+async function mgetInts(keys: string[]): Promise<number[]> {
+  if (keys.length === 0) return [];
+  const chunkSize = 500;
+  const result: number[] = [];
+  for (let i = 0; i < keys.length; i += chunkSize) {
+    const chunk = keys.slice(i, i + chunkSize);
+    const vals = await redis().mget(chunk);
+    for (const v of vals) {
+      result.push(v ? Number.parseInt(v, 10) : 0);
+    }
+  }
+  return result;
+}
+
+interface StatsCache {
+  html: string;
+  ts: number;
+}
+let statsCache: StatsCache | null = null;
+const STATS_CACHE_TTL_MS = 20_000;
+
 export async function buildStats(
   api: TelegramApi,
   onProgress?: (text: string) => Promise<void>,
+  forceRefresh = false,
 ): Promise<string> {
+  const nowMs = Date.now();
+  if (!forceRefresh && !onProgress && statsCache && nowMs - statsCache.ts < STATS_CACHE_TTL_MS) {
+    return statsCache.html;
+  }
+
   const now = new Date();
 
   const progress = async (t: string): Promise<void> => {
@@ -66,27 +104,27 @@ export async function buildStats(
 
   await progress('Connecting to Redis cache database...');
 
-  const userKeys = await scanKeys('user_token:*');
+  // Scan user tokens and active sessions concurrently
+  const [userKeys, requestKeys] = await Promise.all([
+    scanKeys('user_token:*'),
+    scanKeys('user_requests:*'),
+  ]);
   const totalUsers = userKeys.length;
+  const activeUsers = requestKeys.length;
 
   await progress(`Registered users loaded (${comma(totalUsers)} found). Scanning active sessions...`);
 
-  const requestKeys = await scanKeys('user_requests:*');
-  const activeUsers = requestKeys.length;
-
+  // Batch-fetch all request counters in a single round-trip
+  const counts = await mgetInts(requestKeys);
   let totalRequestsToday = 0;
   const userRequestData: Array<[string, number]> = [];
   const requestCounts: number[] = [];
-  for (const key of requestKeys) {
-    try {
-      const count = await intGet(key);
-      totalRequestsToday += count;
-      const uid = key.split(':')[1]!;
-      userRequestData.push([uid, count]);
-      requestCounts.push(count);
-    } catch {
-      continue;
-    }
+  for (let i = 0; i < requestKeys.length; i++) {
+    const count = counts[i]!;
+    totalRequestsToday += count;
+    const uid = requestKeys[i]!.split(':')[1]!;
+    userRequestData.push([uid, count]);
+    requestCounts.push(count);
   }
   userRequestData.sort((a, b) => b[1] - a[1]);
 
@@ -109,8 +147,6 @@ export async function buildStats(
   const avgRequests = pyRoundStr(totalRequestsToday / Math.max(activeUsers, 1), 2);
   const medianRequests = Math.trunc(median(requestCounts));
   const peakRequests = requestCounts.length ? Math.max(...requestCounts) : 0;
-  const minRequests = requestCounts.length ? Math.min(...requestCounts) : 0;
-  void minRequests;
 
   const heavyUsers = requestCounts.filter((c) => c >= 500).length;
   const moderateUsers = requestCounts.filter((c) => c >= 100 && c < 500).length;
@@ -118,16 +154,60 @@ export async function buildStats(
   const idleUsers = requestCounts.filter((c) => c < 10).length;
   const inactiveUsers = totalUsers - activeUsers;
 
+  // Zero network round-trips: compute new users with 0 requests today in-memory
+  const activeUidSet = new Set(userRequestData.map(([uid]) => uid));
   let newToday = 0;
   for (const key of userKeys) {
     const uid = key.split(':')[1]!;
-    const reqCount = await redis().get(`user_requests:${uid}`);
-    if (reqCount === null) newToday += 1;
+    if (!activeUidSet.has(uid)) newToday += 1;
   }
 
   const botUptime = getReadableUptime((Date.now() - ADMIN_BOT_START_TIME) / 1000);
 
-  const redis_info = await redisInfo();
+  // Parallelize failure keys, database size, redis info, and global failed count
+  const [
+    statusKeys,
+    pathKeys,
+    failUserKeys,
+    totalKeys,
+    redis_info,
+    globalFailed,
+  ] = await Promise.all([
+    scanKeys('failed_by_status:*'),
+    scanKeys('failed_by_path:*'),
+    scanKeys('user_failed:*'),
+    redis().dbsize().catch(() => userKeys.length + requestKeys.length),
+    redisInfo().catch(() => ({} as Record<string, string | number>)),
+    intGet('global_failed_total'),
+  ]);
+
+  // Batch-fetch failure values concurrently
+  const [statusVals, pathVals, failUserVals] = await Promise.all([
+    mgetInts(statusKeys),
+    mgetInts(pathKeys),
+    mgetInts(failUserKeys),
+  ]);
+
+  const statusBreakdown: Array<[string, number]> = statusKeys.map((sk, idx) => [
+    sk.split(':')[1]!,
+    statusVals[idx]!,
+  ]);
+  statusBreakdown.sort((a, b) => b[1] - a[1]);
+
+  const pathBreakdown: Array<[string, number]> = pathKeys.map((pk, idx) => [
+    pk.split(':').slice(1).join(':'),
+    pathVals[idx]!,
+  ]);
+  pathBreakdown.sort((a, b) => b[1] - a[1]);
+  const topFailPaths = pathBreakdown.slice(0, 5);
+
+  const userFailData: Array<[string, number]> = failUserKeys.map((fk, idx) => [
+    fk.split(':')[1]!,
+    failUserVals[idx]!,
+  ]);
+  userFailData.sort((a, b) => b[1] - a[1]);
+  const topFailUsers = userFailData.slice(0, 5);
+
   const redisMemory = String(redis_info.used_memory_human ?? 'N/A');
   const redisPeakMemory = String(redis_info.used_memory_peak_human ?? 'N/A');
   const redisUptime = Number(redis_info.uptime_in_seconds ?? 0);
@@ -141,45 +221,17 @@ export async function buildStats(
   const totalLookups = hits + misses;
   const hitRate = pyRoundStr((hits / Math.max(totalLookups, 1)) * 100, 1);
 
-  const totalKeys = (await scanKeys('*')).length;
   const userUtilization = pyRoundStr((activeUsers / Math.max(totalUsers, 1)) * 100, 1);
 
   const theoreticalMax =
-    activeUsers > 0 ? regularActive * 1000 + adminActive * 10000 : 1;
+    activeUsers > 0 ? regularActive * config().DAILY_LIMIT + adminActive * config().ADMIN_LIMIT : 1;
   const capacityUsage = pyRoundStr((totalRequestsToday / theoreticalMax) * 100, 1);
 
   let loadIndicator: string;
-  if (totalRequestsToday < 10000) loadIndicator = '🟢 Low';
-  else if (totalRequestsToday < 50000) loadIndicator = '🟡 Moderate';
-  else if (totalRequestsToday < 100000) loadIndicator = '🟠 High';
+  if (totalRequestsToday < config().DAILY_LIMIT) loadIndicator = '🟢 Low';
+  else if (totalRequestsToday < config().DAILY_LIMIT * 50) loadIndicator = '🟡 Moderate';
+  else if (totalRequestsToday < config().DAILY_LIMIT * 100) loadIndicator = '🟠 High';
   else loadIndicator = '🔴 Critical';
-
-  const globalFailed = await intGet('global_failed_total');
-
-  const statusKeys = await scanKeys('failed_by_status:*');
-  const statusBreakdown: Array<[string, number]> = [];
-  for (const sk of statusKeys) {
-    const code = sk.split(':')[1]!;
-    statusBreakdown.push([code, await intGet(sk)]);
-  }
-  statusBreakdown.sort((a, b) => b[1] - a[1]);
-
-  const pathKeys = await scanKeys('failed_by_path:*');
-  const pathBreakdown: Array<[string, number]> = [];
-  for (const pk of pathKeys) {
-    const p = pk.split(':').slice(1).join(':');
-    pathBreakdown.push([p, await intGet(pk)]);
-  }
-  pathBreakdown.sort((a, b) => b[1] - a[1]);
-  const topFailPaths = pathBreakdown.slice(0, 5);
-
-  const failUserKeys = await scanKeys('user_failed:*');
-  const userFailData: Array<[string, number]> = [];
-  for (const fk of failUserKeys) {
-    userFailData.push([fk.split(':')[1]!, await intGet(fk)]);
-  }
-  userFailData.sort((a, b) => b[1] - a[1]);
-  const topFailUsers = userFailData.slice(0, 5);
 
   const totalAll = totalRequestsToday + globalFailed;
   const successRate = pyRoundStr(((totalAll - globalFailed) / Math.max(totalAll, 1)) * 100, 1);
@@ -194,30 +246,38 @@ export async function buildStats(
       .map(([p, cnt]) => `<tr><td><code>${escapeHtml(p)}</code></td><td><b>${comma(cnt)}</b></td></tr>`)
       .join('') || "<tr><td colspan='2'>None today ✨</td></tr>";
 
-  const failUserRows: string[] = [];
-  for (let idx = 0; idx < topFailUsers.length; idx++) {
-    const [uid, cnt] = topFailUsers[idx]!;
-    if (onProgress) await onProgress(`Resolving failed user identity ${idx + 1}/${topFailUsers.length}...`);
-    const name = await resolveUsername(api, uid);
-    failUserRows.push(
+  // Resolve top fail and top active usernames concurrently
+  const topUsers = userRequestData.slice(0, 10);
+
+  const [resolvedFailUsers, resolvedTopUsers] = await Promise.all([
+    Promise.all(
+      topFailUsers.map(async ([uid, cnt], idx) => {
+        if (onProgress) await onProgress(`Resolving failed user identity ${idx + 1}/${topFailUsers.length}...`);
+        const name = await resolveUsername(api, uid);
+        return [uid, cnt, name] as const;
+      }),
+    ),
+    Promise.all(
+      topUsers.map(async ([uid, count], idx) => {
+        if (onProgress) await onProgress(`Resolving identity for active user ${idx + 1}/${topUsers.length}...`);
+        const name = await resolveUsername(api, uid);
+        return [uid, count, name] as const;
+      }),
+    ),
+  ]);
+
+  const failUserRows = resolvedFailUsers.map(
+    ([uid, cnt, name]) =>
       `<tr><td><b>${escapeHtml(name)}</b> (<code>${uid}</code>)</td><td><b>${comma(cnt)}</b></td></tr>`,
-    );
-  }
+  );
   const failUserTableRows = failUserRows.join('') || "<tr><td colspan='2'>None today ✨</td></tr>";
 
-  const topUsers = userRequestData.slice(0, 10);
-  const topUsersRows: string[] = [];
-  for (let i = 0; i < topUsers.length; i++) {
-    const [uid, count] = topUsers[i]!;
+  const topUsersRows = resolvedTopUsers.map(([uid, count, name], idx) => {
     const adminBadge = isAdmin(Number(uid)) ? '👑 Admin' : '👤 User';
-    if (onProgress) await onProgress(`Resolving identity for active user ${i + 1}/${topUsers.length}...`);
-    const name = await resolveUsername(api, uid);
-    const limit = isAdmin(Number(uid)) ? 10000 : 1000;
+    const limit = isAdmin(Number(uid)) ? config().ADMIN_LIMIT : config().DAILY_LIMIT;
     const pct = pyRoundStr((count / limit) * 100, 1);
-    topUsersRows.push(
-      `<tr><td>${i + 1}</td><td>${adminBadge} <b>${escapeHtml(name)}</b><br/><code>${uid}</code></td><td><b>${comma(count)}</b> / ${comma(limit)}</td><td><b>${pct}%</b></td></tr>`,
-    );
-  }
+    return `<tr><td>${idx + 1}</td><td>${adminBadge} <b>${escapeHtml(name)}</b><br/><code>${uid}</code></td><td><b>${comma(count)}</b> / ${comma(limit)}</td><td><b>${pct}%</b></td></tr>`;
+  });
   const topUsersTable =
     topUsersRows.join('') || "<tr><td colspan='4'>No active users today</td></tr>";
 
@@ -226,7 +286,7 @@ export async function buildStats(
 
   const ts = now.toISOString().slice(0, 19).replace('T', ' ');
 
-  return `<h1>Bot Statistics Dashboard</h1>
+  const fullHtml = `<h1>Bot Statistics Dashboard</h1>
 <blockquote>Generated: <b>${ts} UTC</b> | Bot Uptime: <code>${botUptime}</code></blockquote>
 
 <h2>User Metrics</h2>
@@ -282,8 +342,8 @@ export async function buildStats(
 <h2>System Health &amp; Rate Limits</h2>
 <table border="1">
   <tr><th>Configuration</th><th>Value</th></tr>
-  <tr><td><b>Regular Limit</b></td><td>1,000 req/day</td></tr>
-  <tr><td><b>Admin Limit</b></td><td>10,000 req/day</td></tr>
+  <tr><td><b>Regular Limit</b></td><td>${comma(config().DAILY_LIMIT)} req/day</td></tr>
+  <tr><td><b>Admin Limit</b></td><td>${comma(config().ADMIN_LIMIT)} req/day</td></tr>
   <tr><td><b>Search API</b></td><td>Unlimited</td></tr>
   <tr><td><b>System Load</b></td><td>${loadIndicator}</td></tr>
   <tr><td><b>Active Ratio</b></td><td>${userUtilization}%</td></tr>
@@ -315,6 +375,9 @@ export async function buildStats(
     ${failUserTableRows}
   </table>
 </details>`;
+
+  statsCache = { html: fullHtml, ts: Date.now() };
+  return fullHtml;
 }
 
 // ── Smaller admin cards ─────────────────────────────────────────
@@ -327,11 +390,11 @@ export function userInfoCard(
 ): string {
   const total = requestCount + failedCount;
   const successRate = pyRoundStr((requestCount / Math.max(total, 1)) * 100, 1);
-  const limit = isAdmin(Number(targetUserId)) ? 10000 : 1000;
+  const limit = isAdmin(Number(targetUserId)) ? config().ADMIN_LIMIT : config().DAILY_LIMIT;
   const remaining = Math.max(0, limit - requestCount);
   const isAdm = isAdmin(Number(targetUserId))
-    ? 'Yes (10,000 req/day)'
-    : 'No (1,000 req/day)';
+    ? `Yes (${comma(config().ADMIN_LIMIT)} req/day)`
+    : `No (${comma(config().DAILY_LIMIT)} req/day)`;
 
   return `<h1>User Information</h1>
 <blockquote>Account profile and activity metrics for user <code>${targetUserId}</code>.</blockquote>

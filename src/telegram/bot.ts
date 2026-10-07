@@ -24,6 +24,7 @@ import {
   cmdUser,
 } from './admin.js';
 import { handleCallback } from './callbacks.js';
+import { buildStats } from './adminContent.js';
 import type { Config } from '../config.js';
 import { getLogger } from '../logger.js';
 
@@ -112,6 +113,9 @@ export async function startBot(cfg: Config): Promise<() => Promise<void>> {
   await bot.api.setMyCommands(BOT_COMMANDS);
   const me = await bot.api.getMe();
   log.info(`[BOT] Started @${me.username ?? me.first_name} (${me.id}) via grammY (Bot API 10.3)`);
+
+  // Pre-warm stats cache in background so admin button responds instantly
+  void buildStats(api).catch(() => {});
 
   bot.on('message:text', async (ctx) => {
     try {

@@ -187,8 +187,8 @@ export function loadConfig(): Config {
     UPSTASH_REDIS_REST_URL: process.env.UPSTASH_REDIS_REST_URL || null,
     UPSTASH_REDIS_REST_TOKEN: process.env.UPSTASH_REDIS_REST_TOKEN || null,
 
-    DAILY_LIMIT: getint('DAILY_LIMIT', 1000),
-    ADMIN_LIMIT: getint('ADMIN_LIMIT', 10000),
+    DAILY_LIMIT: getint('DAILY_LIMIT', 100000),
+    ADMIN_LIMIT: getint('ADMIN_LIMIT', 100000),
     ADMIN_API_KEY: process.env.ADMIN_API_KEY || null,
 
     COOKIES_FILE: getenv('COOKIES_FILE', 'cookies.txt'),

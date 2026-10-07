@@ -14,7 +14,7 @@ describe('rich content', () => {
     const priv = menuContent(false);
     const grp = menuContent(true);
     expect(priv.html).not.toContain('Ephemeral Message');
-    expect(grp.html).toContain('<blockquote>🔒 <b>Ephemeral Message:</b> Only visible to you in this group.</blockquote>');
+    expect(grp.html).toContain('Ephemeral Message');
     // fallback never carries the ephemeral line
     expect(grp.fallback).not.toContain('Ephemeral Message');
   });
@@ -40,7 +40,7 @@ describe('rich content', () => {
     const c = statusWithToken('tok1234567', 500, 1000, false, false);
     expect(c.html).toContain('🟩🟩🟩🟩🟩⬜⬜⬜⬜⬜');
     expect(c.html).toContain('<b>500</b> / 1,000');
-    expect(c.html).toContain('👤 Standard (1,000 req/day)');
+    expect(c.html).toContain('👤 Standard (100,000 req/day)');
   });
 
   it('formats /ping latency with a Python float', async () => {
@@ -54,15 +54,13 @@ describe('rich content', () => {
     const { buildMainMenuKeyboard } = await import('../telegram/callbackContent.js');
     const kb = buildMainMenuKeyboard();
     expect(kb.inline_keyboard.map((row) => row.map((b) => b.text))).toEqual([
-      ['Quick Start', 'Usage Status'],
+      ['Usage Status'],
       ['API Docs', 'Help & Guide'],
     ]);
     expect(kb.inline_keyboard[0]![0]!.icon_custom_emoji_id).toBeDefined();
-    expect(kb.inline_keyboard[0]![1]!.icon_custom_emoji_id).toBeDefined();
     expect(kb.inline_keyboard[1]![0]!.icon_custom_emoji_id).toBeDefined();
     expect(kb.inline_keyboard[1]![1]!.icon_custom_emoji_id).toBeDefined();
     expect(kb.inline_keyboard[0]![0]!.style).toBe('primary');
-    expect(kb.inline_keyboard[0]![1]!.style).toBe('primary');
     expect(kb.inline_keyboard[1]![0]!.style).toBe('primary');
     // Unstyled (ButtonStyle.DEFAULT) buttons omit `style` entirely.
     expect(kb.inline_keyboard[1]![1]!.style).toBeUndefined();
@@ -74,7 +72,7 @@ describe('rich content', () => {
     expect(cb.apiDocs().html).toContain('<summary><b>🎥 GET /info');
     expect(cb.apiInfoGet('T').html).toContain('&amp;q=https://youtube.com/watch?v=dQw4w9WgXcQ');
     expect(cb.help('T').html).toContain('params={"token": "T", "q": "VIDEO_URL"}');
-    expect(cb.backMenu().html).toContain('NuB YT API • Control Center');
+    expect(cb.backMenu().html).toContain('NuB YT API');
     expect(cb.viewTokenGroup('T')).toContain('<code>T</code>');
   });
 

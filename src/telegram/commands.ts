@@ -2,7 +2,7 @@
  * Command handlers — /start, /menu, /ping (plugins/commands.py) and
  * /status, /token (plugins/status.py).
  */
-import type { TelegramApi, TgMessage, InlineButton } from './api.js';
+import type { TelegramApi, TgMessage, InlineButton, InlineKeyboardMarkup } from './api.js';
 import { btn, keyboard, ButtonStyle, sendSmartRichMessage, sendRichDraft } from './rich.js';
 import {
   BOT_START_TIME,
@@ -25,16 +25,17 @@ export function isGroupChat(chat: { type: string } | undefined): boolean {
   return !!chat && chat.type !== 'private';
 }
 
-function startKeyboard() {
+export function startKeyboard(userId?: number): InlineKeyboardMarkup {
+  const isAdminUser = userId !== undefined && isAdmin(userId);
   return keyboard([
     [
-      btn('🚀 Quick Start', { callback_data: 'impl_quick_ref', style: ButtonStyle.PRIMARY }),
       btn('📊 Usage Status', { callback_data: 'usage_status', style: ButtonStyle.PRIMARY }),
     ],
     [
       btn('📖 API Docs', { callback_data: 'api_docs', style: ButtonStyle.PRIMARY }),
       btn('❓ Help & Guide', { callback_data: 'help' }),
     ],
+    ...(isAdminUser ? [[btn('⚙️ Administration', { callback_data: 'admin_panel', style: ButtonStyle.DANGER })]] : []),
   ]);
 }
 
@@ -52,7 +53,7 @@ export async function cmdStart(api: TelegramApi, msg: TgMessage): Promise<void> 
     await sendSmartRichMessage(api, msg.chat.id, content.html, {
       receiverUserId: receiverUid,
       fallbackHtml: content.fallback,
-      replyMarkup: startKeyboard(),
+      replyMarkup: startKeyboard(userId),
     });
     return;
   }
@@ -63,19 +64,12 @@ export async function cmdStart(api: TelegramApi, msg: TgMessage): Promise<void> 
   await sendSmartRichMessage(api, msg.chat.id, content.html, {
     receiverUserId: receiverUid,
     fallbackHtml: content.fallback,
-    replyMarkup: startKeyboard(),
+    replyMarkup: startKeyboard(userId),
   });
 }
 
 export async function cmdMenu(api: TelegramApi, msg: TgMessage): Promise<void> {
-  const isGrp = isGroupChat(msg.chat);
-  const receiverUid = msg.from && isGrp ? msg.from.id : null;
-  const content = menuContent(isGrp);
-  await sendSmartRichMessage(api, msg.chat.id, content.html, {
-    receiverUserId: receiverUid,
-    fallbackHtml: content.fallback,
-    replyMarkup: startKeyboard(),
-  });
+  return cmdStart(api, msg);
 }
 
 export async function cmdPing(api: TelegramApi, msg: TgMessage): Promise<void> {
@@ -117,7 +111,7 @@ export async function cmdStatus(api: TelegramApi, msg: TgMessage): Promise<void>
 
   const requestCount = await getUserRequestCount(userId);
   const admin = isAdmin(userId);
-  const limit = admin ? 10000 : 1000;
+  const limit = admin ? config().ADMIN_LIMIT : config().DAILY_LIMIT;
   const content = statusWithToken(token, requestCount, limit, admin, isGrp);
 
   await sendSmartRichMessage(api, msg.chat.id, content.html, {

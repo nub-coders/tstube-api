@@ -118,7 +118,7 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
       }
       const requestCount = await getUserRequestCount(userId);
       const admin = isAdmin(userId);
-      const limit = admin ? 10000 : 1000;
+      const limit = admin ? config().ADMIN_LIMIT : config().DAILY_LIMIT;
       await answer(api, cb);
       await editCard(api, cb, usageCallback(token, requestCount, limit, admin, isGrp));
       break;
@@ -178,10 +178,14 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
       await editCard(api, cb, platformsCard());
       break;
 
-    case 'back_menu':
+    case 'back_menu': {
       await answer(api, cb);
-      await editCard(api, cb, backMenu());
+      const isGrp = isGroup(cb);
+      const token = (await getUserToken(userId)) ?? 'YOUR_TOKEN';
+      const rawUsername = cb.from?.username || cb.from?.first_name || 'User';
+      await editCard(api, cb, backMenu(rawUsername, token, isGrp, userId));
       break;
+    }
 
     case 'admin_refresh_stats': {
       if (!isAdmin(userId)) {
@@ -199,11 +203,20 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
       }
       await answer(api, cb, '🔄 Refreshing statistics...');
       try {
-        const statsHtml = await buildStats(api);
+        const statsHtml = await buildStats(api, undefined, true);
         const kbd = keyboard([
-          [btn('🔄 Refresh Stats', { callback_data: 'admin_refresh_stats', style: ButtonStyle.PRIMARY })],
+          [
+            btn('🔄 Refresh Stats', { callback_data: 'admin_refresh_stats', style: ButtonStyle.PRIMARY }),
+            btn('🍪 Cookie Management', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.SUCCESS }),
+          ],
+          [btn('📱 Back to Menu', { callback_data: 'back_menu' })],
         ]);
-        await editCard(api, cb, { html: statsHtml, keyboard: kbd });
+        await editCard(api, cb, {
+          html: `<h1>⚙️ Administration Panel</h1>
+${statsHtml}
+<p>Select an action below:</p>`,
+          keyboard: kbd,
+        });
       } catch (e) {
         await editCard(api, cb, {
           html: `<blockquote>❌ <b>Refresh failed:</b> ${String(e)}</blockquote>`,
@@ -342,6 +355,29 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
           `<blockquote>❌ <b>Purge failed:</b> ${String(e)}</blockquote>`,
         );
       }
+      break;
+    }
+
+    case 'admin_panel': {
+      if (!isAdmin(userId)) {
+        await answer(api, cb, '❌ Admin only.', true);
+        return;
+      }
+      await answer(api, cb);
+      const statsHtml = await buildStats(api);
+      const card = {
+        html: `<h1>⚙️ Administration Panel</h1>
+${statsHtml}
+<p>Select an action below:</p>`,
+        keyboard: keyboard([
+          [
+            btn('🔄 Refresh Stats', { callback_data: 'admin_refresh_stats', style: ButtonStyle.PRIMARY }),
+            btn('🍪 Cookie Management', { callback_data: 'admin_cookies_refresh', style: ButtonStyle.SUCCESS }),
+          ],
+          [btn('📱 Back to Menu', { callback_data: 'back_menu' })],
+        ]),
+      };
+      await editCard(api, cb, card);
       break;
     }
 

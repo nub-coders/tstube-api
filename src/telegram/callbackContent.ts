@@ -5,7 +5,9 @@
  * interactive Bot API 10.3 expandable documents (<details>, <table>, <blockquote expandable>).
  */
 import { btn, keyboard, ButtonStyle, escapeHtml, type InlineKeyboardMarkup } from './rich.js';
-import { apiUrl, statusWithToken, MENU_BODY } from './content.js';
+import { apiUrl, statusWithToken, startExisting, MENU_BODY } from './content.js';
+import { config, isAdmin } from '../config.js';
+import { comma } from '../pyTime.js';
 
 export interface Card {
   html: string;
@@ -83,24 +85,31 @@ export function revoked(token: string): Card {
 
 // ── Main Menu ───────────────────────────────────────────────────
 
-export function backMenu(): Card {
-  return {
-    html: MENU_BODY,
-    keyboard: buildMainMenuKeyboard(),
-  };
-}
-
-export function buildMainMenuKeyboard(): InlineKeyboardMarkup {
+export function buildMainMenuKeyboard(userId?: number): InlineKeyboardMarkup {
+  const isAdminUser = userId !== undefined && isAdmin(userId);
   return keyboard([
     [
-      btn('🚀 Quick Start', { callback_data: 'impl_quick_ref', style: ButtonStyle.PRIMARY }),
       btn('📊 Usage Status', { callback_data: 'usage_status', style: ButtonStyle.PRIMARY }),
     ],
     [
       btn('📖 API Docs', { callback_data: 'api_docs', style: ButtonStyle.PRIMARY }),
       btn('❓ Help & Guide', { callback_data: 'help' }),
     ],
+    ...(isAdminUser ? [[btn('⚙️ Administration', { callback_data: 'admin_panel', style: ButtonStyle.DANGER })]] : []),
   ]);
+}
+
+export function backMenu(
+  username = 'User',
+  token = 'YOUR_TOKEN',
+  isGrp = false,
+  userId?: number,
+): Card {
+  const content = startExisting(username, token, isGrp);
+  return {
+    html: content.html,
+    keyboard: buildMainMenuKeyboard(userId),
+  };
 }
 
 // ── Quick Start Guide ───────────────────────────────────────────
@@ -114,7 +123,7 @@ export function implQuickRef(token: string): Card {
   <tr><th>Configuration</th><th>Value</th></tr>
   <tr><td><b>API Token</b></td><td><code>${token}</code></td></tr>
   <tr><td><b>Base URL</b></td><td><code>${apiUrl()}</code></td></tr>
-  <tr><td><b>Daily Quota</b></td><td>1,000 req/day (Media) · Unlimited (Search)</td></tr>
+  <tr><td><b>Daily Quota</b></td><td>${comma(config().DAILY_LIMIT)} req/day (Media) · Unlimited (Search)</td></tr>
 </table>
 
 <tg-button-row>
@@ -245,7 +254,7 @@ export function apiDocs(userToken = 'YOUR_TOKEN'): Card {
   <tr><th>Feature</th><th>Specification</th></tr>
   <tr><td><b>Base URL</b></td><td><code>${apiUrl()}/</code></td></tr>
   <tr><td><b>Authentication</b></td><td><code>?token=${escapeHtml(userToken)}</code> or <code>Authorization: Bearer</code></td></tr>
-  <tr><td><b>Daily Quota</b></td><td>1,000 calls/day (Data), Unlimited (Search &amp; Trending)</td></tr>
+  <tr><td><b>Daily Quota</b></td><td>${comma(config().DAILY_LIMIT)} calls/day (Data), Unlimited (Search &amp; Trending)</td></tr>
   <tr><td><b>Burst Rate</b></td><td>10 req/s concurrency limit</td></tr>
 </table>
 
