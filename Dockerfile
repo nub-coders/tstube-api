@@ -49,7 +49,7 @@ COPY --from=build /src/node_modules ./node_modules
 COPY --from=build /src/dist ./dist
 COPY --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/tstube-entrypoint
 
-# Non-root: the process writes COOKIES_FILE and yt-dlp's cache into its home.
+# Non-root: the process writes yt-dlp's cache into its home.
 RUN useradd --create-home --shell /usr/sbin/nologin app \
     && chown -R app:app /app
 USER app

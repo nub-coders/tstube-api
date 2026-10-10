@@ -10,7 +10,6 @@ import { config } from '../config.js';
 import { maskToken } from '../tools.js';
 import { escapeHtml } from './rich.js';
 import { comma, pyRoundStr } from '../pyTime.js';
-import { cookiePool } from '../cookiePool.js';
 
 export interface RichContent {
   html: string;
@@ -84,7 +83,7 @@ function buildStartCard(
 </table>`;
 
   const richButtons = (rawToken: string): string => `<tg-button-row>
-  <tg-button type="url" url="${apiUrl('info')}?token=${escapeHtml(rawToken)}&amp;q=${encodeURIComponent(config().COOKIES_BOOTSTRAP_URL)}" style="primary">▶️ Test Video Info</tg-button>
+  <tg-button type="url" url="${apiUrl('info')}?token=${escapeHtml(rawToken)}&amp;q=${encodeURIComponent('https://www.youtube.com/watch?v=dQw4w9WgXcQ')}" style="primary">▶️ Test Video Info</tg-button>
   <tg-button type="url" url="${apiUrl('search')}?token=${escapeHtml(rawToken)}&amp;q=lofi+hip+hop" style="primary">🔍 Test Search</tg-button>
 </tg-button-row>`;
 
@@ -93,7 +92,7 @@ function buildStartCard(
       ? `<blockquote expandable>
 <b>🚀 Quick Setup:</b><br/>
 Pass your token via query parameter or Authorization Bearer header:<br/>
-• <b>Video Info:</b> <code>curl -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=${config().COOKIES_BOOTSTRAP_URL}"</code><br/>
+• <b>Video Info:</b> <code>curl -H "Authorization: Bearer ${tokenDisplay}" "${apiUrl('info')}?q=https://www.youtube.com/watch?v=dQw4w9WgXcQ"</code><br/>
 • <b>Search:</b> <code>curl -s "${apiUrl('search')}?token=${tokenDisplay}&amp;q=lofi+hip+hop"</code>
 </blockquote>`
       : '';
@@ -165,7 +164,6 @@ export function pingContent(elapsedMs: number, uptime: string): string {
   <tr><td><b>🤖 Telegram Bot Core</b></td><td><b>grammY v1.40.2 (Bot API 10.3)</b></td></tr>
   <tr><td><b>🧠 Primary Resolver</b></td><td><b>youtubei.js v18 (Player API &lt;100ms)</b></td></tr>
   <tr><td><b>🛡 Platform Resolvers</b></td><td><b>Odesli (Spotify/Apple/SoundCloud/JioSaavn)</b></td></tr>
-  <tr><td><b>🍪 Cookies Engine</b></td><td><b>🟢 MongoDB Pool (${cookiePool.size} active)</b></td></tr>
   <tr><td><b>🌐 DNS Infrastructure</b></td><td><b>Cloudflare (1.1.1.1 pinned, 0% drop)</b></td></tr>
   <tr><td><b>🚦 Redis State Cache</b></td><td><b>🟢 Connected &amp; Persistent</b></td></tr>
   <tr><td><b>🟢 Overall Health</b></td><td><b>100% Operational</b></td></tr>

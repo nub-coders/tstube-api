@@ -2,18 +2,15 @@
  * Entrypoint — mirrors main.py's `if __name__ == "__main__"` and lifespan.
  *
  * Starts the HTTP API always, and the Telegram bot when BOT_TOKEN + START_BOT
- * are enabled. Cookies bootstrap runs in the background so a slow browser probe
- * never delays startup or /health.
+ * are enabled.
  */
 import { loadConfig } from './config.js';
 import { setupJsonLogging, getLogger } from './logger.js';
 import { createRedis, closeRedis } from './redis.js';
 import { createAppServer, metricsHandler, rateLimitStatus, type RouteSpec } from './httpServer.js';
 import * as routes from './apiRoutes.js';
-import { bootstrap as bootstrapCookies, startRefresh, stopRefresh } from './cookies.js';
 import { setDefaultResultOrder } from 'node:dns';
 import { getInnertube } from './innertube.js';
-import { cookiePool } from './cookiePool.js';
 import { websharePool } from './proxy.js';
 import { fetchTrending } from './searchService.js';
 import { setGlobalDispatcher, Agent } from 'undici';
@@ -32,7 +29,6 @@ const HTTP_HOST = '0.0.0.0';
 
 const routeTable: RouteSpec[] = [
   ['/', routes.root],
-  ['GET', '/upload.sh', routes.uploadScript],
   ['/search', routes.searchSongs],
   ['/trending', routes.trendingSongs],
   ['/suggest', routes.suggestSongs],
@@ -47,9 +43,6 @@ const routeTable: RouteSpec[] = [
   ['/metrics', metricsHandler],
   ['/favicon.ico', routes.faviconIco],
   ['/favicon.svg', routes.faviconSvg],
-  ['POST', '/admin/cookies/sync', routes.adminSyncCookies],
-  ['GET', '/admin/cookies', routes.adminListCookies],
-  ['POST', '/admin/cookies/terminate', routes.adminTerminateCookie],
 ];
 
 async function main(): Promise<void> {
@@ -58,26 +51,6 @@ async function main(): Promise<void> {
   createRedis(cfg);
 
   if (!cfg.TESTING) {
-    if (cfg.MONGODB_URI) {
-      void (async () => {
-        try {
-          await cookiePool.init();
-        } catch (e) {
-          log.warning(`[STARTUP] Cookie pool init skipped: ${String(e)}`);
-        }
-      })();
-    }
-
-    // Best-effort: browser probe can take up to 60s per browser.
-    void (async () => {
-      try {
-        await bootstrapCookies(cfg);
-        startRefresh(cfg);
-      } catch (e) {
-        log.warning(`[STARTUP] Cookie bootstrap skipped: ${String(e)}`);
-      }
-    })();
-
     // Geo-bypass proxy pool (no-op unless WEBSHARE_API_KEY is set).
     websharePool.init();
   }
@@ -119,7 +92,6 @@ async function main(): Promise<void> {
 
   const shutdown = async (signal: string): Promise<void> => {
     log.info(`[SHUTDOWN] ${signal} — stopping`);
-    stopRefresh();
     if (stopBot) {
       try {
         await stopBot();
@@ -128,7 +100,6 @@ async function main(): Promise<void> {
       }
     }
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await cookiePool.close();
     await websharePool.close();
     await closeRedis();
     process.exit(0);

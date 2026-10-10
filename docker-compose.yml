@@ -24,10 +24,6 @@ x-app: &app
     - "host.docker.internal:host-gateway"
   networks:
     - web
-  volumes:
-    # Firefox profile: auto-export cookies via yt-dlp --cookies-from-browser
-    - /root/snap/firefox/common/.mozilla/firefox:/home/app/.mozilla/firefox:ro
-    - /root/snap/firefox/common/.mozilla/firefox:/home/app/snap/firefox/common/.mozilla/firefox:ro
   # Pinned resolvers: 8.8.8.8 was dropping 12-40% of this host's UDP DNS
   # queries (rate limiting — ICMP to it was clean), and every dropped query
   # cost a 4-5s stall. Because each stream resolves a fresh per-session

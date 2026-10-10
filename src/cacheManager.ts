@@ -193,10 +193,9 @@ async function resolveUrl(
   url: string,
   kind: 'audio' | 'muxed',
   _formatSelector: string,
-  cookies: string | null,
 ): Promise<CachedStream | null> {
   try {
-    const res = await innertubeResolveMeta(url, kind, cookies);
+    const res = await innertubeResolveMeta(url, kind);
     if (res.url) {
       log.info(`[INNERTUBE] ✅ ${kind} ${url.slice(0, 80)}`);
       return { url: res.url, proxyUrl: res.proxyUrl };
@@ -212,7 +211,6 @@ async function getStreamFor(
   prefix: string,
   kind: 'audio' | 'muxed',
   formatSelector: string,
-  cookies: string | null,
 ): Promise<CachedStream | null> {
   // 1. Redis
   try {
@@ -244,7 +242,7 @@ async function getStreamFor(
   const [targetUrl, isDirect] = await resolveTargetUrl(url);
   const stream = isDirect
     ? ({ url: targetUrl, proxyUrl: null } as CachedStream)
-    : await resolveUrl(targetUrl, kind, formatSelector, cookies);
+    : await resolveUrl(targetUrl, kind, formatSelector);
   if (stream) {
     const maxTtl = stream.proxyUrl ? PROXY_STREAM_TTL_S : undefined;
     writeCache(url, stream.url, prefix, stream.proxyUrl, maxTtl);
@@ -264,15 +262,12 @@ async function getStreamFor(
   return stream;
 }
 
-export function getStream(url: string, cookies: string | null = null): Promise<CachedStream | null> {
-  return getStreamFor(url, 'audio:', 'audio', '251/250/140/bestaudio[ext=m4a]/bestaudio/best', cookies);
+export function getStream(url: string): Promise<CachedStream | null> {
+  return getStreamFor(url, 'audio:', 'audio', '251/250/140/bestaudio[ext=m4a]/bestaudio/best');
 }
 
-export function getVideoStream(
-  url: string,
-  cookies: string | null = null,
-): Promise<CachedStream | null> {
-  return getStreamFor(url, 'video:', 'muxed', 'best[ext=mp4]/22/18/best', cookies);
+export function getVideoStream(url: string): Promise<CachedStream | null> {
+  return getStreamFor(url, 'video:', 'muxed', 'best[ext=mp4]/22/18/best');
 }
 
 /** Test/ops hook to point the file cache at a temp dir. */

@@ -1,7 +1,7 @@
 /**
  * Webshare proxy pool — the geo-bypass fallback tier.
  *
- * When the cookie pool (and the default instance) cannot resolve a video —
+ * When the direct resolver cannot resolve a video —
  * typically publisher geo-blocks — the resolver retries through a Webshare
  * datacenter proxy in another region. The pool is fetched live from the
  * Webshare API so burnt IPs are replaced without a redeploy.

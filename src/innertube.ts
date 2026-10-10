@@ -4,13 +4,9 @@
  */
 import { Innertube, Platform, Parser, Helpers } from 'youtubei.js';
 import { ProxyAgent } from 'undici';
-import { readFileSync, existsSync } from 'node:fs';
 import { extractArtist, formatInd } from './formatters.js';
 import { getLogger } from './logger.js';
-import { config } from './config.js';
-import { onCookiesUpdated, isSafeCookiePath } from './cookies.js';
 import { BoundedCache } from './boundedCache.js';
-import { cookiePool } from './cookiePool.js';
 import { websharePool } from './proxy.js';
 import { resolveViaProxy } from './ytdlp.js';
 import { fetchRegionRestriction } from './youtubeApi.js';
@@ -127,169 +123,11 @@ export function extractId(value: string): string | null {
   return BARE_ID_RE.test(v) ? v : null;
 }
 
-/**
- * Parse cookies from any format:
- * - Netscape tab-separated text (cookies.txt format)
- * - Semicolon-separated HTTP cookie header ('SID=xxx; HSID=yyy')
- * - Line-separated 'key=value' pairs
- * - Base64 encoded version of any of the above
- *
- * Returns null if the result does not contain authenticated YouTube session
- * cookies (SAPISID, __Secure-1PSID, __Secure-3PSID, LOGIN_INFO, or SID).
- * Only authenticated cookies are accepted.
- */
-export function parseCookies(input: string | null | undefined): string | null {
-  if (!input || typeof input !== 'string') return null;
-  let text = input.trim();
-  if (!text) return null;
-
-  // Handle base64 encoded input
-  if (!text.includes('\t') && !text.includes('\n') && /^[A-Za-z0-9+/=]+$/.test(text) && text.length > 50) {
-    try {
-      const decoded = Buffer.from(text, 'base64').toString('utf8');
-      if (decoded.includes('=') || decoded.includes('\t')) {
-        text = decoded.trim();
-      }
-    } catch {
-      /* not base64 */
-    }
-  }
-
-  let result: string | null = null;
-
-  // Netscape tab-separated format
-  if (text.includes('\t')) {
-    const cookies: string[] = [];
-    const seen = new Set<string>();
-    for (const line of text.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#')) continue;
-      const parts = line.split('\t');
-      if (parts.length >= 7) {
-        const domain = parts[0]!.trim().toLowerCase();
-        if (domain !== '.youtube.com' && domain !== 'youtube.com' && !domain.endsWith('.youtube.com')) {
-          continue;
-        }
-        const name = parts[5]!.trim();
-        const value = parts[6]!.trim();
-        if (name && !seen.has(name)) {
-          seen.add(name);
-          cookies.push(`${name}=${value}`);
-        }
-      }
-    }
-    result = cookies.length ? cookies.join('; ') : null;
-  } else if (text.includes('=')) {
-    // Semicolon or newline-separated key=value pairs
-    const items = text
-      .split(/[;\r\n]+/)
-      .map((s) => s.trim())
-      .filter((s) => s && s.includes('=') && !s.startsWith('#'));
-    result = items.length ? items.join('; ') : null;
-  }
-
-  if (!result) return null;
-
-  // Only accept authenticated cookies — must contain at least one YouTube session token
-  if (!isAuthenticatedCookieString(result)) {
-    log.warning('[YTJS] Rejecting unauthenticated cookie string (no session tokens found)');
-    return null;
-  }
-
-  return result;
-}
-
-/**
- * Returns true if the given semicolon-separated cookie string contains at least
- * one recognised YouTube authentication token that indicates a logged-in session.
- *
- * Recognised tokens: SAPISID, __Secure-1PSID, __Secure-3PSID, LOGIN_INFO, SID
- */
-export function isAuthenticatedCookieString(cookieStr: string): boolean {
-  // Match cookie name at start of string or after "; "
-  return /(?:^|;\s*)(?:SAPISID|__Secure-1PSID|__Secure-3PSID|LOGIN_INFO|SID)=/i.test(cookieStr);
-}
-
-/**
- * Strip non-YouTube domains from Netscape cookie format.
- * Guarantees that accounts.google.com and external domains are discarded.
- */
-export function sanitizeNetscapeCookies(text: string): string {
-  const lines = text.split(/\r?\n/);
-  const out: string[] = ['# Netscape HTTP Cookie File'];
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const parts = line.split('\t');
-    if (parts.length >= 7) {
-      const domain = parts[0]!.trim().toLowerCase();
-      if (domain === '.youtube.com' || domain === 'youtube.com' || domain.endsWith('.youtube.com')) {
-        out.push(line);
-      }
-    }
-  }
-  return out.join('\n');
-}
-
-/**
- * Check if critical YouTube session cookies in a Netscape jar have expired by timestamp.
- */
-export function isCookieExpired(text: string): { expired: boolean; reason?: string; expiresAt?: Date } {
-  if (!text || !text.includes('\t')) return { expired: false };
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  const lines = text.split(/\r?\n/);
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const parts = line.split('\t');
-    if (parts.length >= 7) {
-      const name = parts[5]!.trim();
-      const exp = Number(parts[4]);
-      // Check YouTube session and authentication cookies
-      if (/^(SAPISID|LOGIN_INFO|__Secure-[13]PSID|SID)$/i.test(name)) {
-        if (!Number.isNaN(exp) && exp > 0 && exp < nowSec) {
-          const expiresAt = new Date(exp * 1000);
-          return {
-            expired: true,
-            reason: `Cookie "${name}" expired on ${expiresAt.toISOString()}`,
-            expiresAt,
-          };
-        }
-      }
-    }
-  }
-
-  return { expired: false };
-}
-
-export function parseCookieFile(path: string): string | null {
-  if (!path || !existsSync(path)) return null;
-  if (!isSafeCookiePath(path)) {
-    log.warning(`[YTJS] Cookie path rejected (relative ".." segment): ${path}`);
-    return null;
-  }
-  try {
-    return parseCookies(readFileSync(path, 'utf8'));
-  } catch (e) {
-    log.warning(`[YTJS] Failed reading cookies from ${path}`, { err: String(e) });
-    return null;
-  }
-}
-
 let ytPromise: Promise<Innertube> | null = null;
-
-onCookiesUpdated(() => {
-  log.info('[YTJS] Resetting Innertube instance due to updated cookies');
-  ytPromise = null;
-});
 
 export function resetInnertube(): void {
   ytPromise = null;
 }
-
-const INNERTUBE_POOL = new BoundedCache<Innertube>(100, 3600);
 
 // Innertube instances whose HTTP traffic is bound to one Webshare exit — one
 // per proxy URL, so the googlevideo URLs they return stay playable through it.
@@ -308,69 +146,17 @@ function makeProxiedFetch(dispatcher: ProxyAgent): typeof fetch {
 async function getProxiedInnertube(proxyUrl: string): Promise<Innertube> {
   const cached = PROXIED_INNERTUBE_POOL.get(proxyUrl);
   if (cached) return cached;
-  const cookieStr = defaultCookieString();
   const instance = await Innertube.create({
-    ...(cookieStr ? { cookie: cookieStr } : {}),
     fetch: makeProxiedFetch(new ProxyAgent(proxyUrl)),
   });
   PROXIED_INNERTUBE_POOL.set(proxyUrl, instance);
   return instance;
 }
 
-/** Cookie string for the default session jar — COOKIES_TEXT first, then COOKIES_FILE. */
-function defaultCookieString(): string | null {
-  let text: string | null | undefined;
-  let cPath: string | undefined;
-  try {
-    const cfg = config();
-    text = cfg.COOKIES_TEXT;
-    cPath = cfg.COOKIES_FILE;
-  } catch {
-    text = process.env.COOKIES_TEXT || process.env.YOUTUBE_COOKIES || process.env.COOKIES;
-    cPath = process.env.COOKIES_FILE || 'cookies.txt';
-  }
-  try {
-    if (text) {
-      const parsed = parseCookies(text);
-      if (parsed) {
-        log.info('[YTJS] Loaded cookies from COOKIES_TEXT environment variable');
-        return parsed;
-      }
-    }
-    if (cPath) {
-      const parsed = parseCookieFile(cPath);
-      if (parsed) {
-        log.info(`[YTJS] Loaded cookies from ${cPath}`);
-        return parsed;
-      }
-    }
-  } catch {
-    /* ignore if config() not yet loaded */
-  }
-  return null;
-}
-
-export async function getInnertube(customCookies?: string | null): Promise<Innertube> {
-  if (customCookies) {
-    const cookieStr = parseCookies(customCookies);
-    if (!cookieStr) {
-      return getInnertube();
-    }
-    const cached = INNERTUBE_POOL.get(cookieStr);
-    if (cached) return cached;
-
-    const instance = await Innertube.create({ cookie: cookieStr });
-    INNERTUBE_POOL.set(cookieStr, instance);
-    return instance;
-  }
-
+export async function getInnertube(): Promise<Innertube> {
   if (!ytPromise) {
     ytPromise = (async () => {
-      const cookieStr = defaultCookieString();
-
-      const instance = await Innertube.create({
-        ...(cookieStr ? { cookie: cookieStr } : {}),
-      });
+      const instance = await Innertube.create({});
       log.info('[YTJS] Innertube instance initialized');
       return instance;
     })().catch((err) => {
@@ -424,18 +210,17 @@ export interface ResolveMeta {
 
 const RESOLVED_STREAM_CACHE = new BoundedCache<ResolveMeta>(2048, 1800);
 
-async function fetchInfo(vid: string, cookies?: string | null): Promise<any | null> {
-  const cacheKey = cookies ? `${vid}:${cookies.slice(0, 32)}` : vid;
-  const cached = INFO_CACHE.get(cacheKey);
+async function fetchInfo(vid: string): Promise<any | null> {
+  const cached = INFO_CACHE.get(vid);
   if (cached !== undefined) return cached;
 
-  const yt = await getInnertube(cookies);
+  const yt = await getInnertube();
   // Working client ladder for metadata
   for (const client of ['TV_SIMPLY', 'MWEB', 'ANDROID', 'WEB', 'IOS'] as const) {
     try {
       const info = await yt.getBasicInfo(vid, { client });
       if (info.basic_info?.title || info.playability_status?.status === 'OK') {
-        INFO_CACHE.set(cacheKey, info);
+        INFO_CACHE.set(vid, info);
         return info;
       }
       log.info(`[YTJS] ${vid} ${client} playability status: ${info.playability_status?.status} (${info.playability_status?.reason || 'no reason'})`);
@@ -512,9 +297,7 @@ async function extractStreamUrls(yt: Innertube, info: any): Promise<[string | nu
   return [muxedUrl, audioUrl];
 }
 
-// Cookie-authenticated MWEB/WEB are the clients that actually pass on the
-// geo-bypass path — the app clients (ANDROID/IOS/TV_SIMPLY) answer 400 when
-// SAPISIDHASH auth rides along, so they come last here.
+// MWEB/WEB are preferred on the geo-bypass path.
 const PROXY_CLIENT_LADDER = ['MWEB', 'WEB', 'TV_SIMPLY', 'IOS', 'ANDROID'] as const;
 
 /**
@@ -649,15 +432,12 @@ async function resolveViaProxyTier(
   return null;
 }
 
-async function attemptResolveWithCookie(
-  vid: string,
-  cookies?: string | null,
-): Promise<ResolveAttempt> {
+async function attemptResolve(vid: string): Promise<ResolveAttempt> {
   let yt: Innertube;
   try {
-    yt = await getInnertube(cookies);
+    yt = await getInnertube();
   } catch (e) {
-    log.warning(`[YTJS] Failed initializing Innertube for cookie: ${String(e)}`);
+    log.warning(`[YTJS] Failed initializing Innertube: ${String(e)}`);
     return { urls: [null, null], lastError: `Innertube init failed: ${String(e)}` };
   }
 
@@ -705,57 +485,20 @@ function geoFromAttempt(attempt: ResolveAttempt): GeoRestriction | null {
 
 export async function resolveBothWithMeta(
   urlOrId: string,
-  cookies?: string | null,
   kind: 'audio' | 'muxed' = 'audio',
 ): Promise<ResolveMeta> {
   const vid = extractId(urlOrId);
   if (!vid) return { urls: [null, null], proxyUrl: null };
 
-  if (!cookies) {
-    const cached = RESOLVED_STREAM_CACHE.get(vid);
-    if (cached) return cached;
-  }
-
-  // If specific cookies were explicitly passed, use them directly
-  if (cookies) {
-    const attempt = await attemptResolveWithCookie(vid, cookies);
-    return { urls: attempt.urls, proxyUrl: null };
-  }
+  const cached = RESOLVED_STREAM_CACHE.get(vid);
+  if (cached) return cached;
 
   let result: ResolveMeta | null = null;
-
-  // Geo-restriction observed by any direct attempt: the official Data API is
-  // the authoritative source when keys exist (1 quota unit); the player
-  // microformat's availableCountries is the keyless fallback.
   let geo: GeoRestriction | null = null;
 
-  // If the dynamic MongoDB cookie pool has active accounts, rotate with failover
-  if (cookiePool.size > 0) {
-    const active = cookiePool.getAllActive();
-    const primary = cookiePool.nextCookie();
-    const candidates = primary
-      ? [primary, ...active.filter((c) => c.id !== primary.id)]
-      : active;
-
-    for (const item of candidates) {
-      const attempt = await attemptResolveWithCookie(vid, item.cookieString);
-      if (attempt.urls[0] || attempt.urls[1]) {
-        void cookiePool.reportSuccess(item.id);
-        result = { urls: attempt.urls, proxyUrl: null };
-        break;
-      } else {
-        geo ??= geoFromAttempt(attempt);
-        void cookiePool.reportFailure(item.id, attempt.lastError || 'No stream formats returned');
-      }
-    }
-  }
-
-  // Fallback to default instance (COOKIES_TEXT / COOKIES_FILE / anonymous)
-  if (!result) {
-    const defaultAttempt = await attemptResolveWithCookie(vid, null);
-    geo ??= geoFromAttempt(defaultAttempt);
-    result = { urls: defaultAttempt.urls, proxyUrl: null };
-  }
+  const directAttempt = await attemptResolve(vid);
+  geo = geoFromAttempt(directAttempt);
+  result = { urls: directAttempt.urls, proxyUrl: null };
 
   if (geo) {
     const official = await fetchRegionRestriction(vid).catch(() => null);
@@ -783,29 +526,26 @@ export async function resolveBothWithMeta(
 
 export async function resolveBoth(
   urlOrId: string,
-  cookies?: string | null,
 ): Promise<[string | null, string | null]> {
-  return (await resolveBothWithMeta(urlOrId, cookies)).urls;
+  return (await resolveBothWithMeta(urlOrId)).urls;
 }
 
 /** Like `resolve`, but also reports the Webshare proxy the URL is locked to (null when direct). */
 export async function resolveWithMeta(
   urlOrId: string,
   kind: 'audio' | 'muxed',
-  cookies?: string | null,
 ): Promise<{ url: string | null; proxyUrl: string | null }> {
   const vid = extractId(urlOrId);
   if (!vid) return { url: null, proxyUrl: null };
-  const meta = await resolveBothWithMeta(urlOrId, cookies, kind);
+  const meta = await resolveBothWithMeta(urlOrId, kind);
   return { url: kind === 'audio' ? meta.urls[1] : meta.urls[0], proxyUrl: meta.proxyUrl };
 }
 
 export async function resolve(
   urlOrId: string,
   kind: 'audio' | 'muxed',
-  cookies?: string | null,
 ): Promise<string | null> {
-  return (await resolveWithMeta(urlOrId, kind, cookies)).url;
+  return (await resolveWithMeta(urlOrId, kind)).url;
 }
 
 export async function metadata(urlOrId: string): Promise<InnertubeMetadata | null> {

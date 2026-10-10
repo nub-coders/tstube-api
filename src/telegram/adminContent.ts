@@ -11,7 +11,6 @@ import { isAdmin, config } from '../config.js';
 import { getRecentErrors, type ErrorLogEntry } from '../tools.js';
 import { comma, pyRoundStr } from '../pyTime.js';
 import { getReadableUptime, apiUrl } from './content.js';
-import { cookiePool } from '../cookiePool.js';
 
 export const ADMIN_BOT_START_TIME = Date.now();
 
@@ -465,11 +464,6 @@ export function adminHelpCard(): string {
   <tr><td><code>/revoke &lt;id&gt;</code></td><td>Forcefully revoke a user's API token</td></tr>
   <tr><td><code>/listusers</code></td><td>List recent registered users</td></tr>
   <tr><td><code>/broadcast</code></td><td>Broadcast a replied message to all users</td></tr>
-  <tr><td><code>/cookies</code></td><td>🍪 View cookie pool status and management panel</td></tr>
-  <tr><td><code>/cookie_terminate &lt;label&gt;</code></td><td>🗑 Terminate a cookie by label/ID</td></tr>
-  <tr><td><code>/cookie_probe</code></td><td>🔍 Force background health probe on all cookies</td></tr>
-  <tr><td><code>/cookie_upload</code></td><td>📤 Show the full cookie upload command with your key</td></tr>
-  <tr><td><code>/cookie_purge</code></td><td>🗑 Hard-delete all expired and inactive cookies</td></tr>
 </table>
 
 <details>
@@ -477,120 +471,11 @@ export function adminHelpCard(): string {
   <pre><code>/user 123456789
 /grant 123456789 500
 /revoke 123456789
-/errors 30
-/cookies
-/cookie_terminate myaccount_label
-/cookie_probe
-/cookie_upload</code></pre>
+/errors 30</code></pre>
 </details>`;
 }
 
-// ── Cookie Management Cards ─────────────────────────────────────
 
-/** Build a rich cookie pool status dashboard. */
-export async function buildCookieStatus(): Promise<string> {
-  const cookies = await cookiePool.getStatus();
-  const total = cookies.length;
-  const active = cookies.filter((c) => c.is_active).length;
-  const inactive = total - active;
-
-  const healthIcon = (c: (typeof cookies)[0]): string => {
-    if (!c.is_active) return '🔴';
-    if ((c.error_count ?? 0) >= 2) return '🟠';
-    if ((c.error_count ?? 0) >= 1) return '🟡';
-    return '🟢';
-  };
-
-  const rows = cookies
-    .map((c) => {
-      const icon = healthIcon(c);
-      const lastUsed = c.last_used_at
-        ? new Date(c.last_used_at).toISOString().slice(0, 16).replace('T', ' ')
-        : 'Never';
-      const lastErr = c.last_error ? escapeHtml(c.last_error.slice(0, 50)) : '—';
-      const successes = typeof c.success_count === 'number' ? comma(c.success_count) : '—';
-      return `<tr>
-  <td>${icon} <b>${escapeHtml(c.label)}</b></td>
-  <td><code>${c.is_active ? 'Active' : 'Inactive'}</code></td>
-  <td>${c.error_count ?? 0} errs / ${successes} ok</td>
-  <td>${lastUsed}</td>
-  <td>${lastErr}</td>
-</tr>`;
-    })
-    .join('');
-
-  const tableRows = rows || "<tr><td colspan='5'>No cookies in pool</td></tr>";
-
-  const poolBackend = cookiePool.size >= 0 ? 'MongoDB' : 'In-memory';
-  void poolBackend;
-
-  const ts = new Date().toISOString().slice(0, 19).replace('T', ' ');
-
-  return `<h1>🍪 Cookie Pool Status</h1>
-<blockquote>Generated: <b>${ts} UTC</b></blockquote>
-
-<h2>Pool Summary</h2>
-<table border="1">
-  <tr><th>Metric</th><th>Value</th></tr>
-  <tr><td><b>Total Cookies</b></td><td>${comma(total)}</td></tr>
-  <tr><td><b>Active (in rotation)</b></td><td><b>${comma(active)}</b></td></tr>
-  <tr><td><b>Inactive / Terminated</b></td><td>${comma(inactive)}</td></tr>
-  <tr><td><b>Current Pool Size</b></td><td><b>${comma(cookiePool.size)}</b></td></tr>
-</table>
-
-<h2>Cookie Details</h2>
-<table border="1">
-  <tr><th>Label</th><th>Status</th><th>Stats</th><th>Last Used</th><th>Last Error</th></tr>
-  ${tableRows}
-</table>
-
-<details>
-  <summary><b>Management Commands</b></summary>
-  <pre><code>/cookie_terminate &lt;label&gt;  — Deactivate a cookie
-/cookie_probe               — Force health probe now
-/cookie_upload              — Show upload command</code></pre>
-</details>`;
-}
-
-/** Build the full cookie upload command card with the admin token embedded. */
-export function cookieUploadCommandCard(adminToken: string): string {
-  const cfg = config();
-  const serverUrl = cfg.BASE_URL || apiUrl();
-  const key = cfg.ADMIN_API_KEY || adminToken;
-
-  const basicCmd = `bash <(curl -s ${serverUrl}/upload.sh) -k ${key}`;
-  const fullCmd = `bash <(curl -s ${serverUrl}/upload.sh) -k ${key} -b chrome,firefox,brave -v`;
-  const loopCmd = `bash <(curl -s ${serverUrl}/upload.sh) -k ${key} --loop --interval 3600`;
-
-  return `<h1>📤 Cookie Upload Command</h1>
-<blockquote>Use the commands below on your machine to extract and sync YouTube cookies to the API pool.</blockquote>
-
-<h2>Basic Upload</h2>
-<blockquote>Detects all browsers automatically:</blockquote>
-<pre><code>${escapeHtml(basicCmd)}</code></pre>
-
-<h2>Full Upload (All Browsers)</h2>
-<blockquote>Extract from Chrome, Firefox, and Brave with verbose output:</blockquote>
-<pre><code>${escapeHtml(fullCmd)}</code></pre>
-
-<h2>Loop Mode (Auto-Sync)</h2>
-<blockquote>Continuously sync every hour:</blockquote>
-<pre><code>${escapeHtml(loopCmd)}</code></pre>
-
-<details>
-  <summary><b>Options Reference</b></summary>
-  <table border="1">
-    <tr><th>Flag</th><th>Description</th></tr>
-    <tr><td><code>-k &lt;KEY&gt;</code></td><td>Admin API key (required)</td></tr>
-    <tr><td><code>-b &lt;LIST&gt;</code></td><td>Browsers: chrome,firefox,brave,edge,chromium</td></tr>
-    <tr><td><code>-p &lt;LIST&gt;</code></td><td>Profiles to use (default: all)</td></tr>
-    <tr><td><code>--loop</code></td><td>Run continuously</td></tr>
-    <tr><td><code>--interval &lt;SEC&gt;</code></td><td>Loop interval in seconds (default: 3600)</td></tr>
-    <tr><td><code>-d, --dry-run</code></td><td>Extract locally without uploading</td></tr>
-    <tr><td><code>-v, --verbose</code></td><td>Verbose yt-dlp output</td></tr>
-  </table>
-</details>`;
-}
 
 export const ACCESS_DENIED = "<blockquote>❌ <b>Access Denied:</b> Admin privileges required.</blockquote>";
 export const ACCESS_DENIED_STATS =

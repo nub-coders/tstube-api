@@ -76,18 +76,7 @@ export interface Config {
   ADMIN_LIMIT: number;
   ADMIN_API_KEY: string | null;
 
-  // ── Cookies & MongoDB Cookie Pool ────────────────────────────
-  COOKIES_FILE: string;
-  COOKIES_TEXT: string | null;
-  COOKIES_BROWSER: string;
-  COOKIES_BOOTSTRAP_URL: string;
-  COOKIES_REFRESH_HOURS: number;
-  MONGODB_URI: string | null;
-  MONGODB_DB: string;
-  MONGODB_COOKIES_COLLECTION: string;
-  COOKIE_SYNC_INTERVAL_SEC: number;
-  COOKIE_PROBE_INTERVAL_SEC: number;
-  COOKIE_PROBE_DELAY_MS: number;
+
 
   // ── Webshare geo-bypass proxy pool ───────────────────────────
   WEBSHARE_API_KEY: string | null;
@@ -139,7 +128,6 @@ export function loadConfig(): Config {
   // Matches bot.py: a missing token is a warning at startup, not a config error —
   // main.py simply runs the API standalone in that case.
 
-  const cookiesRefresh = getfloat('COOKIES_REFRESH_HOURS', 6);
   const apiHost = getenv('API_HOST', 'apitest.nubcoders.com');
 
   let redisHost = getenv('REDIS_HOST', 'localhost');
@@ -191,21 +179,7 @@ export function loadConfig(): Config {
     ADMIN_LIMIT: getint('ADMIN_LIMIT', 100000),
     ADMIN_API_KEY: process.env.ADMIN_API_KEY || null,
 
-    COOKIES_FILE: getenv('COOKIES_FILE', 'cookies.txt'),
-    COOKIES_TEXT: process.env.COOKIES_TEXT || process.env.YOUTUBE_COOKIES || process.env.COOKIES || null,
-    COOKIES_BROWSER: getenv('COOKIES_BROWSER', 'firefox'),
-    COOKIES_BOOTSTRAP_URL: getenv(
-      'COOKIES_BOOTSTRAP_URL',
-      'https://www.youtube.com',
-    ),
-    COOKIES_REFRESH_HOURS: cookiesRefresh,
 
-    MONGODB_URI: process.env.MONGODB_URI || process.env.MONGO_URL || null,
-    MONGODB_DB: getenv('MONGODB_DB', 'tstube'),
-    MONGODB_COOKIES_COLLECTION: getenv('MONGODB_COOKIES_COLLECTION', 'youtube_cookies'),
-    COOKIE_SYNC_INTERVAL_SEC: getint('COOKIE_SYNC_INTERVAL_SEC', 300),
-    COOKIE_PROBE_INTERVAL_SEC: getint('COOKIE_PROBE_INTERVAL_SEC', 900),
-    COOKIE_PROBE_DELAY_MS: getint('COOKIE_PROBE_DELAY_MS', 3000),
 
     WEBSHARE_API_KEY: process.env.WEBSHARE_API_KEY || null,
     WEBSHARE_PROXY_COUNTRIES: (process.env.WEBSHARE_PROXY_COUNTRIES ?? '').toUpperCase(),

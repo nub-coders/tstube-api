@@ -31,7 +31,6 @@ const ASSET_DIR = join(dirname(fileURLToPath(import.meta.url)), 'assets');
 
 const FREE_PATHS = new Set([
   '/',
-  '/upload.sh',
   '/search',
   '/trending',
   '/suggest',

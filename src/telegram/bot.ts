@@ -11,11 +11,6 @@ import { BOT_COMMANDS, cmdHelp, cmdMenu, cmdPing, cmdPlatforms, cmdRevoke, cmdSt
 import {
   cmdAdminHelp,
   cmdBroadcast,
-  cmdCookieProbe,
-  cmdCookiePurge,
-  cmdCookies,
-  cmdCookieTerminate,
-  cmdCookieUpload,
   cmdErrors,
   cmdGrant,
   cmdListUsers,
@@ -34,7 +29,7 @@ const USER_RE = /^\/user\s+\d+/;
 const GRANT_RE = /^\/grant\s+\d+\s+\d+/;
 const REVOKE_ID_RE = /^\/revoke\s+\d+/;
 
-const PRIVATE_ONLY = new Set(['stats', 'user', 'grant', 'revoke', 'listusers', 'adminhelp', 'errors', 'broadcast', 'cookies', 'cookie_terminate', 'cookie_probe', 'cookie_upload', 'cookie_purge']);
+const PRIVATE_ONLY = new Set(['stats', 'user', 'grant', 'revoke', 'listusers', 'adminhelp', 'errors', 'broadcast']);
 
 export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise<void> {
   if (!msg.from || msg.from.is_bot) return;
@@ -78,16 +73,6 @@ export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise
       return cmdErrors(api, msg);
     case 'broadcast':
       return cmdBroadcast(api, msg);
-    case 'cookies':
-      return cmdCookies(api, msg);
-    case 'cookie_terminate':
-      return cmdCookieTerminate(api, msg);
-    case 'cookie_probe':
-      return cmdCookieProbe(api, msg);
-    case 'cookie_upload':
-      return cmdCookieUpload(api, msg);
-    case 'cookie_purge':
-      return cmdCookiePurge(api, msg);
     case 'platforms':
       return cmdPlatforms(api, msg);
     case 'help':
