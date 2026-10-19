@@ -553,7 +553,6 @@ export async function resolveToPlayableStream(
   options?: {
     session?: any;
     fetchFn?: typeof fetch;
-    ytDlpExtractor?: (url: string) => Promise<any>;
   },
 ): Promise<any> {
   if (!queryOrUrl || typeof queryOrUrl !== 'string' || !queryOrUrl.trim()) {
@@ -585,9 +584,6 @@ export async function resolveToPlayableStream(
     const res = await resolveAmazonMusic(cleanInput, options);
     if (res.youtube_url) {
       const streamUrl = res.youtube_url;
-      if (options?.ytDlpExtractor && typeof options.ytDlpExtractor === 'function') {
-        return await options.ytDlpExtractor(streamUrl);
-      }
       return {
         provider: 'amazon_music',
         title: res.title,
@@ -610,9 +606,6 @@ export async function resolveToPlayableStream(
     const res = await resolveSpotify(cleanInput, options);
     if (res.youtube_url) {
       const streamUrl = res.youtube_url;
-      if (options?.ytDlpExtractor && typeof options.ytDlpExtractor === 'function') {
-        return await options.ytDlpExtractor(streamUrl);
-      }
       return {
         provider: 'spotify',
         title: res.title,
@@ -655,9 +648,6 @@ export async function resolveToPlayableStream(
     };
   } else if (provider === 'soundcloud') {
     const res = resolveSoundCloud(cleanInput);
-    if (options?.ytDlpExtractor && typeof options.ytDlpExtractor === 'function') {
-      return await options.ytDlpExtractor(cleanInput);
-    }
     return {
       provider: 'soundcloud',
       title: null,
@@ -667,9 +657,6 @@ export async function resolveToPlayableStream(
       bypass_search: true,
     };
   } else if (provider === 'text_search') {
-    if (options?.ytDlpExtractor && typeof options.ytDlpExtractor === 'function') {
-      return await options.ytDlpExtractor(cleanInput);
-    }
     return {
       provider: 'text_search',
       title: cleanInput,
@@ -680,9 +667,6 @@ export async function resolveToPlayableStream(
     };
   } else {
     // Generic URL fallback
-    if (options?.ytDlpExtractor && typeof options.ytDlpExtractor === 'function') {
-      return await options.ytDlpExtractor(cleanInput);
-    }
     return {
       provider: 'generic_url',
       title: cleanInput,

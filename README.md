@@ -8,8 +8,7 @@ bot's rich-message UI are ports of the Python original, not reinterpretations.
 
 - **Runtime:** Node.js ≥ 22 (ESM). No web framework — a small router on `node:http`.
 - **Redis:** `ioredis`, for bearer tokens, daily counters and stream-job state.
-- **Extraction:** the Innertube `player` endpoint first (one HTTP call), with
-  `yt-dlp -g` / `yt-dlp -j` as the fallback.
+- **Extraction:** the Innertube `player` endpoint via `youtubei.js` with client fallback ladder and Webshare proxy routing.
 - **Bot:** raw Telegram Bot API over HTTPS (`sendRichMessage` / `editMessageText`
   with `rich_message: { html }`), long-polled with `getUpdates`. No MTProto client.
 
@@ -25,7 +24,6 @@ src/
   streamProxy.ts      byte-proxy for googlevideo URLs (node:http, never fetch)
   innertube.ts        Innertube client + related-video parsing
   searchService.ts    YouTube search scrape (in-process + Upstash cache)
-  ytdlp.ts            yt-dlp subprocess runner (global semaphore)
   cacheManager.ts     stream-URL cache (Redis + container-local file)
   metrics.ts          Prometheus text exposition
   telegram/           Bot API client, rich UI helpers, commands/callbacks/admin

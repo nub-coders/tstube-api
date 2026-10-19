@@ -20,7 +20,7 @@ const YT_REGEX = /ytInitialData\s*=\s*(\{.+?\});/s;
 
 // Bounded like every other outbound fetch: a hung YouTube or Upstash response
 // must not pin the handlers behind the free, unauthenticated endpoints.
-const FETCH_TIMEOUT_MS = 10_000;
+const FETCH_TIMEOUT_MS = 3_500;
 
 export interface SearchItem {
   title: string;
@@ -65,16 +65,68 @@ function safeGet(obj: any, ...keys: string[]): any {
   return obj;
 }
 
-async function fetchYtData(url: string): Promise<any | null> {
-  const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
-  const text = await res.text();
-  const m = YT_REGEX.exec(text);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[1]!);
-  } catch {
-    return null;
+async function fetchYtData(url: string, retries = 1): Promise<any | null> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { headers: HEADERS, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+      if (!res.ok) {
+        if (attempt < retries) {
+          await new Promise((r) => setTimeout(r, 200));
+          continue;
+        }
+        return null;
+      }
+      const text = await res.text();
+      const m = YT_REGEX.exec(text);
+      if (!m) return null;
+      return JSON.parse(m[1]!);
+    } catch (e) {
+      if (attempt < retries) {
+        await new Promise((r) => setTimeout(r, 200 * (attempt + 1)));
+        continue;
+      }
+      log.warning(`[SEARCH] YouTube HTML scrape failed: ${String(e)}`);
+      return null;
+    }
   }
+  return null;
+}
+
+function parseYtData(rawData: any, limit: number): SearchItem[] {
+  const contents: any[] = safeGet(
+    rawData,
+    'contents',
+    'twoColumnSearchResultsRenderer',
+    'primaryContents',
+    'sectionListRenderer',
+    'contents',
+  ) as any[];
+
+  const results: SearchItem[] = [];
+  for (const section of Array.isArray(contents) ? contents : []) {
+    const items = safeGet(section, 'itemSectionRenderer', 'contents');
+    for (const item of Array.isArray(items) ? items : []) {
+      const v = item.videoRenderer;
+      if (!v) continue;
+      const videoId = v.videoId;
+      if (!videoId) continue;
+      const titleRuns = safeGet(v, 'title', 'runs');
+      const title = titleRuns?.[0]?.text ?? 'Unknown';
+      const durationStr = v.lengthText?.simpleText ?? 'LIVE';
+      results.push({
+        title,
+        video_id: videoId,
+        url: `https://www.youtube.com/watch?v=${videoId}`,
+        time: durationStr,
+        duration: durationStr,
+        channel: extractChannelName(v),
+        views: stripViews(v.viewCountText?.simpleText ?? '0 views'),
+        thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+      });
+      if (results.length >= limit + 10) break;
+    }
+  }
+  return results;
 }
 
 // ── Upstash Redis helpers ───────────────────────────────────────
@@ -158,39 +210,17 @@ export async function fetchResults(query: string, limit = 1): Promise<SearchOutp
     try {
       const url = YOUTUBE_SEARCH_URL + encodeURIComponent(query).replace(/%20/g, '+');
       const rawData = await fetchYtData(url);
-      if (!rawData) return { main_results: [], suggested: [] };
+      let results: SearchItem[] = rawData ? parseYtData(rawData, limit) : [];
 
-      const contents: any[] = safeGet(
-        rawData,
-        'contents',
-        'twoColumnSearchResultsRenderer',
-        'primaryContents',
-        'sectionListRenderer',
-        'contents',
-      ) as any[];
-
-      const results: SearchItem[] = [];
-      for (const section of Array.isArray(contents) ? contents : []) {
-        const items = safeGet(section, 'itemSectionRenderer', 'contents');
-        for (const item of Array.isArray(items) ? items : []) {
-          const v = item.videoRenderer;
-          if (!v) continue;
-          const videoId = v.videoId;
-          if (!videoId) continue;
-          const titleRuns = safeGet(v, 'title', 'runs');
-          const title = titleRuns?.[0]?.text ?? 'Unknown';
-          const durationStr = v.lengthText?.simpleText ?? 'LIVE';
-          results.push({
-            title,
-            video_id: videoId,
-            url: `https://www.youtube.com/watch?v=${videoId}`,
-            time: durationStr,
-            duration: durationStr,
-            channel: extractChannelName(v),
-            views: stripViews(v.viewCountText?.simpleText ?? '0 views'),
-            thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-          });
-          if (results.length >= limit + 10) break;
+      // If synthetic prefixes or strict matching returned empty results, try relaxing the query.
+      if (!results.length) {
+        const relaxed = query.replace(/^[a-zA-Z0-9]+-\d+\s+/, '').trim();
+        if (relaxed && relaxed !== query) {
+          const relaxedUrl = YOUTUBE_SEARCH_URL + encodeURIComponent(relaxed).replace(/%20/g, '+');
+          const relaxedData = await fetchYtData(relaxedUrl, 0);
+          if (relaxedData) {
+            results = parseYtData(relaxedData, limit);
+          }
         }
       }
 
@@ -199,9 +229,11 @@ export async function fetchResults(query: string, limit = 1): Promise<SearchOutp
         suggested:
           results.length > limit ? results.slice(limit, limit + 5) : results.slice(0, 5),
       };
-      MEMORY_CACHE.set(qkey, output);
-      // Fire-and-forget Redis write.
-      void redisSet(qkey, JSON.stringify(output));
+      if (results.length > 0) {
+        MEMORY_CACHE.set(qkey, output);
+        // Fire-and-forget Redis write.
+        void redisSet(qkey, JSON.stringify(output));
+      }
       return output;
     } finally {
       LOCKS.delete(qkey);

@@ -10,7 +10,7 @@ import { createRedis, closeRedis } from './redis.js';
 import { createAppServer, metricsHandler, rateLimitStatus, type RouteSpec } from './httpServer.js';
 import * as routes from './apiRoutes.js';
 import { setDefaultResultOrder } from 'node:dns';
-import { getInnertube } from './innertube.js';
+import { getInnertube, prewarmProxiedInnertube } from './innertube.js';
 import { websharePool } from './proxy.js';
 import { fetchTrending } from './searchService.js';
 import { setGlobalDispatcher, Agent } from 'undici';
@@ -53,6 +53,7 @@ async function main(): Promise<void> {
   if (!cfg.TESTING) {
     // Geo-bypass proxy pool (no-op unless WEBSHARE_API_KEY is set).
     websharePool.init();
+    prewarmProxiedInnertube(10);
   }
 
   const server = createAppServer({ routes: routeTable });

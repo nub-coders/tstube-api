@@ -6,7 +6,6 @@
  * service behaves identically out of the box.
  */
 import { readFileSync, existsSync } from 'node:fs';
-import { cpus } from 'node:os';
 
 function loadDotenv(path = '.env'): void {
   if (!existsSync(path)) return;
@@ -91,7 +90,6 @@ export interface Config {
   YOUTUBE_API_KEYS: string;
 
   // ── Tuning ───────────────────────────────────────────────────
-  YTDLP_MAX_PROCS: number;
   WEB_CONCURRENCY: number;
 
   TESTING: boolean;
@@ -190,7 +188,6 @@ export function loadConfig(): Config {
 
     YOUTUBE_API_KEYS: process.env.YOUTUBE_API_KEYS ?? '',
 
-    YTDLP_MAX_PROCS: getint('YTDLP_MAX_PROCS', (cpus().length || 2) * 2),
     WEB_CONCURRENCY: getint('WEB_CONCURRENCY', 1),
 
     TESTING: boolish(process.env.TESTING ?? ''),

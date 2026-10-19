@@ -1,14 +1,12 @@
 /**
  * Fast YouTube resolver powered by youtubei.js (ytjs).
- * Primary stream resolver; yt-dlp is the fallback.
  */
 import { Innertube, Platform, Parser, Helpers } from 'youtubei.js';
-import { ProxyAgent } from 'undici';
+import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import { extractArtist, formatInd } from './formatters.js';
 import { getLogger } from './logger.js';
 import { BoundedCache } from './boundedCache.js';
 import { websharePool } from './proxy.js';
-import { resolveViaProxy } from './ytdlp.js';
 import { fetchRegionRestriction } from './youtubeApi.js';
 import type { WebshareProxy } from './proxy.js';
 
@@ -131,15 +129,44 @@ export function resetInnertube(): void {
 
 // Innertube instances whose HTTP traffic is bound to one Webshare exit — one
 // per proxy URL, so the googlevideo URLs they return stay playable through it.
-const PROXIED_INNERTUBE_POOL = new BoundedCache<Innertube>(20, 3600);
+const PROXIED_INNERTUBE_POOL = new BoundedCache<Innertube>(50, 3600);
 
-function makeProxiedFetch(dispatcher: ProxyAgent): typeof fetch {
-  // globalThis.fetch (not npm-undici's): youtubei.js passes globalThis.Request
-  // instances, and only the global fetch recognizes that class. The
-  // non-standard `dispatcher` init option scopes the proxy to this instance
-  // without touching any other fetch call in the process.
-  const proxied = (input: Parameters<typeof fetch>[0], init?: Record<string, unknown>) =>
-    globalThis.fetch(input, { ...(init ?? {}), dispatcher } as unknown as Parameters<typeof fetch>[1]);
+function makeProxiedFetch(agent: ProxyAgent): typeof fetch {
+  const proxied = (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+    let url: string | URL = input as any;
+    let reqInit: Record<string, unknown> = { ...(init ?? {}) };
+    if (input instanceof URL) {
+      url = input.href;
+    } else if (typeof input === 'object' && input !== null && 'url' in input) {
+      const req = input as Request;
+      url = req.url;
+      const inputHeaders = Object.fromEntries(req.headers?.entries?.() ?? []);
+      const initHeaders =
+        init?.headers
+          ? typeof (init.headers as any)?.entries === 'function'
+            ? Object.fromEntries((init.headers as any).entries())
+            : (init.headers as Record<string, string>)
+          : {};
+      reqInit = {
+        method: req.method,
+        body: req.body,
+        ...init,
+        headers: { ...inputHeaders, ...initHeaders },
+      };
+    } else if (init?.headers) {
+      reqInit.headers =
+        typeof (init.headers as any)?.entries === 'function'
+          ? Object.fromEntries((init.headers as any).entries())
+          : init.headers;
+    }
+    if (reqInit.method === 'GET' || reqInit.method === 'HEAD') {
+      delete reqInit.body;
+    }
+    if (reqInit.body != null) {
+      (reqInit as any).duplex = 'half';
+    }
+    return undiciFetch(url as any, { ...reqInit, dispatcher: agent } as any);
+  };
   return proxied as unknown as typeof fetch;
 }
 
@@ -151,6 +178,39 @@ async function getProxiedInnertube(proxyUrl: string): Promise<Innertube> {
   });
   PROXIED_INNERTUBE_POOL.set(proxyUrl, instance);
   return instance;
+}
+
+/** Pre-warm Webshare exits in the background so initial requests have warm sessions ready. */
+export function prewarmProxiedInnertube(count = 10): void {
+  if (!websharePool.enabled) return;
+  void (async () => {
+    for (let i = 0; i < 20; i++) {
+      if (websharePool.size > 0) break;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    const proxies = websharePool.getSomeProxies(count);
+    const queue = [...proxies];
+    const workers = Array.from({ length: 3 }, async () => {
+      while (queue.length > 0) {
+        const p = queue.shift();
+        if (!p) break;
+        if (!isProxiedInnertubeWarm(p.url)) {
+          try {
+            await withTimeout(getProxiedInnertube(p.url), PROXY_BOOTSTRAP_TIMEOUT_MS, 'prewarm');
+            log.info(`[YTJS] Pre-warmed Webshare exit ${p.address}:${p.port}`);
+          } catch {
+            /* ignore bootstrap failure on boot */
+          }
+        }
+      }
+    });
+    await Promise.all(workers);
+  })();
+}
+
+/** A warm exit already has a session cached, so it skips the cold bootstrap. */
+function isProxiedInnertubeWarm(proxyUrl: string): boolean {
+  return PROXIED_INNERTUBE_POOL.has(proxyUrl);
 }
 
 export async function getInnertube(): Promise<Innertube> {
@@ -294,24 +354,36 @@ async function extractStreamUrls(yt: Innertube, info: any): Promise<[string | nu
   const sd: InnertubeStreamingData = info.streaming_data ?? {};
   if (!muxedUrl) muxedUrl = pickMuxed(sd);
   if (!audioUrl) audioUrl = pickAudio(sd);
+  if (!audioUrl && muxedUrl) audioUrl = muxedUrl;
+  if (!muxedUrl && audioUrl) muxedUrl = audioUrl;
   return [muxedUrl, audioUrl];
 }
 
-// MWEB/WEB are preferred on the geo-bypass path.
-const PROXY_CLIENT_LADDER = ['MWEB', 'WEB', 'TV_SIMPLY', 'IOS', 'ANDROID'] as const;
+// App clients (ANDROID/TV_SIMPLY/IOS) return stream URLs that don't require Web PO tokens.
+const PROXY_CLIENT_LADDER = ['ANDROID', 'TV_SIMPLY', 'IOS', 'MWEB', 'WEB'] as const;
 
 /**
  * Resolve through a proxied Innertube instance (stage A of the geo-bypass
- * tier). Both URLs share the same proxy binding, so both are returned.
+ * tier). The instance is bootstrapped by the caller (on its own clock); here
+ * each client in the ladder gets its own probe budget bounded by `deadline`,
+ * so one slow or non-OK client can't starve the ones after it. Both URLs share
+ * the same proxy binding, so both are returned.
  */
 async function attemptResolveWithProxiedInnertube(
   vid: string,
   proxyUrl: string,
+  yt: Innertube,
+  deadline: number,
 ): Promise<ResolveMeta | null> {
-  const yt = await getProxiedInnertube(proxyUrl);
   for (const client of PROXY_CLIENT_LADDER) {
+    if (Date.now() >= deadline) break;
     try {
-      const info = await yt.getBasicInfo(vid, { client });
+      const budget = Math.min(PROXY_PROBE_TIMEOUT_MS, Math.max(1_000, deadline - Date.now()));
+      const info = await withTimeout(
+        yt.getBasicInfo(vid, { client }),
+        budget,
+        'proxied getBasicInfo',
+      );
       if (info.playability_status?.status !== 'OK') continue;
       const [muxedUrl, audioUrl] = await extractStreamUrls(yt, info);
       if (muxedUrl || audioUrl) {
@@ -341,94 +413,120 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 }
 
 /**
- * Tier 4 — Webshare geo-bypass, two stages:
- *   A. youtubei.js through a scoped proxy dispatcher (fast, ~seconds)
- *   B. yt-dlp through the same proxy (slower, battle-tested fallback)
+ * Webshare geo-bypass:
+ *   youtubei.js through a scoped proxy dispatcher (fast, ~seconds).
  * When the failure was classified as a geo-restriction, the proxy is targeted
  * at a country where the video is playable (whitelist) or at least outside
  * the blocked set (blacklist); everything else keeps plain round-robin.
  * Webshare's country labels often disagree with Google's geo-IP view of
- * datacenter IPs (live: 1 of 4 whitelist-matched exits actually worked), so
- * up to PROXY_CANDIDATES exits are tried under a time budget before giving up.
+ * datacenter IPs, so up to PROXY_CANDIDATES exits are tried under a time budget before giving up.
  * The result is pinned to one proxy exit and never written to
  * RESOLVED_STREAM_CACHE (which holds direct, server-locked URL pairs).
  */
-const PROXY_CANDIDATES = 3;
+const PROXY_CANDIDATES = 4;
 const TIER_BUDGET_MS = 35_000;
-const PROXY_STAGE_A_TIMEOUT_MS = 8_000;
-const PROXY_STAGE_B_TIMEOUT_S = 10;
+// Cold Innertube bootstrap (homepage + player JS through the proxy) runs on its
+// own clock, separate from the probe budget, so a cold session doesn't consume
+// the time meant for getBasicInfo. A cached instance returns from this instantly.
+const PROXY_BOOTSTRAP_TIMEOUT_MS = 20_000;
+// One getBasicInfo round-trip through the proxy. Spent per client, not shared
+// across the whole ladder, so a single slow probe no longer fails the candidate.
+const PROXY_PROBE_TIMEOUT_MS = 8_000;
+
+/** Resolve with the first task that yields a non-null value, else null once all settle. */
+function raceUsable<T>(tasks: Promise<T | null>[]): Promise<T | null> {
+  if (!tasks.length) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let remaining = tasks.length;
+    let settled = false;
+    const onDone = (v: T | null) => {
+      if (settled) return;
+      if (v !== null) {
+        settled = true;
+        resolve(v);
+      } else if (--remaining === 0) {
+        resolve(null);
+      }
+    };
+    for (const t of tasks) void t.then(onDone, () => onDone(null));
+  });
+}
 
 async function resolveViaProxyTier(
   vid: string,
-  kind: 'audio' | 'muxed',
+  _kind: 'audio' | 'muxed',
   geo?: GeoRestriction,
 ): Promise<ResolveMeta | null> {
   if (!websharePool.enabled) return null;
 
-  let candidates: WebshareProxy[] = [];
-  if (geo?.allowed?.length) {
-    candidates = websharePool.getGeoCandidates({ allowed: geo.allowed }, PROXY_CANDIDATES);
-    if (!candidates.length) {
-      // Pool has no exit in any allowed country — try the on-demand fetch.
-      const p = await websharePool.getProxyForCountries(geo.allowed).catch(() => null);
-      if (p) candidates.push(p);
-    }
-  } else if (geo?.blocked?.length) {
-    candidates = websharePool.getGeoCandidates({ blocked: geo.blocked }, PROXY_CANDIDATES);
-  }
-  if (!candidates.length) {
-    while (candidates.length < PROXY_CANDIDATES) {
-      const p = await websharePool.getProxy();
-      if (!p || candidates.some((c) => c.id === p.id)) break;
-      candidates.push(p);
-    }
-  }
-  if (!candidates.length) return null;
-
   const deadline = Date.now() + TIER_BUDGET_MS;
-  for (let i = 0; i < candidates.length; i++) {
-    const proxy = candidates[i]!;
-    log.info(
-      `[YTJS] ${vid} Webshare candidate ${i + 1}/${candidates.length}: ${proxy.address}:${proxy.port} (${proxy.countryCode || '??'})` +
-        (geo ? ` — geo target [${geo.allowed.join(',') || 'any'}], avoid [${geo.blocked.join(',') || 'none'}]` : ''),
-    );
+  const tried = new Set<string>();
 
-    // Stage A — in-process Innertube through the proxy.
+  if (geo) {
+    log.info(
+      `[YTJS] ${vid} Webshare tier — geo target [${geo.allowed?.join(',') || 'any'}], avoid [${geo.blocked?.join(',') || 'none'}]`,
+    );
+  }
+
+  // One exit's full attempt: bootstrap (a cold exit pays session setup here, a
+  // warm one returns instantly) then probe the client ladder. Never throws — a
+  // failure resolves to null and marks the exit bad so the race can move on.
+  const attempt = async (proxy: WebshareProxy): Promise<ResolveMeta | null> => {
+    log.info(
+      `[YTJS] ${vid} Webshare exit ${proxy.address}:${proxy.port} (${proxy.countryCode || '??'})` +
+        (isProxiedInnertubeWarm(proxy.url) ? ' [warm]' : ''),
+    );
     try {
-      const budget = Math.min(PROXY_STAGE_A_TIMEOUT_MS, Math.max(1_000, deadline - Date.now()));
-      const meta = await withTimeout(
-        attemptResolveWithProxiedInnertube(vid, proxy.url),
-        budget,
-        'proxied innertube',
-      );
+      const bootBudget = Math.min(PROXY_BOOTSTRAP_TIMEOUT_MS, Math.max(1_000, deadline - Date.now()));
+      const yt = await withTimeout(getProxiedInnertube(proxy.url), bootBudget, 'proxied innertube bootstrap');
+      const meta = await attemptResolveWithProxiedInnertube(vid, proxy.url, yt, deadline);
       if (meta) {
         websharePool.markOk(proxy.id);
         log.info(`[YTJS] ✅ ${vid} resolved via Webshare proxy (youtubei.js)`);
         return meta;
       }
+      PROXIED_INNERTUBE_POOL.delete(proxy.url);
+      websharePool.markBad(proxy.id);
     } catch (e) {
       log.warning(`[YTJS] proxied innertube attempt failed: ${String(e)}`);
+      PROXIED_INNERTUBE_POOL.delete(proxy.url);
+      websharePool.markBad(proxy.id);
     }
-    if (Date.now() >= deadline) break;
+    return null;
+  };
 
-    // Stage B — yt-dlp subprocess through the proxy.
-    let stderr = '';
-    const budgetS = Math.max(5, Math.min(PROXY_STAGE_B_TIMEOUT_S, Math.ceil((deadline - Date.now()) / 1000)));
-    const url = await resolveViaProxy(vid, kind, proxy.url, budgetS, (s) => {
-      stderr += s;
-    });
-    if (url) {
-      websharePool.markOk(proxy.id);
-      log.info(`[YTJS] ✅ ${vid} resolved via Webshare proxy (yt-dlp)`);
-      return kind === 'audio' ? { urls: [null, url], proxyUrl: proxy.url } : { urls: [url, null], proxyUrl: proxy.url };
+  while (Date.now() + 2_000 < deadline) {
+    let candidates: WebshareProxy[] = [];
+    if (geo?.allowed?.length) {
+      candidates = websharePool.getGeoCandidates({ allowed: geo.allowed }, PROXY_CANDIDATES, isProxiedInnertubeWarm);
+      if (!candidates.length) {
+        const p = await websharePool.getProxyForCountries(geo.allowed).catch(() => null);
+        if (p) candidates.push(p);
+      }
+    } else if (geo?.blocked?.length) {
+      candidates = websharePool.getGeoCandidates({ blocked: geo.blocked }, PROXY_CANDIDATES, isProxiedInnertubeWarm);
     }
-    // HTTP 407 no_proxies_allocated — Webshare auto-replaced this proxy and
-    // our cached address is dead. Evict now and re-fetch the list.
-    if (/407|no_proxies_allocated/i.test(stderr)) {
-      websharePool.evictByUrl(proxy.url);
+    if (!candidates.length) {
+      candidates = websharePool.getWarmCandidates(PROXY_CANDIDATES, isProxiedInnertubeWarm);
     }
-    websharePool.markBad(proxy.id);
+
+    let untried = candidates.filter((p) => !tried.has(p.id));
+    if (!untried.length) {
+      const all = websharePool.getAllCandidates().filter((p) => !tried.has(p.id));
+      if (!all.length) break;
+      untried = all.slice(0, PROXY_CANDIDATES);
+    }
+    for (const p of untried) tried.add(p.id);
+
+    const warm = untried.filter((c) => isProxiedInnertubeWarm(c.url));
+    const cold = untried.filter((c) => !isProxiedInnertubeWarm(c.url));
+    for (const group of [warm, cold]) {
+      if (!group.length || Date.now() >= deadline) continue;
+      const meta = await raceUsable(group.map((p) => attempt(p)));
+      if (meta) return meta;
+    }
   }
+
   return null;
 }
 
@@ -441,7 +539,7 @@ async function attemptResolve(vid: string): Promise<ResolveAttempt> {
     return { urls: [null, null], lastError: `Innertube init failed: ${String(e)}` };
   }
 
-  const clients = ['TV_SIMPLY', 'MWEB', 'IOS', 'WEB', 'ANDROID'] as const;
+  const clients = ['ANDROID', 'TV_SIMPLY', 'IOS', 'MWEB', 'WEB'] as const;
   let lastError = 'No stream formats returned';
   let geoBlocked = false;
   let microCountries: string[] = [];

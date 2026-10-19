@@ -47,7 +47,14 @@ export interface ProxyUpstream {
   /** Instrumented body stream, or null when the response is a JSON error. */
   body: Readable | null;
   /** Present for proxy-generated errors (502, connect failure). */
-  error?: { error: string; message?: string; /** The Webshare proxy refused the dial (e.g. 407 replaced proxy). */ proxyRefused?: boolean };
+  error?: {
+    error: string;
+    message?: string;
+    /** The Webshare proxy refused the dial (e.g. 407 replaced proxy). */
+    proxyRefused?: boolean;
+    /** The pinned exit is dead/slow (refusal or connect stall) — safe to re-extract through a fresh one. */
+    retriable?: boolean;
+  };
 }
 
 export interface ProxyOptions {
@@ -196,7 +203,22 @@ function tunnelAgentFor(proxy: ParsedProxy): https.Agent {
   return agent;
 }
 
-export function proxyStream(targetUrl: string, opts: ProxyOptions = {}): Promise<ProxyUpstream> {
+const MAX_REDIRECTS = 5;
+
+export function proxyStream(
+  targetUrl: string,
+  opts: ProxyOptions = {},
+  redirectCount = 0,
+): Promise<ProxyUpstream> {
+  if (redirectCount > MAX_REDIRECTS) {
+    return Promise.resolve({
+      status: 502,
+      headers: { 'content-type': 'application/json' },
+      body: null,
+      error: { error: 'Bad Gateway', message: 'Too many redirects from stream source' },
+    });
+  }
+
   const startedMs = opts.startedMs ?? Date.now();
 
   let parsed: URL;
@@ -223,11 +245,16 @@ export function proxyStream(targetUrl: string, opts: ProxyOptions = {}): Promise
         error: { error: 'Bad Gateway', message: 'Upstream host is not a permitted public address' },
       } as ProxyUpstream;
     }
-    return dialStream(parsed, opts, startedMs);
+    return dialStream(parsed, opts, startedMs, redirectCount);
   });
 }
 
-function dialStream(parsed: URL, opts: ProxyOptions, startedMs: number): Promise<ProxyUpstream> {
+function dialStream(
+  parsed: URL,
+  opts: ProxyOptions,
+  startedMs: number,
+  redirectCount = 0,
+): Promise<ProxyUpstream> {
   return new Promise<ProxyUpstream>((resolve) => {
     const proxy = opts.proxyUrl ? parseProxy(opts.proxyUrl) : null;
     if (opts.proxyUrl && !proxy) {
@@ -277,6 +304,28 @@ function dialStream(parsed: URL, opts: ProxyOptions, startedMs: number): Promise
       metrics.recordUpstreamConnect((Date.now() - connectStarted) / 1000);
 
       const status = upstream.statusCode ?? 502;
+
+      // Handle HTTP redirects (301, 302, 303, 307, 308).
+      // Googlevideo frequently issues 302 redirects to specific edge CDN clusters (rr*.googlevideo.com).
+      // node:http does not follow them automatically, so we must follow them here.
+      if ([301, 302, 303, 307, 308].includes(status) && upstream.headers.location) {
+        log.info(`[STREAM_PROXY] Upstream ${status} redirect to: ${upstream.headers.location.slice(0, 100)}`);
+        upstream.resume(); // drain
+        upstream.destroy();
+        try {
+          const nextUrl = new URL(upstream.headers.location, parsed).href;
+          resolve(proxyStream(nextUrl, opts, redirectCount + 1));
+        } catch (e) {
+          resolve({
+            status: 502,
+            headers: { 'content-type': 'application/json' },
+            body: null,
+            error: { error: 'Bad Gateway', message: `Invalid redirect location: ${String(e)}` },
+          });
+        }
+        return;
+      }
+
       if (status >= 400) {
         metrics.recordStreamError(status);
         log.error(`[STREAM_PROXY] upstream ${status} (expired or IP-locked URL)`);
@@ -341,8 +390,15 @@ function dialStream(parsed: URL, opts: ProxyOptions, startedMs: number): Promise
       metrics.recordUpstreamConnect((Date.now() - connectStarted) / 1000);
       metrics.recordStreamError('connect');
       log.error(`[STREAM_PROXY] Upstream connection error: ${String(e)}`);
-      const refused = isHttps && Boolean(proxy) && /no longer allocated|HTTP 407/i.test(String(e));
-      if (refused && opts.proxyUrl) {
+      const msg = String(e);
+      const refused = isHttps && Boolean(proxy) && /no longer allocated|HTTP 407/i.test(msg);
+      // A connect/tunnel timeout or reset through a pinned exit means the exit
+      // is dead or too slow, not that the URL is gone: evict it so the caller
+      // can re-extract through a fresh exit, same recovery as a 407 refusal.
+      const proxyStalled =
+        Boolean(proxy) &&
+        /connect timeout|tunnel: |ECONNRESET|ETIMEDOUT|EHOSTUNREACH|socket hang up/i.test(msg);
+      if ((refused || proxyStalled) && opts.proxyUrl) {
         void websharePool.evictByUrl(opts.proxyUrl);
       }
       resolve({
@@ -351,8 +407,9 @@ function dialStream(parsed: URL, opts: ProxyOptions, startedMs: number): Promise
         body: null,
         error: {
           error: 'Bad Gateway',
-          message: `Failed to connect to stream source: ${String(e)}`,
+          message: `Failed to connect to stream source: ${msg}`,
           ...(refused ? { proxyRefused: true } : {}),
+          ...(refused || proxyStalled ? { retriable: true } : {}),
         },
       });
     });

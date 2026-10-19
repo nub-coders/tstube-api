@@ -1,5 +1,5 @@
 /**
- * Reject unsupported target URLs before they reach a yt-dlp subprocess (SSRF guard)
+ * Reject unsupported target URLs (SSRF guard)
  * — port of utils/url_validation.py.
  *
  * Supports YouTube, Apple Music, Amazon Music, SoundCloud, JioSaavn, and Spotify hosts,

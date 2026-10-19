@@ -112,7 +112,7 @@ export function processVideo(
   }
 }
 
-/** Seconds -> h:mm:ss / m:ss (used by the yt-dlp metadata fallback). */
+/** Seconds -> h:mm:ss / m:ss. */
 export function formatSeconds(seconds: number): string {
   const h = Math.floor(seconds / 3600);
   const m = Math.floor((seconds % 3600) / 60);

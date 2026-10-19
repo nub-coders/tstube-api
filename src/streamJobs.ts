@@ -47,6 +47,7 @@ export interface StreamJob {
    * pre-capability replica; ensureStreamJob backfills those on first touch.
    */
   secret?: string;
+  failed?: boolean;
 }
 
 const JOB_MEMO = new BoundedCache<StreamJob>(2048, JOB_MEMO_TTL);
@@ -193,10 +194,32 @@ function startBackgroundExtraction(
 ): void {
   void (async () => {
     try {
-      const extracted =
+      let extracted =
         mode === 'video' ? await getVideoStream(url) : await getStream(url);
+      if (!extracted?.url && mode === 'video') {
+        log.warning(`[STREAM_RESOLVER] Muxed stream extraction returned null for ${streamId}, falling back to audio stream`);
+        extracted = await getStream(url);
+      }
+      if (!extracted?.url) {
+        log.warning(`[STREAM_RESOLVER] Retrying stream extraction for ${streamId}`);
+        await new Promise((r) => setTimeout(r, 1000));
+        extracted = mode === 'video' ? await getVideoStream(url) : await getStream(url);
+        if (!extracted?.url && mode === 'video') {
+          extracted = await getStream(url);
+        }
+      }
       if (!extracted?.url) {
         log.error(`[STREAM_RESOLVER] Failed to extract ${mode} for ${streamId}`);
+        const failedJob: StreamJob = {
+          url,
+          mode,
+          extracted_url: null,
+          extracted_time: Date.now() / 1000,
+          secret,
+          failed: true,
+        };
+        jobPublishLocal(streamId, failedJob);
+        await jobSet(streamId, failedJob, true);
         return;
       }
       const job: StreamJob = {
@@ -216,6 +239,16 @@ function startBackgroundExtraction(
       }
     } catch (e) {
       log.error(`[STREAM_RESOLVER] Failed to extract ${mode}: ${String(e)}`);
+      const failedJob: StreamJob = {
+        url,
+        mode,
+        extracted_url: null,
+        extracted_time: Date.now() / 1000,
+        secret,
+        failed: true,
+      };
+      jobPublishLocal(streamId, failedJob);
+      await jobSet(streamId, failedJob, true);
     }
   })();
 }
@@ -225,7 +258,7 @@ function startBackgroundExtraction(
  * running. Mirrors main._ensure_stream_job.
  */
 export async function ensureStreamJob(url: string, mode: string): Promise<string> {
-  validateYoutubeTarget(url); // SSRF guard: only YouTube targets reach yt-dlp
+  validateYoutubeTarget(url); // SSRF guard: only valid YouTube targets reach resolver
   const resolvedMode = resolveMode(mode);
   const streamId = encodeStreamId(url, resolvedMode);
   let secret = newStreamSecret();
@@ -263,20 +296,24 @@ export async function ensureStreamJob(url: string, mode: string): Promise<string
       secret = newStreamSecret();
       await jobSet(streamId, { ...job, secret }, true);
     }
-    if (job.extracted_url === null) {
+    if (job.extracted_url === null && !job.failed) {
+      startBackgroundExtraction(streamId, url, resolvedMode, secret);
+    } else if (job.failed) {
+      job.failed = false;
+      await jobSet(streamId, job, true);
       startBackgroundExtraction(streamId, url, resolvedMode, secret);
     }
   }
   return streamCapability(streamId, secret);
 }
 
-/** Wait (up to `timeout` seconds) for a job with extracted_url, or null if gone. */
+/** Wait (up to `timeout` seconds) for a job with extracted_url or failure, or null if gone. */
 export async function awaitExtracted(
   streamId: string,
   timeout = AWAIT_TIMEOUT_S,
 ): Promise<StreamJob | null> {
   let job = await jobGet(streamId);
-  if (job === null || job.extracted_url) return job;
+  if (job === null || job.extracted_url || job.failed) return job;
 
   const event = jobEvent(streamId);
   const deadline = Date.now() + timeout * 1000;
@@ -285,7 +322,7 @@ export async function awaitExtracted(
     if (remaining <= 0) break;
     await event.wait(Math.min(CROSS_REPLICA_POLL_S, remaining / 1000) * 1000);
     job = await jobGet(streamId);
-    if (job === null || job.extracted_url) break;
+    if (job === null || job.extracted_url || job.failed) break;
   }
   return job;
 }

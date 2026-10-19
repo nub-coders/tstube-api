@@ -12,8 +12,7 @@ name: tstube-api
 x-app: &app
   image: tstube-api:latest
   restart: always
-  # PID 1 reaping: the service shells out to yt-dlp, and init also forwards
-  # SIGTERM to the Node signal handler that drains in-flight streams.
+  # PID 1 init forwards SIGTERM to the Node signal handler that drains in-flight streams.
   init: true
   env_file: .env
   # Redis comes from .env — a managed Redis hostname resolves fine from inside a

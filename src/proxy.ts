@@ -164,6 +164,7 @@ export function parseProxyList(
 export class WebsharePool {
   private candidates: WebshareProxy[] = [];
   private rrIndex = 0;
+  private warmIndex = 0;
   private failures = new Map<string, number>();
   private countryFetches = new Map<string, { at: number; proxy: WebshareProxy | null; inflight?: Promise<WebshareProxy | null> }>();
   private timer: NodeJS.Timeout | null = null;
@@ -306,6 +307,7 @@ export class WebsharePool {
   getGeoCandidates(
     codes: { allowed?: string[]; blocked?: string[] },
     limit = 3,
+    isWarm?: (url: string) => boolean,
   ): WebshareProxy[] {
     const out: WebshareProxy[] = [];
     const push = (p: WebshareProxy): void => {
@@ -320,9 +322,12 @@ export class WebsharePool {
         if (out.length >= limit) break;
         const matches = this.candidates.filter((p) => p.countryCode === code);
         if (!matches.length) continue;
+        const sorted = isWarm
+          ? [...matches].sort((a, b) => (isWarm(b.url) ? 1 : 0) - (isWarm(a.url) ? 1 : 0))
+          : matches;
         // Rotate within the country so repeated jobs lead with different exits.
-        const start = this.rrIndex % matches.length;
-        for (const p of [...matches.slice(start), ...matches.slice(0, start)]) {
+        const start = isWarm ? 0 : this.rrIndex % sorted.length;
+        for (const p of [...sorted.slice(start), ...sorted.slice(0, start)]) {
           push(p);
           if (out.length >= limit) break;
         }
@@ -334,14 +339,61 @@ export class WebsharePool {
     if (codes.blocked?.length) {
       const blocked = new Set(codes.blocked.map((c) => c.trim().toUpperCase()));
       const matches = this.candidates.filter((p) => !blocked.has(p.countryCode));
-      const start = matches.length ? this.rrIndex % matches.length : 0;
-      for (const p of [...matches.slice(start), ...matches.slice(0, start)]) {
+      const sorted = isWarm
+        ? [...matches].sort((a, b) => (isWarm(b.url) ? 1 : 0) - (isWarm(a.url) ? 1 : 0))
+        : matches;
+      const start = isWarm ? 0 : (sorted.length ? this.rrIndex % sorted.length : 0);
+      for (const p of [...sorted.slice(start), ...sorted.slice(0, start)]) {
         push(p);
         if (out.length >= limit) break;
       }
       if (matches.length) this.rrIndex = (this.rrIndex + 1) % Math.max(1, this.candidates.length);
     }
     return out;
+  }
+
+  /**
+   * Return candidate proxies, prioritizing warm ones (if predicate matches).
+   * Falls back to round-robin.
+   */
+  getWarmCandidates(
+    limit = 3,
+    isWarm?: (url: string) => boolean,
+  ): WebshareProxy[] {
+    const out: WebshareProxy[] = [];
+    const push = (p: WebshareProxy): void => {
+      if (out.length < limit && !out.some((q) => q.id === p.id)) out.push(p);
+    };
+
+    if (isWarm && this.candidates.length > 0) {
+      const warmList = this.candidates.filter((p) => isWarm(p.url));
+      if (warmList.length > 0) {
+        const start = this.warmIndex % warmList.length;
+        for (let i = 0; i < warmList.length && out.length < limit; i++) {
+          push(warmList[(start + i) % warmList.length]!);
+        }
+        this.warmIndex = (this.warmIndex + Math.min(limit, warmList.length)) % warmList.length;
+      }
+    }
+
+    if (this.candidates.length > 0 && out.length < limit) {
+      const start = this.rrIndex % this.candidates.length;
+      for (let i = 0; i < this.candidates.length && out.length < limit; i++) {
+        const p = this.candidates[(start + i) % this.candidates.length]!;
+        push(p);
+      }
+      this.rrIndex = (this.rrIndex + limit) % this.candidates.length;
+    }
+
+    return out;
+  }
+
+  getSomeProxies(count = 3): WebshareProxy[] {
+    return this.candidates.slice(0, count);
+  }
+
+  getAllCandidates(): WebshareProxy[] {
+    return [...this.candidates];
   }
 
   /**

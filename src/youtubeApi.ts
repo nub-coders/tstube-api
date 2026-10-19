@@ -1,8 +1,8 @@
 /**
  * Optional official YouTube Data API path — port of utils/youtube_api.py.
  *
- * When no API keys are configured, GetVideoById() uses the Innertube fast path
- * and falls back to `yt-dlp -j`, so the endpoint works without any Google key.
+ * When no API keys are configured, GetVideoById() uses the Innertube fast path,
+ * so the endpoint works without any Google key.
  */
 import { config } from './config.js';
 import { nextUtcMidnightEpoch } from './quota.js';

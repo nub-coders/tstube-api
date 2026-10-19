@@ -89,7 +89,9 @@ function errorBody(e: unknown, start: number): Record<string, unknown> {
 function failureResult(e: unknown, start: number): Result {
   if (e instanceof HttpError) return json(e.status, e.payload);
   if (e instanceof ValueError) return json(400, errorBody(e, start));
-  log.error(`[ROUTES] internal failure: ${String(e)}`);
+  const cause = (e as any)?.cause ? ` cause: ${String((e as any).cause)}` : '';
+  const stack = e instanceof Error && e.stack ? `\n${e.stack}` : '';
+  log.error(`[ROUTES] internal failure: ${String(e)}${cause}${stack}`);
   return json(500, { error: 'Internal Server Error', time_taken: timeTaken(start) });
 }
 
@@ -153,10 +155,38 @@ export async function searchSongs(ctx: Ctx): Promise<Result> {
         time_taken: timeTaken(start),
       });
     }
-    const data = await scrapeSearch(q, limit);
+    let data = await scrapeSearch(q, limit);
+    if (!data.main_results.length) {
+      try {
+        let apiResults = await apiSearch(q, limit);
+        if (!apiResults.length) {
+          const relaxed = q.replace(/^[a-zA-Z0-9]+-\d+\s+/, '').trim();
+          if (relaxed && relaxed !== q) {
+            apiResults = await apiSearch(relaxed, limit);
+          }
+        }
+        if (apiResults.length) {
+          data = {
+            main_results: apiResults.map((r) => ({
+              title: r.title,
+              video_id: r.video_id,
+              url: r.url,
+              time: r.duration ?? '0:00',
+              duration: r.duration ?? '0:00',
+              channel: r.channel_name,
+              views: r.views ?? '0',
+              thumbnail: r.thumbnail,
+            })),
+            suggested: [],
+          };
+        }
+      } catch {
+        /* fallback best effort */
+      }
+    }
     return json(200, {
       query: q,
-      method: 'scrape',
+      method: data.suggested.length ? 'scrape' : 'youtube_data_api',
       results: data.main_results,
       suggested: data.suggested,
       total_results: data.main_results.length,
@@ -265,12 +295,13 @@ export async function streamResolver(ctx: Ctx): Promise<Result> {
 
   let upstream = await proxyFor(ctx, job.extracted_url, started, job.proxy_url ?? null);
   if (upstream.status === 502 && upstream.error) {
-    // A refused dial (HTTP 407 — Webshare replaced the proxy) is recoverable:
-    // the pool already evicted the dead exit, so re-extract through a fresh
-    // one and retry once, exactly like the revoked-URL path.
-    const proxyRefused = Boolean((upstream.error as { proxyRefused?: boolean }).proxyRefused);
-    if (proxyRefused && job.proxy_url) {
-      log.info(`[STREAM_PROXY] Proxy refused dial for ${streamId} — refreshing via a new exit...`);
+    // A refused or stalled dial through a pinned exit (HTTP 407 replacement, or
+    // connect/tunnel timeout) is recoverable: the pool already evicted the dead
+    // exit, so re-extract through a fresh one and retry once, exactly like the
+    // revoked-URL path.
+    const retriable = Boolean((upstream.error as { retriable?: boolean }).retriable);
+    if (retriable && job.proxy_url) {
+      log.info(`[STREAM_PROXY] Dial failed for ${streamId} — refreshing via a new exit...`);
       const refreshed = await refreshStreamUrl(streamId, job);
       const newUrl = refreshed?.extracted_url;
       if (newUrl && newUrl !== job.extracted_url) {
