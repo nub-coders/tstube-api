@@ -80,6 +80,22 @@ describe('TelegramApi rich payloads', () => {
     await new TelegramApi('123:ABC').getMe();
     expect(seen).toBe('https://api.telegram.org/bot123:ABC/getMe');
   });
+
+  it('retries transient network fetch errors before throwing', async () => {
+    let attempt = 0;
+    globalThis.fetch = (async () => {
+      attempt += 1;
+      if (attempt < 2) {
+        throw new TypeError('fetch failed');
+      }
+      return { status: 200, json: async () => ({ ok: true, result: { message_id: 99 } }) } as unknown as Response;
+    }) as typeof fetch;
+
+    const api = new TelegramApi('TOKEN');
+    const res = await api.call<{ message_id: number }>('sendMessage', { text: 'hi' });
+    expect(attempt).toBe(2);
+    expect(res.message_id).toBe(99);
+  });
 });
 
 describe('sendSmartRichMessage fallbacks', () => {

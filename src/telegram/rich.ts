@@ -140,6 +140,18 @@ export async function sendSmartRichMessage(
   return await sendRichOrPlain(api, chatId, richHtml, replyMarkup);
 }
 
+function formatError(e: unknown): string {
+  if (e instanceof Error) {
+    const cause = (e as { cause?: unknown }).cause;
+    if (cause) {
+      const causeStr = cause instanceof Error ? cause.message : String(cause);
+      return `${e.name}: ${e.message} (cause: ${causeStr})`;
+    }
+    return `${e.name}: ${e.message}`;
+  }
+  return String(e);
+}
+
 /** Rich send, degrading to a classic message when rich messages are unsupported. */
 async function sendRichOrPlain(
   api: TelegramApi,
@@ -156,7 +168,7 @@ async function sendRichOrPlain(
         reply_markup: replyMarkup,
       });
     } catch (e) {
-      log.warning('[RICH] send failed, using classic fallback', { err: String(e) });
+      log.warning('[RICH] send failed, using classic fallback', { err: formatError(e) });
     }
   }
   try {
@@ -166,7 +178,7 @@ async function sendRichOrPlain(
       reply_markup: replyMarkup,
     });
   } catch (e) {
-    log.error('[SEND] classic fallback failed', { err: String(e) });
+    log.error('[SEND] classic fallback failed', { err: formatError(e) });
     return null;
   }
 }
@@ -190,7 +202,7 @@ export async function editSmartRichMessage(
       });
       return true;
     } catch (e) {
-      log.warning('[RICH] edit failed, using classic fallback', { err: String(e) });
+      log.warning('[RICH] edit failed, using classic fallback', { err: formatError(e) });
     }
   }
   try {
@@ -202,7 +214,7 @@ export async function editSmartRichMessage(
     });
     return true;
   } catch (e) {
-    log.error('[EDIT] classic fallback failed', { err: String(e) });
+    log.error('[EDIT] classic fallback failed', { err: formatError(e) });
     return false;
   }
 }

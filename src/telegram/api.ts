@@ -123,25 +123,40 @@ export class TelegramApi {
     }
   }
 
-  async call<T = unknown>(method: string, payload?: Json, timeoutMs = 35_000): Promise<T> {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const res = await fetch(`${this.baseUrl}/${method}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload ?? {}),
-        signal: controller.signal,
-      });
-      const body = (await res.json().catch(() => null)) as
-        | { ok: boolean; result?: T; error_code?: number; description?: string }
-        | null;
-      if (!body?.ok) {
-        throw new BotApiError(body?.error_code ?? res.status, body?.description ?? `HTTP ${res.status}`);
+  async call<T = unknown>(
+    method: string,
+    payload?: Json,
+    timeoutMs = 35_000,
+    maxRetries = 2,
+  ): Promise<T> {
+    let attempt = 0;
+    while (true) {
+      attempt += 1;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const res = await fetch(`${this.baseUrl}/${method}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload ?? {}),
+          signal: controller.signal,
+        });
+        const body = (await res.json().catch(() => null)) as
+          | { ok: boolean; result?: T; error_code?: number; description?: string }
+          | null;
+        if (!body?.ok) {
+          throw new BotApiError(body?.error_code ?? res.status, body?.description ?? `HTTP ${res.status}`);
+        }
+        return body.result as T;
+      } catch (e) {
+        if (e instanceof BotApiError || attempt > maxRetries || method === 'getUpdates') {
+          throw e;
+        }
+        const delay = attempt * 300;
+        await new Promise((r) => setTimeout(r, delay));
+      } finally {
+        clearTimeout(timer);
       }
-      return body.result as T;
-    } finally {
-      clearTimeout(timer);
     }
   }
 
