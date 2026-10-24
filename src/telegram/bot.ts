@@ -14,6 +14,7 @@ import {
   cmdErrors,
   cmdGrant,
   cmdListUsers,
+  cmdProxyStats,
   cmdRevokeAdmin,
   cmdStats,
   cmdUser,
@@ -29,7 +30,18 @@ const USER_RE = /^\/user\s+\d+/;
 const GRANT_RE = /^\/grant\s+\d+\s+\d+/;
 const REVOKE_ID_RE = /^\/revoke\s+\d+/;
 
-const PRIVATE_ONLY = new Set(['stats', 'user', 'grant', 'revoke', 'listusers', 'adminhelp', 'errors', 'broadcast']);
+const PRIVATE_ONLY = new Set([
+  'stats',
+  'proxystats',
+  'webshare',
+  'user',
+  'grant',
+  'revoke',
+  'listusers',
+  'adminhelp',
+  'errors',
+  'broadcast',
+]);
 
 export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise<void> {
   if (!msg.from || msg.from.is_bot) return;
@@ -61,6 +73,9 @@ export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise
       return cmdToken(api, msg);
     case 'stats':
       return cmdStats(api, msg);
+    case 'proxystats':
+    case 'webshare':
+      return cmdProxyStats(api, msg);
     case 'user':
       return cmdUser(api, msg);
     case 'grant':

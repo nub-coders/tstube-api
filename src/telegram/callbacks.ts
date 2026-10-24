@@ -17,10 +17,11 @@ import {
   viewTokenGroup,
   type Card,
 } from './callbackContent.js';
-import { buildStats, ACCESS_DENIED } from './adminContent.js';
+import { buildStats, ACCESS_DENIED, webshareStatsCard } from './adminContent.js';
 import { generateToken, getUserRequestCount, getUserToken, revokeUserToken, setUserToken } from '../tools.js';
 import { isAdmin, config } from '../config.js';
 import { getLogger } from '../logger.js';
+import { websharePool } from '../proxy.js';
 
 const log = getLogger('ytube_api.bot');
 
@@ -118,8 +119,9 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
       const requestCount = await getUserRequestCount(userId);
       const admin = isAdmin(userId);
       const limit = admin ? config().ADMIN_LIMIT : config().DAILY_LIMIT;
+      const proxyHealth = await websharePool.getPublicHealth();
       await answer(api, cb);
-      await editCard(api, cb, usageCallback(token, requestCount, limit, admin, isGrp));
+      await editCard(api, cb, usageCallback(token, requestCount, limit, admin, isGrp, proxyHealth));
       break;
     }
 
@@ -205,6 +207,7 @@ export async function handleCallback(api: TelegramApi, cb: CallbackQuery): Promi
         const statsHtml = await buildStats(api, undefined, true);
         const kbd = keyboard([
           [btn('🔄 Refresh Stats', { callback_data: 'admin_refresh_stats', style: ButtonStyle.PRIMARY })],
+          [btn('🌐 Proxy Stats', { callback_data: 'admin_refresh_proxystats' })],
           [btn('📱 Back to Menu', { callback_data: 'back_menu' })],
         ]);
         await editCard(api, cb, {
@@ -221,7 +224,31 @@ ${statsHtml}
       break;
     }
 
-
+    case 'admin_refresh_proxystats': {
+      if (!isAdmin(userId)) {
+        await answer(api, cb, '❌ Admin only.', true);
+        return;
+      }
+      await answer(api, cb, '🔄 Refreshing proxy stats...');
+      try {
+        const stats = await websharePool.getBandwidthStats(true);
+        const cardHtml = webshareStatsCard(stats, websharePool.size, websharePool.summary());
+        const kbd = keyboard([
+          [btn('🔄 Refresh Proxy Stats', { callback_data: 'admin_refresh_proxystats', style: ButtonStyle.PRIMARY })],
+          [btn('⚙️ Admin Panel', { callback_data: 'admin_panel' })],
+          [btn('📱 Back to Menu', { callback_data: 'back_menu' })],
+        ]);
+        await editCard(api, cb, {
+          html: cardHtml,
+          keyboard: kbd,
+        });
+      } catch (e) {
+        await editCard(api, cb, {
+          html: `<blockquote>❌ <b>Refresh failed:</b> ${String(e)}</blockquote>`,
+        });
+      }
+      break;
+    }
 
     case 'admin_panel': {
       if (!isAdmin(userId)) {
@@ -236,6 +263,7 @@ ${statsHtml}
 <p>Select an action below:</p>`,
         keyboard: keyboard([
           [btn('🔄 Refresh Stats', { callback_data: 'admin_refresh_stats', style: ButtonStyle.PRIMARY })],
+          [btn('🌐 Proxy Stats', { callback_data: 'admin_refresh_proxystats' })],
           [btn('📱 Back to Menu', { callback_data: 'back_menu' })],
         ]),
       };

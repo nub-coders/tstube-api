@@ -11,6 +11,7 @@ import { isAdmin, config } from '../config.js';
 import { getRecentErrors, type ErrorLogEntry } from '../tools.js';
 import { comma, pyRoundStr } from '../pyTime.js';
 import { getReadableUptime, apiUrl } from './content.js';
+import { websharePool, type WebshareBandwidthStats } from '../proxy.js';
 
 export const ADMIN_BOT_START_TIME = Date.now();
 
@@ -102,6 +103,11 @@ export async function buildStats(
   };
 
   await progress('Connecting to Redis cache database...');
+
+  // Kick off Webshare bandwidth query concurrently with Redis keyscan
+  const wsStatsTask = websharePool.enabled
+    ? websharePool.getBandwidthStats(forceRefresh).catch(() => null)
+    : Promise.resolve(null);
 
   // Scan user tokens and active sessions concurrently
   const [userKeys, requestKeys] = await Promise.all([
@@ -283,6 +289,42 @@ export async function buildStats(
   const cmdCountStr =
     typeof totalCommands === 'number' ? comma(totalCommands) : String(totalCommands);
 
+  const wsStats = await wsStatsTask;
+  let webshareSection = '';
+  if (websharePool.enabled) {
+    const poolSize = websharePool.size;
+    const poolSummary = websharePool.summary();
+    const poolStatus = poolSize > 0
+      ? `🟢 <b>Operational</b> (${poolSize} exits${poolSummary ? ` · ${escapeHtml(poolSummary)}` : ''})`
+      : '🟠 <b>Empty / Initializing</b>';
+    const usedStr = wsStats ? wsStats.usedFormatted : 'Loading...';
+    const leftStr = wsStats ? wsStats.remainingFormatted : 'Loading...';
+    const quotaStr = wsStats ? wsStats.limitFormatted : 'Loading...';
+    const reqStr = wsStats && wsStats.totalRequests > 0
+      ? `${comma(wsStats.totalRequests)} (${pyRoundStr((wsStats.successfulRequests / wsStats.totalRequests) * 100, 1)}% success)`
+      : (wsStats ? '0 requests' : '—');
+
+    webshareSection = `
+<h2>Webshare Proxy Pool &amp; Bandwidth</h2>
+<table border="1">
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td><b>Tier Status</b></td><td>${poolStatus}</td></tr>
+  <tr><td><b>Bandwidth Used</b></td><td><b>${usedStr}</b></td></tr>
+  <tr><td><b>Bandwidth Left</b></td><td><b>${leftStr}</b></td></tr>
+  <tr><td><b>Monthly Quota</b></td><td>${quotaStr}</td></tr>
+  <tr><td><b>Proxy Requests</b></td><td>${reqStr}</td></tr>
+</table>
+`;
+  } else {
+    webshareSection = `
+<h2>Webshare Proxy Pool &amp; Bandwidth</h2>
+<table border="1">
+  <tr><th>Configuration</th><th>Status</th></tr>
+  <tr><td><b>Proxy Tier</b></td><td>⚪ Disabled (<code>WEBSHARE_API_KEY</code> unset)</td></tr>
+</table>
+`;
+  }
+
   const ts = now.toISOString().slice(0, 19).replace('T', ' ');
 
   const fullHtml = `<h1>Bot Statistics Dashboard</h1>
@@ -337,7 +379,7 @@ export async function buildStats(
   <tr><td><b>Hit Rate</b></td><td>${hitRate}% (${comma(hits)} hits / ${comma(misses)} misses)</td></tr>
   <tr><td><b>Total Keys</b></td><td>${comma(totalKeys)}</td></tr>
 </table>
-
+${webshareSection}
 <h2>System Health &amp; Rate Limits</h2>
 <table border="1">
   <tr><th>Configuration</th><th>Value</th></tr>
@@ -450,6 +492,64 @@ export function listUsersCard(rows: string): string {
 </table>`;
 }
 
+export function webshareStatsCard(
+  stats: WebshareBandwidthStats,
+  poolSize: number,
+  poolSummary?: string,
+): string {
+  if (!stats.enabled) {
+    return `<h1>🌐 Webshare Proxy Statistics</h1>
+<blockquote>Fallback datacenter proxy tier for geo-blocked videos.</blockquote>
+
+<table border="1">
+  <tr><th>Configuration</th><th>Status</th></tr>
+  <tr><td><b>Proxy Tier</b></td><td>⚪ Disabled (<code>WEBSHARE_API_KEY</code> unset)</td></tr>
+</table>`;
+  }
+
+  const poolStatus = poolSize > 0
+    ? `🟢 <b>Operational</b> (${poolSize} exits${poolSummary ? ` · ${escapeHtml(poolSummary)}` : ''})`
+    : '🟠 <b>Empty / Initializing</b>';
+
+  const usedStr = stats.usedFormatted;
+  const leftStr = stats.remainingFormatted;
+  const quotaStr = stats.limitFormatted;
+  const planInfo = stats.activePlan
+    ? `${stats.activePlan.proxyType} (${stats.activePlan.proxyCount} proxies)`
+    : 'Standard';
+
+  const reqSuccessRate = stats.totalRequests > 0
+    ? pyRoundStr((stats.successfulRequests / stats.totalRequests) * 100, 1) + '%'
+    : 'N/A';
+
+  const topCountries = Object.entries(stats.countriesUsed)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([cc, count]) => `${cc} (${comma(count)})`)
+    .join(', ');
+
+  return `<h1>🌐 Webshare Proxy Statistics</h1>
+<blockquote>Real-time bandwidth usage, remaining quota, and pool health.</blockquote>
+
+<h2>Bandwidth Usage</h2>
+<table border="1">
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td><b>Bandwidth Used</b></td><td><b>${usedStr}</b> (${comma(stats.usedBytes)} bytes)</td></tr>
+  <tr><td><b>Bandwidth Left</b></td><td><b>${leftStr}</b></td></tr>
+  <tr><td><b>Monthly Quota</b></td><td>${quotaStr}</td></tr>
+  <tr><td><b>Active Plan</b></td><td>${escapeHtml(planInfo)}</td></tr>
+</table>
+
+<h2>Proxy Health &amp; Activity</h2>
+<table border="1">
+  <tr><th>Metric</th><th>Value</th></tr>
+  <tr><td><b>Tier Status</b></td><td>${poolStatus}</td></tr>
+  <tr><td><b>Total Requests</b></td><td>${comma(stats.totalRequests)}</td></tr>
+  <tr><td><b>Success Rate</b></td><td><b>${reqSuccessRate}</b> (${comma(stats.successfulRequests)} ok / ${comma(stats.failedRequests)} fail)</td></tr>
+  ${topCountries ? `<tr><td><b>Top Countries</b></td><td>${escapeHtml(topCountries)}</td></tr>` : ''}
+</table>`;
+}
+
 export function adminHelpCard(): string {
   return `<h1>Admin Control Panel</h1>
 <blockquote>Administrative commands for maintenance, telemetry, and quota control.</blockquote>
@@ -458,6 +558,7 @@ export function adminHelpCard(): string {
 <table border="1">
   <tr><th>Command</th><th>Purpose</th></tr>
   <tr><td><code>/stats</code></td><td>View interactive bot and server statistics</td></tr>
+  <tr><td><code>/proxystats</code></td><td>View Webshare proxy pool &amp; bandwidth usage</td></tr>
   <tr><td><code>/errors [n]</code></td><td>View recent API error logs (default 15)</td></tr>
   <tr><td><code>/user &lt;id&gt;</code></td><td>Query user quota, token, and error counts</td></tr>
   <tr><td><code>/grant &lt;id&gt; &lt;qty&gt;</code></td><td>Credit extra requests to a user</td></tr>

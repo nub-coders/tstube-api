@@ -20,6 +20,7 @@ import {
 import { help, platformsCard, revokeConfirm } from './callbackContent.js';
 import { config, isAdmin } from '../config.js';
 import { generateToken, getUserToken, setUserToken, getUserRequestCount } from '../tools.js';
+import { websharePool } from '../proxy.js';
 
 export function isGroupChat(chat: { type: string } | undefined): boolean {
   return !!chat && chat.type !== 'private';
@@ -97,8 +98,10 @@ export async function cmdStatus(api: TelegramApi, msg: TgMessage): Promise<void>
   const isGrp = isGroupChat(msg.chat);
   const receiverUid = isGrp ? userId : null;
 
+  const proxyHealth = await websharePool.getPublicHealth();
+
   if (!token) {
-    const content = statusNoToken(isGrp);
+    const content = statusNoToken(isGrp, proxyHealth);
     await sendSmartRichMessage(api, msg.chat.id, content.html, {
       receiverUserId: receiverUid,
       fallbackHtml: content.fallback,
@@ -112,7 +115,7 @@ export async function cmdStatus(api: TelegramApi, msg: TgMessage): Promise<void>
   const requestCount = await getUserRequestCount(userId);
   const admin = isAdmin(userId);
   const limit = admin ? config().ADMIN_LIMIT : config().DAILY_LIMIT;
-  const content = statusWithToken(token, requestCount, limit, admin, isGrp);
+  const content = statusWithToken(token, requestCount, limit, admin, isGrp, proxyHealth);
 
   await sendSmartRichMessage(api, msg.chat.id, content.html, {
     receiverUserId: receiverUid,

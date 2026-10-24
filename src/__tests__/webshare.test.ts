@@ -5,7 +5,9 @@
 import { describe, expect, it, beforeEach, afterEach } from 'vitest';
 import {
   buildProxyUrl,
+  formatBytes,
   parseProxyList,
+  parseWebshareStats,
   WebsharePool,
   type WebshareProxy,
 } from '../proxy.js';
@@ -211,5 +213,281 @@ describe('WebsharePool rotation', () => {
     const s = JSON.stringify(pool.status());
     expect(s).not.toContain('password');
     expect(s).not.toContain('"p"');
+  });
+
+  it('returns disabled stats when WEBSHARE_API_KEY is unset', async () => {
+    delete process.env.WEBSHARE_API_KEY;
+    const disabledPool = new WebsharePool();
+    const stats = await disabledPool.getBandwidthStats();
+    expect(stats.enabled).toBe(false);
+    expect(stats.usedFormatted).toBe('0 B');
+    expect(stats.remainingFormatted).toBe('N/A');
+  });
+
+  it('summary() formats candidate country codes', () => {
+    (pool as unknown as { _setCandidatesForTest: (l: WebshareProxy[]) => void })._setCandidatesForTest([
+      { ...list(['c1'])[0]!, countryCode: 'US' },
+      { ...list(['c2'])[0]!, countryCode: 'US' },
+      { ...list(['c3'])[0]!, countryCode: 'DE' },
+    ]);
+    expect(pool.summary()).toBe('US×2, DE×1');
+  });
+
+  it('status() reflects cached bandwidth stats without leaking credentials', () => {
+    (pool as unknown as { _setCandidatesForTest: (l: WebshareProxy[]) => void })._setCandidatesForTest(list(['s']));
+    pool._setStatsForTest({
+      enabled: true,
+      usedBytes: 1024 * 1024 * 1024,
+      usedFormatted: '1 GB',
+      limitBytes: 10 * 1024 * 1024 * 1024,
+      limitGb: 10,
+      limitFormatted: '10 GB',
+      remainingBytes: 9 * 1024 * 1024 * 1024,
+      remainingFormatted: '9 GB (90% remaining)',
+      percentUsed: 10,
+      percentRemaining: 90,
+      totalRequests: 50,
+      successfulRequests: 48,
+      failedRequests: 2,
+      countriesUsed: { US: 50 },
+      activePlan: { id: 1, proxyType: 'dc', proxyCount: 10, status: 'active' },
+      lastUpdatedAt: 1729760000000,
+    });
+    const st = pool.status();
+    expect(st.bandwidth).toEqual({
+      used: '1 GB',
+      used_bytes: 1024 * 1024 * 1024,
+      limit: '10 GB',
+      limit_bytes: 10 * 1024 * 1024 * 1024,
+      remaining: '9 GB (90% remaining)',
+      remaining_bytes: 9 * 1024 * 1024 * 1024,
+      percent_used: 10,
+      percent_remaining: 90,
+      total_requests: 50,
+      last_updated: expect.any(String),
+    });
+  });
+
+  it('getPublicHealth reports operational and bandwidthReached correctly', async () => {
+    delete process.env.WEBSHARE_API_KEY;
+    const disabledPool = new WebsharePool();
+    expect(await disabledPool.getPublicHealth()).toEqual({
+      enabled: false,
+      operational: true,
+      bandwidthReached: false,
+      statusBadge: '⚪ Direct (No Proxy Tier)',
+    });
+
+    process.env.WEBSHARE_API_KEY = 'test-key';
+    const activePool = new WebsharePool();
+    activePool._setCandidatesForTest(list(['p1']));
+
+    // 1. Healthy bandwidth
+    activePool._setStatsForTest({
+      enabled: true,
+      usedBytes: 10 * 1024 * 1024 * 1024,
+      usedFormatted: '10 GB',
+      limitBytes: 100 * 1024 * 1024 * 1024,
+      limitGb: 100,
+      limitFormatted: '100 GB',
+      remainingBytes: 90 * 1024 * 1024 * 1024,
+      remainingFormatted: '90 GB (90% remaining)',
+      percentUsed: 10,
+      percentRemaining: 90,
+      totalRequests: 100,
+      successfulRequests: 95,
+      failedRequests: 5,
+      countriesUsed: { US: 100 },
+      activePlan: null,
+      lastUpdatedAt: Date.now(),
+    });
+    const healthy = await activePool.getPublicHealth();
+    expect(healthy.enabled).toBe(true);
+    expect(healthy.operational).toBe(true);
+    expect(healthy.bandwidthReached).toBe(false);
+    expect(healthy.statusBadge).toBe('🟢 Operational');
+    expect(healthy.notice).toBeUndefined();
+
+    // 2. Near quota (>95%)
+    activePool._setStatsForTest({
+      enabled: true,
+      usedBytes: 96 * 1024 * 1024 * 1024,
+      usedFormatted: '96 GB',
+      limitBytes: 100 * 1024 * 1024 * 1024,
+      limitGb: 100,
+      limitFormatted: '100 GB',
+      remainingBytes: 4 * 1024 * 1024 * 1024,
+      remainingFormatted: '4 GB (4% remaining)',
+      percentUsed: 96,
+      percentRemaining: 4,
+      totalRequests: 100,
+      successfulRequests: 95,
+      failedRequests: 5,
+      countriesUsed: { US: 100 },
+      activePlan: null,
+      lastUpdatedAt: Date.now(),
+    });
+    const low = await activePool.getPublicHealth();
+    expect(low.statusBadge).toBe('🟡 Bandwidth Low');
+    expect(low.notice).toContain('near monthly capacity');
+
+    // 3. Bandwidth reached (0 remaining)
+    activePool._setStatsForTest({
+      enabled: true,
+      usedBytes: 100 * 1024 * 1024 * 1024,
+      usedFormatted: '100 GB',
+      limitBytes: 100 * 1024 * 1024 * 1024,
+      limitGb: 100,
+      limitFormatted: '100 GB',
+      remainingBytes: 0,
+      remainingFormatted: '0 B (0% remaining)',
+      percentUsed: 100,
+      percentRemaining: 0,
+      totalRequests: 200,
+      successfulRequests: 180,
+      failedRequests: 20,
+      countriesUsed: { US: 200 },
+      activePlan: null,
+      lastUpdatedAt: Date.now(),
+    });
+    const reached = await activePool.getPublicHealth();
+    expect(reached.operational).toBe(false);
+    expect(reached.bandwidthReached).toBe(true);
+    expect(reached.statusBadge).toBe('🔴 Bandwidth Limit Reached');
+    expect(reached.notice).toContain('Proxy bandwidth quota has been reached');
+
+    // 4. Empty candidate pool
+    activePool._setCandidatesForTest([]);
+    activePool._setStatsForTest(null);
+    const empty = await activePool.getPublicHealth();
+    expect(empty.operational).toBe(false);
+    expect(empty.bandwidthReached).toBe(false);
+    expect(empty.statusBadge).toContain('Proxy Pool Empty');
+  });
+});
+
+describe('formatBytes', () => {
+  it('formats 0 and negative bytes', () => {
+    expect(formatBytes(0)).toBe('0 B');
+    expect(formatBytes(-100)).toBe('0 B');
+  });
+
+  it('formats byte boundaries correctly', () => {
+    expect(formatBytes(512)).toBe('512 B');
+    expect(formatBytes(1024)).toBe('1 KB');
+    expect(formatBytes(1536)).toBe('1.5 KB');
+    expect(formatBytes(1024 * 1024)).toBe('1 MB');
+    expect(formatBytes(1024 * 1024 * 1024 * 5)).toBe('5 GB');
+    expect(formatBytes(1024 * 1024 * 1024 * 1024 * 2.5)).toBe('2.5 TB');
+  });
+});
+
+describe('parseWebshareStats', () => {
+  it('parses aggregate stats with a capped plan', () => {
+    const statsPayload = {
+      bandwidth_total: 25 * 1024 * 1024 * 1024,
+      requests_total: 1000,
+      requests_successful: 950,
+      requests_failed: 50,
+      countries_used: { US: 800, DE: 200 },
+    };
+    const planPayload = {
+      results: [
+        {
+          id: 1234,
+          proxy_type: 'datacenter',
+          proxy_count: 10,
+          bandwidth_limit: 100, // 100 GB
+          status: 'active',
+        },
+      ],
+    };
+
+    const stats = parseWebshareStats(statsPayload, planPayload);
+    expect(stats.enabled).toBe(true);
+    expect(stats.usedBytes).toBe(25 * 1024 * 1024 * 1024);
+    expect(stats.usedFormatted).toBe('25 GB');
+    expect(stats.limitGb).toBe(100);
+    expect(stats.limitFormatted).toBe('100 GB');
+    expect(stats.remainingBytes).toBe(75 * 1024 * 1024 * 1024);
+    expect(stats.remainingFormatted).toContain('75 GB');
+    expect(stats.remainingFormatted).toContain('75% remaining');
+    expect(stats.percentUsed).toBe(25);
+    expect(stats.percentRemaining).toBe(75);
+    expect(stats.totalRequests).toBe(1000);
+    expect(stats.successfulRequests).toBe(950);
+    expect(stats.failedRequests).toBe(50);
+    expect(stats.countriesUsed).toEqual({ US: 800, DE: 200 });
+    expect(stats.activePlan).toEqual({
+      id: 1234,
+      proxyType: 'datacenter',
+      proxyCount: 10,
+      status: 'active',
+    });
+  });
+
+  it('parses unlimited plan (bandwidth_limit = 0)', () => {
+    const statsPayload = {
+      bandwidth_total: 500 * 1024 * 1024, // 500 MB
+      requests_total: 200,
+      requests_successful: 190,
+      requests_failed: 10,
+    };
+    const planPayload = {
+      bandwidth_limit: 0,
+      proxy_type: 'residential',
+      proxy_count: 50,
+      status: 'active',
+    };
+
+    const stats = parseWebshareStats(statsPayload, planPayload);
+    expect(stats.limitFormatted).toBe('Unlimited');
+    expect(stats.remainingFormatted).toBe('Unlimited');
+    expect(stats.remainingBytes).toBeNull();
+    expect(stats.percentUsed).toBeNull();
+    expect(stats.percentRemaining).toBeNull();
+  });
+
+  it('parses hourly stats list and filters out is_projected entries', () => {
+    const listPayload = {
+      results: [
+        {
+          timestamp: '2026-10-24T00:00:00Z',
+          bandwidth_total: 1024 * 1024 * 100, // 100 MB
+          requests_total: 50,
+          requests_successful: 45,
+          requests_failed: 5,
+          is_projected: false,
+          countries_used: { US: 50 },
+        },
+        {
+          timestamp: '2026-10-24T01:00:00Z',
+          bandwidth_total: 1024 * 1024 * 200, // 200 MB (projected / future forecast)
+          requests_total: 100,
+          requests_successful: 90,
+          requests_failed: 10,
+          is_projected: true,
+          countries_used: { US: 100 },
+        },
+      ],
+    };
+
+    const stats = parseWebshareStats(listPayload, null);
+    expect(stats.usedBytes).toBe(1024 * 1024 * 100);
+    expect(stats.totalRequests).toBe(50);
+    expect(stats.successfulRequests).toBe(45);
+    expect(stats.failedRequests).toBe(5);
+    expect(stats.countriesUsed).toEqual({ US: 50 });
+    expect(stats.limitFormatted).toBe('Unknown');
+    expect(stats.remainingFormatted).toBe('Unknown');
+  });
+
+  it('safely handles empty or malformed payloads', () => {
+    const stats = parseWebshareStats(null, null);
+    expect(stats.usedBytes).toBe(0);
+    expect(stats.usedFormatted).toBe('0 B');
+    expect(stats.limitFormatted).toBe('Unknown');
+    expect(stats.remainingFormatted).toBe('Unknown');
+    expect(stats.totalRequests).toBe(0);
   });
 });

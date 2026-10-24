@@ -17,6 +17,9 @@ import net from 'node:net';
 const log = getLogger('ytube_api.webshare');
 
 const API_URL = 'https://proxy.webshare.io/api/v2/proxy/list/?mode=direct&page=1&page_size=100';
+const STATS_AGGREGATE_API_URL = 'https://proxy.webshare.io/api/v2/stats/aggregate/';
+const STATS_LIST_API_URL = 'https://proxy.webshare.io/api/v2/stats/';
+const PLAN_API_URL = 'https://proxy.webshare.io/api/v2/subscription/plan/';
 const FETCH_TIMEOUT_MS = 15_000;
 /** Consecutive failed resolutions before a proxy is pulled from rotation. */
 const MAX_FAILURES_PER_PROXY = 3;
@@ -24,6 +27,8 @@ const MAX_FAILURES_PER_PROXY = 3;
 const MIN_REFRESH_INTERVAL_MS = 30_000;
 /** How long an on-demand country-filtered fetch stays authoritative. */
 const COUNTRY_FETCH_TTL_MS = 5 * 60_000;
+/** Bandwidth stats cache TTL (60s). */
+const STATS_CACHE_TTL_MS = 60_000;
 
 export interface WebshareProxy {
   id: string;
@@ -44,6 +49,50 @@ export interface ParsedProxyList {
   droppedInvalid: number;
   droppedUnsafe: number;
   droppedCountry: number;
+}
+
+export interface WebshareBandwidthStats {
+  enabled: boolean;
+  usedBytes: number;
+  usedFormatted: string;
+  limitBytes: number | null;
+  limitGb: number | null;
+  limitFormatted: string;
+  remainingBytes: number | null;
+  remainingFormatted: string;
+  percentUsed: number | null;
+  percentRemaining: number | null;
+  totalRequests: number;
+  successfulRequests: number;
+  failedRequests: number;
+  countriesUsed: Record<string, number>;
+  activePlan: {
+    id: number;
+    proxyType: string;
+    proxyCount: number;
+    status: string;
+  } | null;
+  lastUpdatedAt: number;
+  error?: string;
+}
+
+export interface WebsharePublicHealth {
+  enabled: boolean;
+  operational: boolean;
+  bandwidthReached: boolean;
+  statusBadge: string;
+  notice?: string;
+}
+
+/** Format a raw byte count into a human-readable string (e.g. "12.34 GB", "500 MB"). */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  const idx = Math.min(units.length - 1, Math.max(0, i));
+  const val = bytes / Math.pow(1024, idx);
+  const formatted = val >= 100 || idx === 0 ? Math.round(val).toString() : Number(val.toFixed(2)).toString();
+  return `${formatted} ${units[idx]}`;
 }
 
 /** Percent-encode credentials and assemble the proxy URL. */
@@ -75,14 +124,18 @@ function apiKey(): string | null {
  * host only (SSRF guard). Only query params may vary between calls (e.g. the
  * country filter); the origin may not.
  */
-function guardedApiUrl(): URL | null {
+export function guardedWebshareUrl(target: string): URL | null {
   try {
-    const url = new URL(API_URL);
+    const url = new URL(target);
     if (url.protocol === 'https:' && url.hostname === 'proxy.webshare.io') return url;
   } catch {
     /* fall through */
   }
   return null;
+}
+
+function guardedApiUrl(): URL | null {
+  return guardedWebshareUrl(API_URL);
 }
 
 /** A proxy exit must be a public host — never an internal address. */
@@ -157,6 +210,127 @@ export function parseProxyList(
 }
 
 /**
+ * Parse Webshare proxy stats and subscription plan payloads into a unified
+ * bandwidth usage and quota status object.
+ *
+ * Supports both /stats/aggregate/ (single object) and /stats/ (hourly list).
+ */
+export function parseWebshareStats(
+  statsPayload: unknown,
+  planPayload: unknown,
+): WebshareBandwidthStats {
+  let usedBytes = 0;
+  let totalRequests = 0;
+  let successfulRequests = 0;
+  let failedRequests = 0;
+  const countriesUsed: Record<string, number> = {};
+
+  if (statsPayload && typeof statsPayload === 'object') {
+    const list = Array.isArray(statsPayload)
+      ? statsPayload
+      : Array.isArray((statsPayload as Record<string, unknown>).results)
+        ? ((statsPayload as Record<string, unknown>).results as unknown[])
+        : null;
+
+    if (list) {
+      for (const item of list) {
+        if (!item || typeof item !== 'object') continue;
+        const row = item as Record<string, unknown>;
+        if (row.is_projected === true) continue;
+        if (typeof row.bandwidth_total === 'number') usedBytes += row.bandwidth_total;
+        if (typeof row.requests_total === 'number') totalRequests += row.requests_total;
+        if (typeof row.requests_successful === 'number') successfulRequests += row.requests_successful;
+        if (typeof row.requests_failed === 'number') failedRequests += row.requests_failed;
+        if (row.countries_used && typeof row.countries_used === 'object') {
+          for (const [cc, cnt] of Object.entries(row.countries_used as Record<string, unknown>)) {
+            countriesUsed[cc] = (countriesUsed[cc] ?? 0) + (Number(cnt) || 0);
+          }
+        }
+      }
+    } else {
+      const obj = statsPayload as Record<string, unknown>;
+      if (typeof obj.bandwidth_total === 'number') usedBytes = obj.bandwidth_total;
+      if (typeof obj.requests_total === 'number') totalRequests = obj.requests_total;
+      if (typeof obj.requests_successful === 'number') successfulRequests = obj.requests_successful;
+      if (typeof obj.requests_failed === 'number') failedRequests = obj.requests_failed;
+      if (obj.countries_used && typeof obj.countries_used === 'object') {
+        for (const [cc, cnt] of Object.entries(obj.countries_used as Record<string, unknown>)) {
+          countriesUsed[cc] = (countriesUsed[cc] ?? 0) + (Number(cnt) || 0);
+        }
+      }
+    }
+  }
+
+  let activePlan: { id: number; proxyType: string; proxyCount: number; status: string } | null = null;
+  let bandwidthLimitGb: number | null = null;
+
+  if (planPayload && typeof planPayload === 'object') {
+    const pObj = planPayload as Record<string, unknown>;
+    let planCandidate: Record<string, unknown> | null = null;
+    if (Array.isArray(pObj.results)) {
+      const plans = pObj.results as Array<Record<string, unknown>>;
+      planCandidate = plans.find((p) => p && p.status === 'active') ?? plans[0] ?? null;
+    } else if (pObj.id !== undefined || pObj.bandwidth_limit !== undefined) {
+      planCandidate = pObj;
+    }
+
+    if (planCandidate) {
+      if (typeof planCandidate.bandwidth_limit === 'number') {
+        bandwidthLimitGb = planCandidate.bandwidth_limit;
+      }
+      activePlan = {
+        id: Number(planCandidate.id) || 0,
+        proxyType: typeof planCandidate.proxy_type === 'string' ? planCandidate.proxy_type : 'unknown',
+        proxyCount: typeof planCandidate.proxy_count === 'number' ? planCandidate.proxy_count : 0,
+        status: typeof planCandidate.status === 'string' ? planCandidate.status : 'active',
+      };
+    }
+  }
+
+  let limitBytes: number | null = null;
+  let limitFormatted = 'Unknown';
+  let remainingBytes: number | null = null;
+  let remainingFormatted = 'Unknown';
+  let percentUsed: number | null = null;
+  let percentRemaining: number | null = null;
+
+  if (bandwidthLimitGb !== null) {
+    if (bandwidthLimitGb === 0) {
+      limitBytes = 0;
+      limitFormatted = 'Unlimited';
+      remainingBytes = null;
+      remainingFormatted = 'Unlimited';
+    } else if (bandwidthLimitGb > 0) {
+      limitBytes = Math.round(bandwidthLimitGb * 1024 * 1024 * 1024);
+      limitFormatted = formatBytes(limitBytes);
+      remainingBytes = Math.max(0, limitBytes - usedBytes);
+      percentUsed = Math.min(100, Math.max(0, Number(((usedBytes / limitBytes) * 100).toFixed(1))));
+      percentRemaining = Math.max(0, Number((100 - percentUsed).toFixed(1)));
+      remainingFormatted = `${formatBytes(remainingBytes)} (${percentRemaining}% remaining)`;
+    }
+  }
+
+  return {
+    enabled: true,
+    usedBytes,
+    usedFormatted: formatBytes(usedBytes),
+    limitBytes,
+    limitGb: bandwidthLimitGb,
+    limitFormatted,
+    remainingBytes,
+    remainingFormatted,
+    percentUsed,
+    percentRemaining,
+    totalRequests,
+    successfulRequests,
+    failedRequests,
+    countriesUsed,
+    activePlan,
+    lastUpdatedAt: Date.now(),
+  };
+}
+
+/**
  * Round-robin pool of Webshare proxies with live API refresh.
  * `getProxy()` hands out exits one by one; `markBad()` rotates and eventually
  * evicts repeatedly-failing proxies; `refresh()` re-reads the account's list.
@@ -171,6 +345,9 @@ export class WebsharePool {
   private refreshInflight: Promise<void> | null = null;
   private lastRefreshAt = 0;
   private initialized = false;
+  private cachedStats: WebshareBandwidthStats | null = null;
+  private statsFetchInflight: Promise<WebshareBandwidthStats> | null = null;
+  private lastStatsFetchAt = 0;
 
   get enabled(): boolean {
     try {
@@ -219,6 +396,9 @@ export class WebsharePool {
     this.candidates = [];
     this.countryFetches.clear();
     this.initialized = false;
+    this.cachedStats = null;
+    this.statsFetchInflight = null;
+    this.lastStatsFetchAt = 0;
   }
 
   /** Fetch the account's proxy list (single-flight; keeps old list on failure). */
@@ -533,6 +713,11 @@ export class WebsharePool {
     return false;
   }
 
+  /** Country summary of active pool candidates (e.g. "US×10, FR×2"). */
+  summary(): string {
+    return summary(this.candidates);
+  }
+
   /** Test hook — replace the candidate list without touching the API. */
   _setCandidatesForTest(proxies: WebshareProxy[]): void {
     this.candidates = proxies;
@@ -541,11 +726,253 @@ export class WebsharePool {
     this.countryFetches.clear();
   }
 
+  /** Test hook — inject bandwidth stats without making API requests. */
+  _setStatsForTest(stats: WebshareBandwidthStats | null): void {
+    this.cachedStats = stats;
+    this.lastStatsFetchAt = stats ? Date.now() : 0;
+  }
+
+  /**
+   * Fetch current bandwidth usage and remaining allocation from the Webshare API.
+   * Caches responses for STATS_CACHE_TTL_MS (60s) to respect API rate limits.
+   */
+  async getBandwidthStats(forceRefresh = false): Promise<WebshareBandwidthStats> {
+    if (!this.enabled) {
+      return {
+        enabled: false,
+        usedBytes: 0,
+        usedFormatted: '0 B',
+        limitBytes: null,
+        limitGb: null,
+        limitFormatted: 'N/A',
+        remainingBytes: null,
+        remainingFormatted: 'N/A',
+        percentUsed: null,
+        percentRemaining: null,
+        totalRequests: 0,
+        successfulRequests: 0,
+        failedRequests: 0,
+        countriesUsed: {},
+        activePlan: null,
+        lastUpdatedAt: Date.now(),
+      };
+    }
+
+    const now = Date.now();
+    if (!forceRefresh && this.cachedStats && now - this.lastStatsFetchAt < STATS_CACHE_TTL_MS) {
+      return this.cachedStats;
+    }
+
+    if (this.statsFetchInflight) return this.statsFetchInflight;
+
+    this.statsFetchInflight = this.doFetchStats().finally(() => {
+      this.statsFetchInflight = null;
+    });
+    return this.statsFetchInflight;
+  }
+
+  private async doFetchStats(): Promise<WebshareBandwidthStats> {
+    const apiKeyValue = apiKey();
+    if (!apiKeyValue) {
+      return {
+        enabled: false,
+        usedBytes: 0,
+        usedFormatted: '0 B',
+        limitBytes: null,
+        limitGb: null,
+        limitFormatted: 'N/A',
+        remainingBytes: null,
+        remainingFormatted: 'N/A',
+        percentUsed: null,
+        percentRemaining: null,
+        totalRequests: 0,
+        successfulRequests: 0,
+        failedRequests: 0,
+        countriesUsed: {},
+        activePlan: null,
+        lastUpdatedAt: Date.now(),
+      };
+    }
+
+    try {
+      const headers = {
+        Authorization: `Token ${apiKeyValue}`,
+        Accept: 'application/json',
+      };
+
+      // 1. Fetch bandwidth statistics: try aggregate endpoint, fallback to hourly list
+      let statsPayload: unknown = null;
+      const aggUrl = guardedWebshareUrl(STATS_AGGREGATE_API_URL);
+      if (aggUrl) {
+        try {
+          const resp = await fetch(aggUrl, {
+            headers,
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+          });
+          if (resp.ok) {
+            statsPayload = await resp.json();
+          }
+        } catch {
+          /* fallback to list */
+        }
+      }
+
+      if (!statsPayload) {
+        const listUrl = guardedWebshareUrl(STATS_LIST_API_URL);
+        if (listUrl) {
+          try {
+            const resp = await fetch(listUrl, {
+              headers,
+              signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+            });
+            if (resp.ok) {
+              statsPayload = await resp.json();
+            } else {
+              const body = await resp.text().catch(() => '');
+              log.warning(`[WEBSHARE] Stats fetch failed: HTTP ${resp.status} ${body.slice(0, 100)}`);
+            }
+          } catch (e) {
+            log.warning(`[WEBSHARE] Stats list fetch error: ${String(e)}`);
+          }
+        }
+      }
+
+      // 2. Fetch subscription plan to determine bandwidth quota
+      let planPayload: unknown = null;
+      const planUrl = guardedWebshareUrl(PLAN_API_URL);
+      if (planUrl) {
+        try {
+          const resp = await fetch(planUrl, {
+            headers,
+            signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+          });
+          if (resp.ok) {
+            planPayload = await resp.json();
+          } else {
+            const body = await resp.text().catch(() => '');
+            log.warning(`[WEBSHARE] Plan fetch failed: HTTP ${resp.status} ${body.slice(0, 100)}`);
+          }
+        } catch (e) {
+          log.warning(`[WEBSHARE] Plan fetch error: ${String(e)}`);
+        }
+      }
+
+      const parsed = parseWebshareStats(statsPayload, planPayload);
+      this.cachedStats = parsed;
+      this.lastStatsFetchAt = Date.now();
+      return parsed;
+    } catch (e) {
+      log.warning(`[WEBSHARE] Failed to fetch proxy stats: ${String(e)}`);
+      return {
+        enabled: true,
+        usedBytes: this.cachedStats?.usedBytes ?? 0,
+        usedFormatted: this.cachedStats?.usedFormatted ?? '0 B',
+        limitBytes: this.cachedStats?.limitBytes ?? null,
+        limitGb: this.cachedStats?.limitGb ?? null,
+        limitFormatted: this.cachedStats?.limitFormatted ?? 'Unknown',
+        remainingBytes: this.cachedStats?.remainingBytes ?? null,
+        remainingFormatted: this.cachedStats?.remainingFormatted ?? 'Unknown',
+        percentUsed: this.cachedStats?.percentUsed ?? null,
+        percentRemaining: this.cachedStats?.percentRemaining ?? null,
+        totalRequests: this.cachedStats?.totalRequests ?? 0,
+        successfulRequests: this.cachedStats?.successfulRequests ?? 0,
+        failedRequests: this.cachedStats?.failedRequests ?? 0,
+        countriesUsed: this.cachedStats?.countriesUsed ?? {},
+        activePlan: this.cachedStats?.activePlan ?? null,
+        lastUpdatedAt: Date.now(),
+        error: String(e),
+      };
+    }
+  }
+
+  /**
+   * High-level operational health for public status boards and normal user dashboards.
+   * Never leaks internal credentials, IPs, or billing numbers.
+   */
+  async getPublicHealth(): Promise<WebsharePublicHealth> {
+    if (!this.enabled) {
+      return {
+        enabled: false,
+        operational: true,
+        bandwidthReached: false,
+        statusBadge: '⚪ Direct (No Proxy Tier)',
+      };
+    }
+
+    try {
+      const stats = await this.getBandwidthStats().catch(() => null);
+      const isBandwidthReached =
+        !!stats &&
+        ((stats.remainingBytes !== null && stats.remainingBytes <= 0) ||
+          (stats.percentUsed !== null && stats.percentUsed >= 100));
+
+      if (isBandwidthReached) {
+        return {
+          enabled: true,
+          operational: false,
+          bandwidthReached: true,
+          statusBadge: '🔴 Bandwidth Limit Reached',
+          notice:
+            '⚠️ <b>Service Alert:</b> Proxy bandwidth quota has been reached. Geo-restricted video extraction and fallback bypasses may be temporarily degraded until quota reset.',
+        };
+      }
+
+      if (stats?.percentUsed !== null && stats?.percentUsed !== undefined && stats.percentUsed >= 95) {
+        return {
+          enabled: true,
+          operational: true,
+          bandwidthReached: false,
+          statusBadge: '🟡 Bandwidth Low',
+          notice:
+            '⚠️ <b>Service Notice:</b> Proxy bandwidth is near monthly capacity (>95% used).',
+        };
+      }
+
+      if (this.candidates.length === 0) {
+        return {
+          enabled: true,
+          operational: false,
+          bandwidthReached: false,
+          statusBadge: '🟠 Degraded (Proxy Pool Empty)',
+          notice: '⚠️ <b>Service Notice:</b> Proxy pool is currently initializing or unavailable.',
+        };
+      }
+
+      return {
+        enabled: true,
+        operational: true,
+        bandwidthReached: false,
+        statusBadge: '🟢 Operational',
+      };
+    } catch {
+      return {
+        enabled: true,
+        operational: true,
+        bandwidthReached: false,
+        statusBadge: '🟢 Operational',
+      };
+    }
+  }
+
   /** Operational snapshot (no credentials). */
   status(): Record<string, unknown> {
     return {
       enabled: this.enabled,
       pool_size: this.candidates.length,
+      bandwidth: this.cachedStats
+        ? {
+            used: this.cachedStats.usedFormatted,
+            used_bytes: this.cachedStats.usedBytes,
+            limit: this.cachedStats.limitFormatted,
+            limit_bytes: this.cachedStats.limitBytes,
+            remaining: this.cachedStats.remainingFormatted,
+            remaining_bytes: this.cachedStats.remainingBytes,
+            percent_used: this.cachedStats.percentUsed,
+            percent_remaining: this.cachedStats.percentRemaining,
+            total_requests: this.cachedStats.totalRequests,
+            last_updated: new Date(this.cachedStats.lastUpdatedAt).toISOString(),
+          }
+        : null,
       proxies: this.candidates.map((p) => ({
         address: p.address,
         port: p.port,

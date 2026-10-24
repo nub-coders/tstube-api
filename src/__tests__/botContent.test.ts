@@ -41,6 +41,28 @@ describe('rich content', () => {
     expect(c.html).toContain('🟩🟩🟩🟩🟩⬜⬜⬜⬜⬜');
     expect(c.html).toContain('<b>500</b> / 1,000');
     expect(c.html).toContain('👤 Standard (100,000 req/day)');
+
+    // When proxy health is operational
+    const cOk = statusWithToken('tok1234567', 500, 1000, false, false, {
+      enabled: true,
+      operational: true,
+      bandwidthReached: false,
+      statusBadge: '🟢 Operational',
+    });
+    expect(cOk.html).toContain('🌐 Geo-Bypass &amp; Proxies');
+    expect(cOk.html).toContain('🟢 Operational');
+
+    // When proxy bandwidth limit is reached
+    const cExhausted = statusWithToken('tok1234567', 500, 1000, false, false, {
+      enabled: true,
+      operational: false,
+      bandwidthReached: true,
+      statusBadge: '🔴 Bandwidth Limit Reached',
+      notice: '⚠️ <b>Service Alert:</b> Proxy bandwidth quota has been reached.',
+    });
+    expect(cExhausted.html).toContain('🔴 Bandwidth Limit Reached');
+    expect(cExhausted.html).toContain('Proxy bandwidth quota has been reached');
+    expect(cExhausted.fallback).toContain('🔴 Bandwidth Limit Reached');
   });
 
   it('formats /ping latency with a Python float', async () => {
@@ -97,6 +119,66 @@ describe('rich content', () => {
     expect(chunks.length).toBeGreaterThan(1);
     for (const c of chunks) expect(c.length).toBeLessThanOrEqual(3600 + 300);
     expect(chunks[0]).toContain('Recent API Error Log (40)');
+  });
+
+  it('renders webshareStatsCard for disabled and enabled states', async () => {
+    const { webshareStatsCard, adminHelpCard } = await import('../telegram/adminContent.js');
+    const disabledCard = webshareStatsCard(
+      {
+        enabled: false,
+        usedBytes: 0,
+        usedFormatted: '0 B',
+        limitBytes: null,
+        limitGb: null,
+        limitFormatted: 'N/A',
+        remainingBytes: null,
+        remainingFormatted: 'N/A',
+        percentUsed: null,
+        percentRemaining: null,
+        totalRequests: 0,
+        successfulRequests: 0,
+        failedRequests: 0,
+        countriesUsed: {},
+        activePlan: null,
+        lastUpdatedAt: Date.now(),
+      },
+      0,
+    );
+    expect(disabledCard).toContain('Webshare Proxy Statistics');
+    expect(disabledCard).toContain('Disabled (<code>WEBSHARE_API_KEY</code> unset)');
+
+    const enabledCard = webshareStatsCard(
+      {
+        enabled: true,
+        usedBytes: 15 * 1024 * 1024 * 1024,
+        usedFormatted: '15 GB',
+        limitBytes: 50 * 1024 * 1024 * 1024,
+        limitGb: 50,
+        limitFormatted: '50 GB',
+        remainingBytes: 35 * 1024 * 1024 * 1024,
+        remainingFormatted: '35 GB (70% remaining)',
+        percentUsed: 30,
+        percentRemaining: 70,
+        totalRequests: 120,
+        successfulRequests: 115,
+        failedRequests: 5,
+        countriesUsed: { US: 100, GB: 20 },
+        activePlan: { id: 1, proxyType: 'datacenter', proxyCount: 10, status: 'active' },
+        lastUpdatedAt: Date.now(),
+      },
+      10,
+      'US×8, GB×2',
+    );
+
+    expect(enabledCard).toContain('Webshare Proxy Statistics');
+    expect(enabledCard).toContain('15 GB');
+    expect(enabledCard).toContain('35 GB (70% remaining)');
+    expect(enabledCard).toContain('50 GB');
+    expect(enabledCard).toContain('🟢 <b>Operational</b> (10 exits · US×8, GB×2)');
+    expect(enabledCard).toContain('US (100), GB (20)');
+
+    expect(adminHelpCard()).toContain('/proxystats');
+    expect(adminHelpCard()).toContain('Webshare proxy pool &amp; bandwidth usage');
   });
 });
 

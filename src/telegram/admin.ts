@@ -5,6 +5,7 @@ import {
   ACCESS_DENIED_STATS,
   adminHelpCard,
   buildStats,
+  webshareStatsCard,
   errorLogCards,
   grantCard,
   listUsersCard,
@@ -12,6 +13,7 @@ import {
   userInfoCard,
 } from './adminContent.js';
 import { isAdmin } from '../config.js';
+import { websharePool } from '../proxy.js';
 import {
   getFailedRequestCount,
   getRecentErrors,
@@ -58,6 +60,38 @@ export async function cmdStats(api: TelegramApi, msg: TgMessage): Promise<void> 
       api,
       chatId,
       `<blockquote>❌ <b>Error retrieving stats:</b> ${escapeHtml(String(e))}</blockquote>`,
+    );
+  }
+}
+
+export async function cmdProxyStats(api: TelegramApi, msg: TgMessage): Promise<void> {
+  const userId = msg.from!.id;
+  if (!isAdmin(userId)) {
+    await sendSmartRichMessage(api, msg.chat.id, ACCESS_DENIED_STATS, { receiverUserId: userId });
+    return;
+  }
+
+  const chatId = msg.chat.id;
+  const draftId = api.rndId();
+  try {
+    await sendRichDraft(
+      api,
+      chatId,
+      draftId,
+      '<blockquote>⚡ <b>Fetching Webshare proxy &amp; bandwidth statistics...</b></blockquote>',
+    );
+    const stats = await websharePool.getBandwidthStats(true);
+    const html = webshareStatsCard(stats, websharePool.size, websharePool.summary());
+    await sendSmartRichMessage(api, chatId, html, {
+      replyMarkup: keyboard([
+        [btn('🔄 Refresh Proxy Stats', { callback_data: 'admin_refresh_proxystats', style: ButtonStyle.PRIMARY })],
+      ]),
+    });
+  } catch (e) {
+    await sendSmartRichMessage(
+      api,
+      chatId,
+      `<blockquote>❌ <b>Error retrieving proxy stats:</b> ${escapeHtml(String(e))}</blockquote>`,
     );
   }
 }

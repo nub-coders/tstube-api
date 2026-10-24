@@ -10,6 +10,7 @@ import { config } from '../config.js';
 import { maskToken } from '../tools.js';
 import { escapeHtml } from './rich.js';
 import { comma, pyRoundStr } from '../pyTime.js';
+import type { WebsharePublicHealth } from '../proxy.js';
 
 export interface RichContent {
   html: string;
@@ -177,13 +178,14 @@ export function pingContent(elapsedMs: number, uptime: string): string {
 
 // ── /status (plugins/status.py) ─────────────────────────────────
 
-export function statusNoToken(isGrp: boolean): RichContent {
+export function statusNoToken(isGrp: boolean, proxyHealth?: WebsharePublicHealth): RichContent {
+  const noticeAlert = proxyHealth?.notice ? `\n\n<blockquote>${proxyHealth.notice}</blockquote>` : '';
   const base = `<h1>📊 Usage Status</h1>
-<blockquote>❌ You don't have an active API token yet. Click below to generate one immediately.</blockquote>`;
+<blockquote>❌ You don't have an active API token yet. Click below to generate one immediately.</blockquote>${noticeAlert}`;
   return {
     html:
       base +
-      (isGrp ? '<blockquote>🔒 <b>Ephemeral:</b> Only visible to you in this group.</blockquote>' : ''),
+      (isGrp ? '\n\n<blockquote>🔒 <b>Ephemeral:</b> Only visible to you in this group.</blockquote>' : ''),
     fallback:
       base +
       `
@@ -200,11 +202,16 @@ export function statusWithToken(
   limit: number,
   isAdminUser: boolean,
   isGrp: boolean,
+  proxyHealth?: WebsharePublicHealth,
 ): RichContent {
   const remaining = Math.max(0, limit - requestCount);
   const progress = Math.min(Math.trunc((requestCount / limit) * 10), 10);
   const bar = '🟩'.repeat(progress) + '⬜'.repeat(10 - progress);
   const adminBadge = isAdminUser ? `👑 Admin (${comma(config().ADMIN_LIMIT)} req/day)` : `👤 Standard (${comma(config().DAILY_LIMIT)} req/day)`;
+
+  const proxyRow = proxyHealth && proxyHealth.enabled
+    ? `\n  <tr><td><b>🌐 Geo-Bypass &amp; Proxies</b></td><td>${proxyHealth.statusBadge}</td></tr>`
+    : '';
 
   const table = (tokenDisplay: string, rawToken?: string): string => `<table border="1">
   <tr><th>📈 Metric</th><th>📋 Current Value</th></tr>
@@ -217,13 +224,15 @@ export function statusWithToken(
   <tr><td><b>📊 Used Today</b></td><td><b>${comma(requestCount)}</b> / ${comma(limit)}</td></tr>
   <tr><td><b>⚡ Remaining Quota</b></td><td><b>${comma(remaining)} requests</b></td></tr>
   <tr><td><b>⏱ Daily Reset</b></td><td>Midnight UTC (00:00)</td></tr>
-  <tr><td><b>🔋 Quota Meter</b></td><td>${bar}</td></tr>
+  <tr><td><b>🔋 Quota Meter</b></td><td>${bar}</td></tr>${proxyRow}
 </table>`;
+
+  const noticeAlert = proxyHealth?.notice ? `\n\n<blockquote>${proxyHealth.notice}</blockquote>` : '';
 
   let html = `<h1>📊 Quota &amp; Usage Dashboard</h1>
 <blockquote>Real-time metrics, daily allocations, and rate limit tracking.</blockquote>
 
-${table(token, token)}
+${table(token, token)}${noticeAlert}
 
 <tg-button-row>
   <tg-button type="url" url="${apiUrl('rate-limit-status')}?token=${escapeHtml(token)}" style="primary">📊 Live Quota JSON</tg-button>
@@ -242,13 +251,13 @@ ${table(token, token)}
 
   if (isGrp) {
     html +=
-      '<blockquote>🔒 <b>Ephemeral Message:</b> This usage status and your API token are only visible to you in this group.</blockquote>';
+      '\n\n<blockquote>🔒 <b>Ephemeral Message:</b> This usage status and your API token are only visible to you in this group.</blockquote>';
   }
 
   const fallback = `<h1>📊 Quota &amp; Usage Dashboard</h1>
 <blockquote>Real-time metrics, daily allocations, and rate limit tracking.</blockquote>
 
-${table(maskToken(token))}
+${table(maskToken(token))}${noticeAlert}
 
 <tg-button-row>
   <tg-button type="url" url="${apiUrl()}" style="primary">🌐 Open API Gateway</tg-button>

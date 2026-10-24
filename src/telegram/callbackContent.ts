@@ -8,6 +8,7 @@ import { btn, keyboard, ButtonStyle, escapeHtml, type InlineKeyboardMarkup } fro
 import { apiUrl, statusWithToken, startExisting, MENU_BODY } from './content.js';
 import { config, isAdmin } from '../config.js';
 import { comma } from '../pyTime.js';
+import type { WebsharePublicHealth } from '../proxy.js';
 
 export interface Card {
   html: string;
@@ -38,8 +39,9 @@ export function usageCallback(
   limit: number,
   isAdminUser: boolean,
   isGrp: boolean,
+  proxyHealth?: WebsharePublicHealth,
 ): Card {
-  const content = statusWithToken(token, requestCount, limit, isAdminUser, isGrp);
+  const content = statusWithToken(token, requestCount, limit, isAdminUser, isGrp, proxyHealth);
   return {
     html: content.html,
     keyboard: keyboard([
