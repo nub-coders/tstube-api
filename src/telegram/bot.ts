@@ -26,9 +26,9 @@ import { getLogger } from '../logger.js';
 
 const log = getLogger('ytube_api.bot');
 
-const USER_RE = /^\/user\s+\d+/;
-const GRANT_RE = /^\/grant\s+\d+\s+\d+/;
-const REVOKE_ID_RE = /^\/revoke\s+\d+/;
+const USER_RE = /^\/user(@\w+)?\s+\d+/i;
+const GRANT_RE = /^\/grant(@\w+)?\s+\d+\s+\d+/i;
+const REVOKE_ID_RE = /^\/revoke(@\w+)?\s+\d+/i;
 
 const PRIVATE_ONLY = new Set([
   'stats',
@@ -36,7 +36,6 @@ const PRIVATE_ONLY = new Set([
   'webshare',
   'user',
   'grant',
-  'revoke',
   'listusers',
   'adminhelp',
   'errors',
@@ -45,17 +44,22 @@ const PRIVATE_ONLY = new Set([
 
 export async function dispatchMessage(api: TelegramApi, msg: TgMessage): Promise<void> {
   if (!msg.from || msg.from.is_bot) return;
-  const text = msg.text ?? '';
+  const text = msg.text ?? msg.caption ?? '';
   if (!text.startsWith('/')) return;
 
   const isPrivate = msg.chat.type === 'private';
   const command = text.split(/\s+/)[0]!.slice(1).split('@')[0]!.toLowerCase();
 
+  // Admin /revoke <id> is private-only; general /revoke is public for self-revocation
+  if (command === 'revoke' && REVOKE_ID_RE.test(text)) {
+    if (!isPrivate) return;
+    return cmdRevokeAdmin(api, msg);
+  }
+
   // Private-only admin commands keyed on real args (regex filters in Python).
   if (isPrivate) {
     if (USER_RE.test(text)) return cmdUser(api, msg);
     if (GRANT_RE.test(text)) return cmdGrant(api, msg);
-    if (REVOKE_ID_RE.test(text)) return cmdRevokeAdmin(api, msg);
   }
 
   if (PRIVATE_ONLY.has(command) && !isPrivate) return;
@@ -117,7 +121,7 @@ export async function startBot(cfg: Config): Promise<() => Promise<void>> {
   // Pre-warm stats cache in background so admin button responds instantly
   void buildStats(api).catch(() => {});
 
-  bot.on('message:text', async (ctx) => {
+  bot.on(['message:text', 'message:caption'], async (ctx) => {
     try {
       await dispatchMessage(api, ctx.message as unknown as TgMessage);
     } catch (e) {

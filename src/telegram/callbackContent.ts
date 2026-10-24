@@ -5,7 +5,7 @@
  * interactive Bot API 10.3 expandable documents (<details>, <table>, <blockquote expandable>).
  */
 import { btn, keyboard, ButtonStyle, escapeHtml, type InlineKeyboardMarkup } from './rich.js';
-import { apiUrl, statusWithToken, startExisting, MENU_BODY } from './content.js';
+import { apiUrl, statusWithToken, startExisting } from './content.js';
 import { config, isAdmin } from '../config.js';
 import { comma } from '../pyTime.js';
 import type { WebsharePublicHealth } from '../proxy.js';
@@ -245,19 +245,19 @@ export function platformsCard(): Card {
   };
 }
 
-// ── Master API Documentation (All-in-One Interactive Reference) ─
+// ── Master API Documentation (Interactive Reference) ────────────
 
 export function apiDocs(userToken = 'YOUR_TOKEN'): Card {
   return {
     html: `<h1>API Documentation</h1>
-<blockquote>Interactive endpoint reference, request parameters, and schemas. Tap any endpoint below to expand:</blockquote>
+<blockquote>Interactive endpoint reference and cURL examples. Tap any section to expand:</blockquote>
 
 <table border="1">
   <tr><th>Feature</th><th>Specification</th></tr>
   <tr><td><b>Base URL</b></td><td><code>${apiUrl()}/</code></td></tr>
-  <tr><td><b>Authentication</b></td><td><code>?token=${escapeHtml(userToken)}</code> or <code>Authorization: Bearer</code></td></tr>
-  <tr><td><b>Daily Quota</b></td><td>${comma(config().DAILY_LIMIT)} calls/day (Data), Unlimited (Search &amp; Trending)</td></tr>
-  <tr><td><b>Burst Rate</b></td><td>10 req/s concurrency limit</td></tr>
+  <tr><td><b>Auth</b></td><td><code>?token=${escapeHtml(userToken)}</code> or <code>Authorization: Bearer</code></td></tr>
+  <tr><td><b>Quota</b></td><td>${comma(config().DAILY_LIMIT)} req/day (Media) · Unlimited (Search &amp; Trending)</td></tr>
+  <tr><td><b>Rate Guard</b></td><td>10 req/s burst limit · Resets 00:00 UTC</td></tr>
 </table>
 
 <tg-button-row>
@@ -266,130 +266,54 @@ export function apiDocs(userToken = 'YOUR_TOKEN'): Card {
 </tg-button-row>
 
 <details>
-  <summary><b>🎬 Supported Platforms &amp; Link Patterns</b></summary>
-  <blockquote>Direct URL extraction is supported across video and music networks:</blockquote>
-  <table border="1">
-    <tr><th>Network</th><th>Supported Types</th><th>Output Formats</th></tr>
-    <tr><td><b>YouTube</b></td><td>Videos, Shorts, Music</td><td>Direct MP4 / WebM video + audio streams</td></tr>
-    <tr><td><b>Spotify</b></td><td>Tracks, Albums, Playlists</td><td>Metadata + playable stream pipe</td></tr>
-    <tr><td><b>Apple Music</b></td><td>Songs, Albums, Playlists</td><td>Metadata + playable stream pipe</td></tr>
-    <tr><td><b>Amazon Music</b></td><td>Tracks, Albums</td><td>Metadata + playable stream pipe</td></tr>
-    <tr><td><b>SoundCloud</b></td><td>Tracks, Sets</td><td>Direct MP3 / AAC audio streams</td></tr>
-    <tr><td><b>JioSaavn</b></td><td>Songs, Albums</td><td>Direct 320kbps / 160kbps audio streams</td></tr>
-  </table>
-</details>
-
-<details>
   <summary><b>🎥 GET /info — Video Metadata &amp; Streams</b></summary>
-  <blockquote>Extract rich video metadata, available formats (1080p, 720p, 480p, 360p), audio tracks, and direct CDN URLs.</blockquote>
-  <table border="1">
-    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
-    <tr><td><code>q</code></td><td>string</td><td>Yes</td><td>Video/Music URL (YouTube, Spotify, Apple Music, SoundCloud, JioSaavn) or search query</td></tr>
-    <tr><td><code>token</code></td><td>string</td><td>Yes*</td><td>Bearer token (*or Authorization header)</td></tr>
-    <tr><td><code>max_results</code></td><td>int</td><td>No</td><td>Search fallback count (default: 1)</td></tr>
-  </table>
-  <p><b>cURL:</b></p>
+  <blockquote>Extract metadata, formats (1080p, 720p, audio), and direct stream URL.</blockquote>
+  <p><b>Params:</b> <code>q</code> (URL or query), <code>token</code>, <code>max_results</code></p>
   <pre><code class="language-bash">curl -s -H "Authorization: Bearer ${userToken}" "${apiUrl('info')}?q=https://youtu.be/dQw4w9WgXcQ"</code></pre>
 </details>
 
 <details>
-  <summary><b>⚡ GET /stream — Live Seekable Media Stream Pipe</b></summary>
-  <blockquote>Direct streaming proxy pipe supporting HTTP 206 Partial Content, Range headers, and chunked playback.</blockquote>
-  <table border="1">
-    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
-    <tr><td><code>q</code></td><td>string</td><td>Yes</td><td>Video URL to stream</td></tr>
-    <tr><td><code>token</code></td><td>string</td><td>Yes*</td><td>Bearer token (*or Authorization header)</td></tr>
-    <tr><td><code>format</code></td><td>string</td><td>No</td><td>Specific format code or audio/video selector</td></tr>
-  </table>
-  <p><b>cURL:</b></p>
+  <summary><b>⚡ GET /stream — Live Seekable Stream</b></summary>
+  <blockquote>Streaming proxy supporting HTTP 206 Partial Content and Range headers.</blockquote>
+  <p><b>Params:</b> <code>q</code> (URL), <code>token</code>, <code>format</code></p>
   <pre><code class="language-bash">curl -L -H "Authorization: Bearer ${userToken}" "${apiUrl('stream')}?q=https://youtu.be/dQw4w9WgXcQ" -o video.mp4</code></pre>
 </details>
 
 <details>
-  <summary><b>🔍 GET /search — Multi-Platform Search (Free &amp; Unmetered)</b></summary>
-  <blockquote>Fast query discovery with durations, thumbnails, views, and channel IDs. Unmetered (no quota consumed).</blockquote>
-  <table border="1">
-    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
-    <tr><td><code>q</code></td><td>string</td><td>Yes</td><td>Search query keywords</td></tr>
-    <tr><td><code>max_results</code></td><td>int</td><td>No</td><td>Results to return (1–20, default: 5)</td></tr>
-  </table>
-  <p><b>cURL:</b></p>
+  <summary><b>🔍 GET /search — Multi-Platform Search (Free)</b></summary>
+  <blockquote>Fast query search with video durations, thumbnails, views, and channel IDs.</blockquote>
+  <p><b>Params:</b> <code>q</code> (query), <code>max_results</code> (1–20, default 5)</p>
   <pre><code class="language-bash">curl -s "${apiUrl('search')}?q=lofi+hip+hop&amp;max_results=5"</code></pre>
 </details>
 
 <details>
-  <summary><b>🔥 GET /trending — Regional Trending Feeds (Free)</b></summary>
-  <blockquote>Explore viral videos across countries and categories. Completely free and unmetered.</blockquote>
-  <table border="1">
-    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
-    <tr><td><code>region</code></td><td>string</td><td>No</td><td>ISO 3166-1 alpha-2 country code (default: US)</td></tr>
-    <tr><td><code>category</code></td><td>string</td><td>No</td><td>Category: default, music, gaming, movies</td></tr>
-  </table>
-  <p><b>cURL:</b></p>
+  <summary><b>🔥 GET /trending — Regional Feeds (Free)</b></summary>
+  <blockquote>Explore viral videos across countries and categories. Unmetered.</blockquote>
+  <p><b>Params:</b> <code>region</code> (ISO code, default US), <code>category</code></p>
   <pre><code class="language-bash">curl -s "${apiUrl('trending')}?region=US"</code></pre>
 </details>
 
 <details>
-  <summary><b>🎼 GET /formats — Stream Format Matrix</b></summary>
-  <blockquote>List all available resolutions, video/audio codecs (h264, vp9, av01), and audio bitrates.</blockquote>
-  <table border="1">
-    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
-    <tr><td><code>q</code></td><td>string</td><td>Yes</td><td>Video URL to analyze</td></tr>
-    <tr><td><code>token</code></td><td>string</td><td>Yes*</td><td>Bearer token (*or Authorization header)</td></tr>
-  </table>
-  <p><b>cURL:</b></p>
-  <pre><code class="language-bash">curl -s -H "Authorization: Bearer ${userToken}" "${apiUrl('formats')}?q=https://youtu.be/dQw4w9WgXcQ"</code></pre>
-</details>
-
-<details>
   <summary><b>📊 GET /rate-limit-status — Quota Telemetry</b></summary>
-  <blockquote>Check consumed quota, remaining daily requests, burst capacity, and midnight UTC reset time.</blockquote>
-  <table border="1">
-    <tr><th>Parameter</th><th>Type</th><th>Required</th><th>Description</th></tr>
-    <tr><td><code>token</code></td><td>string</td><td>Yes*</td><td>Bearer token (*or Authorization header)</td></tr>
-  </table>
-  <p><b>cURL:</b></p>
+  <blockquote>Inspect consumed quota, remaining daily requests, and midnight UTC reset time.</blockquote>
   <pre><code class="language-bash">curl -s "${apiUrl('rate-limit-status')}?token=${userToken}"</code></pre>
 </details>
 
 <details>
   <summary><b>🩺 GET /health — Health Check Probe</b></summary>
-  <blockquote>High-availability health check endpoint returning HTTP 200 {"status": "ok"}.</blockquote>
-  <p><b>cURL:</b></p>
+  <blockquote>Service uptime and connectivity probe returning HTTP 200 <code>{"status":"ok"}</code>.</blockquote>
   <pre><code class="language-bash">curl -s "${apiUrl('health')}"</code></pre>
 </details>
 
 <details>
-  <summary><b>🐍 Python SDK &amp; Integration Guide</b></summary>
-  <blockquote>Complete Python client wrapper with connection pooling, search, stream extraction, and retry logic:</blockquote>
+  <summary><b>🐍 Python Quickstart</b></summary>
   <pre><code class="language-python">import requests
-from typing import Dict, List
-
-class NubYtApiClient:
-    def __init__(self, token: str = "${userToken}", base_url: str = "${apiUrl()}"):
-        self.token = token
-        self.base_url = base_url.rstrip("/")
-        self.session = requests.Session()
-        self.session.headers.update({"Authorization": f"Bearer {token}"})
-
-    def get_info(self, url_or_query: str, max_results: int = 1) -> Dict:
-        r = self.session.get(f"{self.base_url}/info", params={"q": url_or_query, "max_results": max_results}, timeout=30)
-        r.raise_for_status()
-        return r.json()
-
-    def search(self, query: str, max_results: int = 5) -> List[Dict]:
-        r = self.session.get(f"{self.base_url}/search", params={"q": query, "max_results": min(max_results, 20)}, timeout=15)
-        r.raise_for_status()
-        return r.json().get("results", [])
-
-    def quota(self) -> Dict:
-        r = self.session.get(f"{self.base_url}/rate-limit-status")
-        return r.json()
-
-# Quick test:
-client = NubYtApiClient()
-print("Search:", client.search("lofi hip hop", 2))
-print("Info:", client.get_info("https://youtube.com/watch?v=dQw4w9WgXcQ")["url"])</code></pre>
+res = requests.get(
+    "${apiUrl('info')}",
+    headers={"Authorization": f"Bearer {userToken}"},
+    params={"q": "https://youtu.be/dQw4w9WgXcQ"}
+).json()
+print("Stream URL:", res.get("url"))</code></pre>
 </details>`,
     keyboard: keyboard([
       [

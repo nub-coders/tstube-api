@@ -53,6 +53,8 @@ export async function cmdStats(api: TelegramApi, msg: TgMessage): Promise<void> 
     await sendSmartRichMessage(api, chatId, statsHtml, {
       replyMarkup: keyboard([
         [btn('🔄 Refresh Stats', { callback_data: 'admin_refresh_stats', style: ButtonStyle.PRIMARY })],
+        [btn('🌐 Proxy Stats', { callback_data: 'admin_refresh_proxystats' })],
+        [btn('📱 Back to Menu', { callback_data: 'back_menu' })],
       ]),
     });
   } catch (e) {
@@ -85,6 +87,8 @@ export async function cmdProxyStats(api: TelegramApi, msg: TgMessage): Promise<v
     await sendSmartRichMessage(api, chatId, html, {
       replyMarkup: keyboard([
         [btn('🔄 Refresh Proxy Stats', { callback_data: 'admin_refresh_proxystats', style: ButtonStyle.PRIMARY })],
+        [btn('⚙️ Admin Panel', { callback_data: 'admin_panel' })],
+        [btn('📱 Back to Menu', { callback_data: 'back_menu' })],
       ]),
     });
   } catch (e) {
@@ -100,7 +104,12 @@ export async function cmdUser(api: TelegramApi, msg: TgMessage): Promise<void> {
   if (msg.chat.type !== 'private') return;
   if (!isAdmin(msg.from!.id)) return deny(api, msg);
   try {
-    const targetUserId = msg.text!.split(/\s+/)[1]!;
+    const parts = (msg.text ?? '').trim().split(/\s+/);
+    if (parts.length < 2 || !parts[1]) {
+      await sendSmartRichMessage(api, msg.chat.id, '<blockquote>ℹ️ <b>Usage:</b> <code>/user &lt;user_id&gt;</code></blockquote>');
+      return;
+    }
+    const targetUserId = parts[1];
     const token = await getUserToken(targetUserId);
     const requestCount = await getUserRequestCount(targetUserId);
     const failedCount = await getFailedRequestCount(targetUserId);
@@ -111,7 +120,7 @@ export async function cmdUser(api: TelegramApi, msg: TgMessage): Promise<void> {
       await sendSmartRichMessage(
         api,
         msg.chat.id,
-        `<blockquote>❌ <b>Not Found:</b> User <code>${targetUserId}</code> has no registered token.</blockquote>`,
+        `<blockquote>❌ <b>Not Found:</b> User <code>${escapeHtml(targetUserId)}</code> has no registered token.</blockquote>`,
       );
     }
   } catch (e) {
@@ -127,9 +136,17 @@ export async function cmdGrant(api: TelegramApi, msg: TgMessage): Promise<void> 
   if (msg.chat.type !== 'private') return;
   if (!isAdmin(msg.from!.id)) return deny(api, msg);
   try {
-    const parts = msg.text!.split(/\s+/);
-    const targetUserId = Number.parseInt(parts[1]!, 10);
-    const amount = Number.parseInt(parts[2]!, 10);
+    const parts = (msg.text ?? '').trim().split(/\s+/);
+    if (parts.length < 3 || !parts[1] || !parts[2]) {
+      await sendSmartRichMessage(api, msg.chat.id, '<blockquote>ℹ️ <b>Usage:</b> <code>/grant &lt;user_id&gt; &lt;amount&gt;</code></blockquote>');
+      return;
+    }
+    const targetUserId = Number.parseInt(parts[1], 10);
+    const amount = Number.parseInt(parts[2], 10);
+    if (!Number.isSafeInteger(targetUserId) || targetUserId <= 0 || !Number.isSafeInteger(amount) || amount <= 0) {
+      await sendSmartRichMessage(api, msg.chat.id, '<blockquote>❌ <b>Error:</b> Please provide a valid numeric user ID and positive grant amount.</blockquote>');
+      return;
+    }
     const [currentCount, newCount] = await grantUserRequests(targetUserId, amount);
     await sendSmartRichMessage(api, msg.chat.id, grantCard(targetUserId, amount, currentCount, newCount));
   } catch (e) {
@@ -145,7 +162,16 @@ export async function cmdRevokeAdmin(api: TelegramApi, msg: TgMessage): Promise<
   if (msg.chat.type !== 'private') return;
   if (!isAdmin(msg.from!.id)) return deny(api, msg);
   try {
-    const targetUserId = Number.parseInt(msg.text!.split(/\s+/)[1]!, 10);
+    const parts = (msg.text ?? '').trim().split(/\s+/);
+    if (parts.length < 2 || !parts[1]) {
+      await sendSmartRichMessage(api, msg.chat.id, '<blockquote>ℹ️ <b>Usage:</b> <code>/revoke &lt;user_id&gt;</code></blockquote>');
+      return;
+    }
+    const targetUserId = Number.parseInt(parts[1], 10);
+    if (!Number.isSafeInteger(targetUserId) || targetUserId <= 0) {
+      await sendSmartRichMessage(api, msg.chat.id, '<blockquote>❌ <b>Error:</b> Please provide a valid numeric user ID.</blockquote>');
+      return;
+    }
     await revokeUserToken(targetUserId);
     await sendSmartRichMessage(api, msg.chat.id, revokeAdminCard(targetUserId));
   } catch (e) {
@@ -184,7 +210,7 @@ export async function cmdErrors(api: TelegramApi, msg: TgMessage): Promise<void>
   let count = 15;
   if (parts.length > 1) {
     const parsed = Number.parseInt(parts[1]!, 10);
-    count = Number.isNaN(parsed) ? 15 : Math.min(parsed, 50);
+    count = Number.isNaN(parsed) ? 15 : Math.max(1, Math.min(parsed, 50));
   }
 
   try {
@@ -227,7 +253,7 @@ const BROADCAST_HELP = `<h1>📢 Broadcast Command</h1>
   3. Real-time progress will stream via draft updates until delivery completes.</p>
 </details>`;
 
-const BROADCAST_BLOCKED = ['user not found', 'blocked', 'forbidden', 'chat not found'];
+const BROADCAST_BLOCKED = ['user not found', 'blocked', 'forbidden', 'chat not found', 'bot was blocked'];
 
 export async function cmdBroadcast(api: TelegramApi, msg: TgMessage): Promise<void> {
   const userId = msg.from!.id;
@@ -247,7 +273,7 @@ export async function cmdBroadcast(api: TelegramApi, msg: TgMessage): Promise<vo
     const userKeys = await scanKeys('user_token:*');
     const storedUserIds = userKeys
       .map((k) => Number.parseInt(k.split(':')[1]!, 10))
-      .filter((n) => !Number.isNaN(n));
+      .filter((n) => !Number.isNaN(n) && n > 0);
     const totalUsers = storedUserIds.length;
 
     if (totalUsers === 0) {
@@ -278,28 +304,36 @@ export async function cmdBroadcast(api: TelegramApi, msg: TgMessage): Promise<vo
     for (const target of storedUserIds) {
       try {
         if (dropAuthor) {
-          if (reply.text) {
-            await api.sendMessage({ chat_id: target, text: reply.text });
-          } else if (reply.photo?.length) {
-            await api.sendPhoto({
-              chat_id: target,
-              photo: reply.photo[reply.photo.length - 1]!.file_id,
-              caption: reply.caption ?? '',
-            });
-          } else if (reply.video) {
-            await api.sendVideo({ chat_id: target, video: reply.video.file_id, caption: reply.caption ?? '' });
-          } else if (reply.document) {
-            await api.sendDocument({
-              chat_id: target,
-              document: reply.document.file_id,
-              caption: reply.caption ?? '',
-            });
-          } else {
-            await api.forwardMessage({
+          try {
+            await api.copyMessage({
               chat_id: target,
               from_chat_id: msg.chat.id,
               message_id: reply.message_id,
             });
+          } catch {
+            if (reply.text) {
+              await api.sendMessage({ chat_id: target, text: reply.text });
+            } else if (reply.photo?.length) {
+              await api.sendPhoto({
+                chat_id: target,
+                photo: reply.photo[reply.photo.length - 1]!.file_id,
+                caption: reply.caption ?? '',
+              });
+            } else if (reply.video) {
+              await api.sendVideo({ chat_id: target, video: reply.video.file_id, caption: reply.caption ?? '' });
+            } else if (reply.document) {
+              await api.sendDocument({
+                chat_id: target,
+                document: reply.document.file_id,
+                caption: reply.caption ?? '',
+              });
+            } else {
+              await api.forwardMessage({
+                chat_id: target,
+                from_chat_id: msg.chat.id,
+                message_id: reply.message_id,
+              });
+            }
           }
         } else {
           await api.forwardMessage({
@@ -310,19 +344,6 @@ export async function cmdBroadcast(api: TelegramApi, msg: TgMessage): Promise<vo
         }
 
         sentCount += 1;
-
-        if (sentCount % 10 === 0 || sentCount === totalUsers) {
-          await sendRichDraft(
-            api,
-            msg.chat.id,
-            draftId,
-            `<blockquote>📢 <b>Broadcast Progress</b><br/>
-✅ Delivered: <b>${comma(sentCount)}</b> / ${comma(totalUsers)}<br/>
-❌ Failed: <b>${comma(failedCount)}</b><br/>
-🗑 Removed Inactive: <b>${comma(removedUsers)}</b><br/>
-⏳ Transmission in progress...</blockquote>`,
-          );
-        }
       } catch (e) {
         const errStr = String(e).toLowerCase();
         if (BROADCAST_BLOCKED.some((k) => errStr.includes(k))) {
@@ -335,7 +356,28 @@ export async function cmdBroadcast(api: TelegramApi, msg: TgMessage): Promise<vo
           }
         }
         failedCount += 1;
+
+        if (errStr.includes('too many requests') || errStr.includes('retry after')) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        }
       }
+
+      const processed = sentCount + failedCount;
+      if (processed % 10 === 0 || processed === totalUsers) {
+        await sendRichDraft(
+          api,
+          msg.chat.id,
+          draftId,
+          `<blockquote>📢 <b>Broadcast Progress</b><br/>
+✅ Delivered: <b>${comma(sentCount)}</b> / ${comma(totalUsers)}<br/>
+❌ Failed: <b>${comma(failedCount)}</b><br/>
+🗑 Removed Inactive: <b>${comma(removedUsers)}</b><br/>
+⏳ Transmission in progress...</blockquote>`,
+        );
+      }
+
+      // Safe pace to stay comfortably under Telegram's broadcast limits
+      await new Promise((resolve) => setTimeout(resolve, 35));
     }
 
     const successPct = totalUsers ? Math.round((sentCount / totalUsers) * 1000) / 10 : 0.0;

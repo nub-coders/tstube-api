@@ -106,11 +106,18 @@ export class TelegramApi {
     return !this.richUnsupported;
   }
 
-  /** Mark rich messages as unavailable after a "method not found" response. */
+  /** Mark rich messages as unavailable after a "method not found" or missing text response. */
   private noteRichFailure(e: unknown): void {
     if (e instanceof BotApiError) {
       const d = e.description.toLowerCase();
-      if (e.errorCode === 404 || d.includes('method not found') || d.includes('unknown method')) {
+      if (
+        e.errorCode === 404 ||
+        d.includes('method not found') ||
+        d.includes('unknown method') ||
+        d.includes('message text is empty') ||
+        d.includes('text is empty') ||
+        d.includes('text is required')
+      ) {
         this.richUnsupported = true;
       }
     }
@@ -238,6 +245,15 @@ export class TelegramApi {
     message_id: number;
   }): Promise<TgMessage> {
     return this.call<TgMessage>('forwardMessage', params as unknown as Json);
+  }
+
+  copyMessage(params: {
+    chat_id: number | string;
+    from_chat_id: number | string;
+    message_id: number;
+    caption?: string;
+  }): Promise<{ message_id: number }> {
+    return this.call<{ message_id: number }>('copyMessage', params as unknown as Json);
   }
 
   answerCallbackQuery(params: {

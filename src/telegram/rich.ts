@@ -85,6 +85,7 @@ export function stripRichHtml(html: string): string {
   let out = html;
   out = out.replace(/<br\s*\/?>/gi, '\n');
   out = out.replace(/<\/(p|h[1-6]|div|tr|li|blockquote|details|summary|tg-button-row)>/gi, '\n');
+  out = out.replace(/<tg-button[^>]*\burl=["']([^"']+)["'][^>]*>(.*?)<\/tg-button>/gi, '[$2: $1] ');
   out = out.replace(/<tg-button[^>]*>(.*?)<\/tg-button>/gi, '[$1] ');
   out = out.replace(/<li[^>]*>/gi, '• ');
   out = out.replace(/<\/t[dh]>/gi, '  ');

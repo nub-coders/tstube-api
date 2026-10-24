@@ -150,7 +150,10 @@ export function menuContent(
   return buildStartCard(username, token, isGrp, false);
 }
 
-export const MENU_BODY = buildStartCard('User', 'YOUR_TOKEN', false, false).html;
+export function getMenuBody(): string {
+  return buildStartCard('User', 'YOUR_TOKEN', false, false).html;
+}
+export const MENU_BODY = '';
 
 // ── /ping ───────────────────────────────────────────────────────
 

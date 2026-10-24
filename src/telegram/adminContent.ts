@@ -23,25 +23,15 @@ async function resolveUsername(api: TelegramApi, uid: string): Promise<string> {
   try {
     const chatPromise = api.getChat(Number(uid));
     const timeoutPromise = new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('getChat timeout')), 800),
+      setTimeout(() => reject(new Error('getChat timeout')), 1500),
     );
     const chat = await Promise.race([chatPromise, timeoutPromise]);
     const name = `${chat.first_name ?? ''} ${chat.last_name ?? ''}`.trim() || `User ${uid}`;
     usernameCache.set(uid, name);
     return name;
   } catch {
-    const fallback = `User ${uid}`;
-    usernameCache.set(uid, fallback);
-    return fallback;
+    return `User ${uid}`;
   }
-}
-
-function median(values: number[]): number {
-  if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  if (sorted.length % 2 === 1) return sorted[mid]!;
-  return (sorted[mid - 1]! + sorted[mid]!) / 2;
 }
 
 /** Parse `/info` reply into a map, coercing numeric fields like redis-py does. */
@@ -150,35 +140,23 @@ export async function buildStats(
   const regularTotal = totalUsers - totalAdminCount;
 
   const avgRequests = pyRoundStr(totalRequestsToday / Math.max(activeUsers, 1), 2);
-  const medianRequests = Math.trunc(median(requestCounts));
   const peakRequests = requestCounts.length ? Math.max(...requestCounts) : 0;
 
   const heavyUsers = requestCounts.filter((c) => c >= 500).length;
   const moderateUsers = requestCounts.filter((c) => c >= 100 && c < 500).length;
   const lightUsers = requestCounts.filter((c) => c >= 10 && c < 100).length;
   const idleUsers = requestCounts.filter((c) => c < 10).length;
-  const inactiveUsers = totalUsers - activeUsers;
-
-  // Zero network round-trips: compute new users with 0 requests today in-memory
-  const activeUidSet = new Set(userRequestData.map(([uid]) => uid));
-  let newToday = 0;
-  for (const key of userKeys) {
-    const uid = key.split(':')[1]!;
-    if (!activeUidSet.has(uid)) newToday += 1;
-  }
 
   const botUptime = getReadableUptime((Date.now() - ADMIN_BOT_START_TIME) / 1000);
 
   // Parallelize failure keys, database size, redis info, and global failed count
   const [
-    statusKeys,
     pathKeys,
     failUserKeys,
     totalKeys,
     redis_info,
     globalFailed,
   ] = await Promise.all([
-    scanKeys('failed_by_status:*'),
     scanKeys('failed_by_path:*'),
     scanKeys('user_failed:*'),
     redis().dbsize().catch(() => userKeys.length + requestKeys.length),
@@ -187,39 +165,28 @@ export async function buildStats(
   ]);
 
   // Batch-fetch failure values concurrently
-  const [statusVals, pathVals, failUserVals] = await Promise.all([
-    mgetInts(statusKeys),
+  const [pathVals, failUserVals] = await Promise.all([
     mgetInts(pathKeys),
     mgetInts(failUserKeys),
   ]);
-
-  const statusBreakdown: Array<[string, number]> = statusKeys.map((sk, idx) => [
-    sk.split(':')[1]!,
-    statusVals[idx]!,
-  ]);
-  statusBreakdown.sort((a, b) => b[1] - a[1]);
 
   const pathBreakdown: Array<[string, number]> = pathKeys.map((pk, idx) => [
     pk.split(':').slice(1).join(':'),
     pathVals[idx]!,
   ]);
   pathBreakdown.sort((a, b) => b[1] - a[1]);
-  const topFailPaths = pathBreakdown.slice(0, 5);
+  const topFailPaths = pathBreakdown.slice(0, 3);
 
   const userFailData: Array<[string, number]> = failUserKeys.map((fk, idx) => [
     fk.split(':')[1]!,
     failUserVals[idx]!,
   ]);
   userFailData.sort((a, b) => b[1] - a[1]);
-  const topFailUsers = userFailData.slice(0, 5);
+  const topFailUsers = userFailData.slice(0, 3);
 
   const redisMemory = String(redis_info.used_memory_human ?? 'N/A');
   const redisPeakMemory = String(redis_info.used_memory_peak_human ?? 'N/A');
-  const redisUptime = Number(redis_info.uptime_in_seconds ?? 0);
-  const redisUptimeStr = getReadableUptime(redisUptime);
-  const connectedClients = redis_info.connected_clients ?? 'N/A';
   const opsPerSec = redis_info.instantaneous_ops_per_sec ?? 'N/A';
-  const totalCommands = redis_info.total_commands_processed ?? 'N/A';
 
   const hits = Number(redis_info.keyspace_hits ?? 0);
   const misses = Number(redis_info.keyspace_misses ?? 0);
@@ -241,18 +208,13 @@ export async function buildStats(
   const totalAll = totalRequestsToday + globalFailed;
   const successRate = pyRoundStr(((totalAll - globalFailed) / Math.max(totalAll, 1)) * 100, 1);
 
-  const statusTableRows =
-    statusBreakdown
-      .slice(0, 6)
-      .map(([code, cnt]) => `<tr><td><code>${escapeHtml(code)}</code></td><td><b>${comma(cnt)}</b></td></tr>`)
-      .join('') || "<tr><td colspan='2'>None today ✨</td></tr>";
   const pathTableRows =
     topFailPaths
       .map(([p, cnt]) => `<tr><td><code>${escapeHtml(p)}</code></td><td><b>${comma(cnt)}</b></td></tr>`)
       .join('') || "<tr><td colspan='2'>None today ✨</td></tr>";
 
-  // Resolve top fail and top active usernames concurrently
-  const topUsers = userRequestData.slice(0, 10);
+  // Resolve top fail and top active usernames concurrently (slice to 5)
+  const topUsers = userRequestData.slice(0, 5);
 
   const [resolvedFailUsers, resolvedTopUsers] = await Promise.all([
     Promise.all(
@@ -278,51 +240,25 @@ export async function buildStats(
   const failUserTableRows = failUserRows.join('') || "<tr><td colspan='2'>None today ✨</td></tr>";
 
   const topUsersRows = resolvedTopUsers.map(([uid, count, name], idx) => {
-    const adminBadge = isAdmin(Number(uid)) ? '👑 Admin' : '👤 User';
+    const adminBadge = isAdmin(Number(uid)) ? '👑' : '👤';
     const limit = isAdmin(Number(uid)) ? config().ADMIN_LIMIT : config().DAILY_LIMIT;
     const pct = pyRoundStr((count / limit) * 100, 1);
-    return `<tr><td>${idx + 1}</td><td>${adminBadge} <b>${escapeHtml(name)}</b><br/><code>${uid}</code></td><td><b>${comma(count)}</b> / ${comma(limit)}</td><td><b>${pct}%</b></td></tr>`;
+    return `<tr><td>${idx + 1}</td><td>${adminBadge} <b>${escapeHtml(name)}</b> (<code>${uid}</code>)</td><td><b>${comma(count)}</b> / ${comma(limit)} (${pct}%)</td></tr>`;
   });
   const topUsersTable =
-    topUsersRows.join('') || "<tr><td colspan='4'>No active users today</td></tr>";
-
-  const cmdCountStr =
-    typeof totalCommands === 'number' ? comma(totalCommands) : String(totalCommands);
+    topUsersRows.join('') || "<tr><td colspan='3'>No active users today</td></tr>";
 
   const wsStats = await wsStatsTask;
-  let webshareSection = '';
+  let webshareSummary: string;
   if (websharePool.enabled) {
     const poolSize = websharePool.size;
-    const poolSummary = websharePool.summary();
-    const poolStatus = poolSize > 0
-      ? `🟢 <b>Operational</b> (${poolSize} exits${poolSummary ? ` · ${escapeHtml(poolSummary)}` : ''})`
-      : '🟠 <b>Empty / Initializing</b>';
-    const usedStr = wsStats ? wsStats.usedFormatted : 'Loading...';
-    const leftStr = wsStats ? wsStats.remainingFormatted : 'Loading...';
-    const quotaStr = wsStats ? wsStats.limitFormatted : 'Loading...';
-    const reqStr = wsStats && wsStats.totalRequests > 0
-      ? `${comma(wsStats.totalRequests)} (${pyRoundStr((wsStats.successfulRequests / wsStats.totalRequests) * 100, 1)}% success)`
-      : (wsStats ? '0 requests' : '—');
-
-    webshareSection = `
-<h2>Webshare Proxy Pool &amp; Bandwidth</h2>
-<table border="1">
-  <tr><th>Metric</th><th>Value</th></tr>
-  <tr><td><b>Tier Status</b></td><td>${poolStatus}</td></tr>
-  <tr><td><b>Bandwidth Used</b></td><td><b>${usedStr}</b></td></tr>
-  <tr><td><b>Bandwidth Left</b></td><td><b>${leftStr}</b></td></tr>
-  <tr><td><b>Monthly Quota</b></td><td>${quotaStr}</td></tr>
-  <tr><td><b>Proxy Requests</b></td><td>${reqStr}</td></tr>
-</table>
-`;
+    const usedStr = wsStats ? wsStats.usedFormatted : '…';
+    const quotaStr = wsStats ? wsStats.limitFormatted : '…';
+    webshareSummary = poolSize > 0
+      ? `🟢 <b>${poolSize} exits</b> · Used: <b>${usedStr}</b> / ${quotaStr}`
+      : '🟠 <b>Initializing</b>';
   } else {
-    webshareSection = `
-<h2>Webshare Proxy Pool &amp; Bandwidth</h2>
-<table border="1">
-  <tr><th>Configuration</th><th>Status</th></tr>
-  <tr><td><b>Proxy Tier</b></td><td>⚪ Disabled (<code>WEBSHARE_API_KEY</code> unset)</td></tr>
-</table>
-`;
+    webshareSummary = '⚪ Disabled';
   }
 
   const ts = now.toISOString().slice(0, 19).replace('T', ' ');
@@ -330,27 +266,14 @@ export async function buildStats(
   const fullHtml = `<h1>Bot Statistics Dashboard</h1>
 <blockquote>Generated: <b>${ts} UTC</b> | Bot Uptime: <code>${botUptime}</code></blockquote>
 
-<h2>User Metrics</h2>
+<h2>Traffic &amp; Users</h2>
 <table border="1">
-  <tr><th>Metric</th><th>Count</th></tr>
-  <tr><td><b>Total Registered</b></td><td>${comma(totalUsers)}</td></tr>
-  <tr><td><b>Active Today</b></td><td>${comma(activeUsers)} (${userUtilization}%)</td></tr>
-  <tr><td><b>Inactive Today</b></td><td>${comma(inactiveUsers)}</td></tr>
-  <tr><td><b>New (0 Requests)</b></td><td>${comma(newToday)}</td></tr>
-  <tr><td><b>Admin Users</b></td><td>${totalAdminCount} (${adminActive} active)</td></tr>
-  <tr><td><b>Regular Users</b></td><td>${comma(regularTotal)} (${regularActive} active)</td></tr>
-</table>
-
-<h2>Request Analytics</h2>
-<table border="1">
-  <tr><th>Metric</th><th>Value</th></tr>
-  <tr><td><b>Total Today</b></td><td><b>${comma(totalRequestsToday)}</b></td></tr>
-  <tr><td><b>Admin Requests</b></td><td>${comma(adminRequests)}</td></tr>
-  <tr><td><b>Regular Requests</b></td><td>${comma(regularRequests)}</td></tr>
-  <tr><td><b>Avg / Active User</b></td><td>${avgRequests}</td></tr>
-  <tr><td><b>Median / User</b></td><td>${medianRequests}</td></tr>
-  <tr><td><b>Peak Single User</b></td><td>${comma(peakRequests)}</td></tr>
-  <tr><td><b>Capacity Used</b></td><td>${capacityUsage}%</td></tr>
+  <tr><th>Metric</th><th>Total</th><th>Active Today</th></tr>
+  <tr><td><b>Registered Users</b></td><td>${comma(totalUsers)}</td><td>${comma(activeUsers)} (${userUtilization}%)</td></tr>
+  <tr><td><b>Regular Users</b></td><td>${comma(regularTotal)}</td><td>${regularActive} active</td></tr>
+  <tr><td><b>Admin Users</b></td><td>${totalAdminCount}</td><td>${adminActive} active</td></tr>
+  <tr><td><b>Requests Today</b></td><td colspan="2"><b>${comma(totalRequestsToday)}</b> (avg ${avgRequests}/user, peak ${comma(peakRequests)})</td></tr>
+  <tr><td><b>Success Rate</b></td><td colspan="2"><b>${successRate}%</b> (${comma(globalFailed)} failed)</td></tr>
 </table>
 
 <h2>Activity Tiers</h2>
@@ -362,49 +285,25 @@ export async function buildStats(
   <tr><td>⚪ <b>Idle</b></td><td>&lt;10 req</td><td>${idleUsers}</td></tr>
 </table>
 
-<h2>Top 10 Users Today</h2>
+<h2>Top 5 Users Today</h2>
 <table border="1">
-  <tr><th>#</th><th>User</th><th>Requests</th><th>Quota</th></tr>
+  <tr><th>#</th><th>User</th><th>Requests &amp; Quota</th></tr>
   ${topUsersTable}
 </table>
 
-<h2>Redis Infrastructure</h2>
+<h2>Infrastructure &amp; Health</h2>
 <table border="1">
-  <tr><th>Property</th><th>Status</th></tr>
-  <tr><td><b>Used Memory</b></td><td>${redisMemory} (Peak: ${redisPeakMemory})</td></tr>
-  <tr><td><b>Redis Uptime</b></td><td>${redisUptimeStr}</td></tr>
-  <tr><td><b>Clients</b></td><td>${connectedClients}</td></tr>
-  <tr><td><b>Ops / Sec</b></td><td>${opsPerSec}</td></tr>
-  <tr><td><b>Commands</b></td><td>${cmdCountStr}</td></tr>
-  <tr><td><b>Hit Rate</b></td><td>${hitRate}% (${comma(hits)} hits / ${comma(misses)} misses)</td></tr>
-  <tr><td><b>Total Keys</b></td><td>${comma(totalKeys)}</td></tr>
+  <tr><th>Component</th><th>Status</th></tr>
+  <tr><td><b>System Load</b></td><td>${loadIndicator} (${capacityUsage}% cap)</td></tr>
+  <tr><td><b>Redis Memory</b></td><td>${redisMemory} (Peak: ${redisPeakMemory})</td></tr>
+  <tr><td><b>Redis Ops</b></td><td>${opsPerSec} ops/s · ${comma(totalKeys)} keys (${hitRate}% hit)</td></tr>
+  <tr><td><b>Proxy Pool</b></td><td>${webshareSummary}</td></tr>
+  <tr><td><b>Daily Limits</b></td><td>User: ${comma(config().DAILY_LIMIT)} · Admin: ${comma(config().ADMIN_LIMIT)}</td></tr>
 </table>
-${webshareSection}
-<h2>System Health &amp; Rate Limits</h2>
-<table border="1">
-  <tr><th>Configuration</th><th>Value</th></tr>
-  <tr><td><b>Regular Limit</b></td><td>${comma(config().DAILY_LIMIT)} req/day</td></tr>
-  <tr><td><b>Admin Limit</b></td><td>${comma(config().ADMIN_LIMIT)} req/day</td></tr>
-  <tr><td><b>Search API</b></td><td>Unlimited</td></tr>
-  <tr><td><b>System Load</b></td><td>${loadIndicator}</td></tr>
-  <tr><td><b>Active Ratio</b></td><td>${userUtilization}%</td></tr>
-  <tr><td><b>Cache Status</b></td><td><b>Operational</b></td></tr>
-</table>
-
-<h2>Failure Analytics</h2>
-<table border="1">
-  <tr><th>Metric</th><th>Value</th></tr>
-  <tr><td><b>Total Failed</b></td><td><b>${comma(globalFailed)}</b></td></tr>
-  <tr><td><b>Success Rate</b></td><td><b>${successRate}%</b></td></tr>
-</table>
+<blockquote>💡 <i>Tap <b>Proxy Stats</b> below for full datacenter proxy bandwidth &amp; country metrics.</i></blockquote>
 
 <details>
-  <summary><b>Error Details &amp; Failing Endpoints</b></summary>
-  <h3>By Status Code</h3>
-  <table border="1">
-    <tr><th>Status</th><th>Count</th></tr>
-    ${statusTableRows}
-  </table>
+  <summary><b>Error &amp; Failure Breakdown</b></summary>
   <h3>Top Failing Paths</h3>
   <table border="1">
     <tr><th>Path</th><th>Failures</th></tr>
@@ -437,13 +336,16 @@ export function userInfoCard(
     ? `Yes (${comma(config().ADMIN_LIMIT)} req/day)`
     : `No (${comma(config().DAILY_LIMIT)} req/day)`;
 
+  const safeUid = escapeHtml(targetUserId);
+  const safeToken = escapeHtml(token);
+
   return `<h1>User Information</h1>
-<blockquote>Account profile and activity metrics for user <code>${targetUserId}</code>.</blockquote>
+<blockquote>Account profile and activity metrics for user <code>${safeUid}</code>.</blockquote>
 
 <table border="1">
   <tr><th>Field</th><th>Value</th></tr>
-  <tr><td><b>User ID</b></td><td><code>${targetUserId}</code></td></tr>
-  <tr><td><b>Token</b></td><td><code>${token}</code></td></tr>
+  <tr><td><b>User ID</b></td><td><code>${safeUid}</code></td></tr>
+  <tr><td><b>Token</b></td><td><code>${safeToken}</code></td></tr>
   <tr><td><b>Admin Status</b></td><td>${isAdm}</td></tr>
 </table>
 
