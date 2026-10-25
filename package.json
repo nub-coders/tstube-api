@@ -5,7 +5,7 @@
   "type": "module",
   "description": "TypeScript replacement for the ytube_api FastAPI service + Telegram bot",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.19.0"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/copy-assets.mjs",
@@ -18,12 +18,12 @@
   "dependencies": {
     "grammy": "^1.46.0",
     "ioredis": "^5.4.1",
-    "undici": "^8.10.2",
+    "undici": "^8.12.3",
     "youtubei.js": "18.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   }
 }

@@ -1,5 +1,5 @@
 /**
- * Key-pool health tests: a quota-dead key is skipped until UTC midnight and the
+ * Key-pool health tests: a quota-dead key is skipped until Pacific midnight and the
  * request retries through a live key; an invalid key is removed outright; when
  * every key is dead the pool short-circuits to empty without touching the
  * network; transient failures (5xx, network) mark nothing.
@@ -148,6 +148,61 @@ describe('Data API key pool', () => {
     calls = [];
     expect(await yt.fetchResults('song', 1)).toEqual([]);
     expect(calls).toHaveLength(0); // no probes once the pool is dry
+  });
+
+  it.each([
+    ['winter', '2026-01-31T23:30:00Z', '2026-02-01T08:00:00Z'],
+    ['summer', '2026-06-30T23:30:00Z', '2026-07-01T07:00:00Z'],
+    ['before spring transition', '2026-03-07T23:30:00Z', '2026-03-08T08:00:00Z'],
+    ['spring transition day', '2026-03-08T23:30:00Z', '2026-03-09T07:00:00Z'],
+    ['before fall transition', '2026-10-31T23:30:00Z', '2026-11-01T07:00:00Z'],
+    ['fall transition day', '2026-11-01T23:30:00Z', '2026-11-02T08:00:00Z'],
+    ['year boundary', '2026-12-31T23:30:00Z', '2027-01-01T08:00:00Z'],
+  ])('suppresses UTC probes and revives at exact Pacific midnight: %s', async (_, exhaustedAt, resetAt) => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(exhaustedAt));
+    const yt = await fresh();
+    route = () => ({ status: 403, body: quotaError });
+
+    expect(await yt.fetchResults('song', 1)).toEqual([]);
+    expect(calls.map((c) => c.key)).toEqual(['KEYA', 'KEYB', 'KEYC']);
+
+    calls = [];
+    const utcMidnight = (Math.floor(Date.parse(exhaustedAt) / 86_400_000) + 1) * 86_400_000;
+    clock.mockReturnValue(utcMidnight);
+    // Google has not reset yet. Probing here would extend the old UTC cooldown
+    // into the replenished Pacific quota day.
+    expect(await yt.fetchResults('song', 1)).toEqual([]);
+    expect(calls).toHaveLength(0);
+
+    route = successRoute;
+    clock.mockReturnValue(Date.parse(resetAt) - 1);
+    expect(await yt.fetchResults('song', 1)).toEqual([]);
+    expect(calls).toHaveLength(0);
+
+    clock.mockReturnValue(Date.parse(resetAt));
+    expect(await yt.fetchResults('song', 1)).toHaveLength(1);
+    expect(calls.map((c) => c.key)).toEqual(['KEYA', 'KEYA']);
+  });
+
+  it.each([
+    ['winter', '2026-01-15T00:01:00Z', '2026-01-15T08:00:00Z'],
+    ['summer', '2026-10-25T00:01:00Z', '2026-10-25T07:00:00Z'],
+  ])('revives keys exhausted after UTC midnight at the same-day Pacific reset: %s', async (_, exhaustedAt, resetAt) => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(exhaustedAt));
+    const yt = await fresh();
+    route = () => ({ status: 403, body: quotaError });
+    expect(await yt.fetchResults('song', 1)).toEqual([]);
+    expect(calls).toHaveLength(3);
+
+    calls = [];
+    route = successRoute;
+    clock.mockReturnValue(Date.parse(resetAt) - 1);
+    expect(await yt.fetchResults('song', 1)).toEqual([]);
+    expect(calls).toHaveLength(0);
+
+    clock.mockReturnValue(Date.parse(resetAt));
+    expect(await yt.fetchResults('song', 1)).toHaveLength(1);
+    expect(calls.map((c) => c.key)).toEqual(['KEYA', 'KEYA']);
   });
 
   it('returns {} from getVideoById when all keys are dead', async () => {

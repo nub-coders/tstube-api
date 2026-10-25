@@ -269,6 +269,16 @@ export interface ResolveMeta {
 }
 
 const RESOLVED_STREAM_CACHE = new BoundedCache<ResolveMeta>(2048, 1800);
+const ACTIVE_STREAM_RESOLVES = new Map<string, Set<{ invalidated: boolean }>>();
+
+/** Forget revoked URLs and prevent an older player request from restoring them. */
+export function invalidateResolvedStream(urlOrId: string): void {
+  const vid = extractId(urlOrId);
+  if (!vid) return;
+  RESOLVED_STREAM_CACHE.delete(vid);
+  INFO_CACHE.delete(vid);
+  for (const attempt of ACTIVE_STREAM_RESOLVES.get(vid) ?? []) attempt.invalidated = true;
+}
 
 async function fetchInfo(vid: string): Promise<any | null> {
   const cached = INFO_CACHE.get(vid);
@@ -298,6 +308,34 @@ interface ResolveAttempt {
   geoBlocked?: boolean;
   /** availableCountries from the player microformat, when present. */
   microCountries?: string[];
+}
+
+type PlayerFailure = 'content' | 'proxy' | 'unknown';
+
+function playabilityFailure(status: unknown, reason: unknown): PlayerFailure {
+  if (typeof status !== 'string' || status === 'OK') return 'unknown';
+  // Private, removed, age-limited and region-limited videos say nothing about
+  // exit health. Bot challenges and rate/IP blocks do depend on the exit.
+  return /(?:confirm|verify).{0,30}(?:not a bot|human)|unusual traffic|too many requests|rate.?limit|(?:ip|address).{0,30}block/i.test(String(reason ?? ''))
+    ? 'proxy'
+    : 'content';
+}
+
+function playerExceptionFailure(error: unknown): PlayerFailure {
+  // youtubei.js throws for ERROR playability and retains the player status
+  // in InnertubeError.info instead of returning a VideoInfo object.
+  const info = (error as { info?: { status?: unknown; reason?: unknown } } | null)?.info;
+  if (info?.status) return playabilityFailure(info.status, info.reason);
+  const message = String(error);
+  if (/video (?:is unavailable|is private|has been removed)|available in (?:your|this) country/i.test(message)) return 'content';
+  return /timed? ?out|fetch failed|network|econn|enotfound|eai_again|socket|proxy|tls|certificate|status code (?:401|403|407|429|5\d\d)/i.test(message)
+    ? 'proxy'
+    : 'unknown';
+}
+
+interface ProxiedResolveAttempt {
+  meta: ResolveMeta | null;
+  failure: PlayerFailure;
 }
 
 /** Allowlist/blacklist of countries a video is playable in. */
@@ -374,7 +412,9 @@ async function attemptResolveWithProxiedInnertube(
   proxyUrl: string,
   yt: Innertube,
   deadline: number,
-): Promise<ResolveMeta | null> {
+): Promise<ProxiedResolveAttempt> {
+  let contentFailure = false;
+  let proxyFailure = false;
   for (const client of PROXY_CLIENT_LADDER) {
     if (Date.now() >= deadline) break;
     try {
@@ -384,16 +424,24 @@ async function attemptResolveWithProxiedInnertube(
         budget,
         'proxied getBasicInfo',
       );
-      if (info.playability_status?.status !== 'OK') continue;
+      if (info.playability_status?.status !== 'OK') {
+        const failure = playabilityFailure(info.playability_status?.status, info.playability_status?.reason);
+        contentFailure ||= failure === 'content';
+        proxyFailure ||= failure === 'proxy';
+        continue;
+      }
+      contentFailure = true; // A playable player response proves this exit is reachable.
       const [muxedUrl, audioUrl] = await extractStreamUrls(yt, info);
       if (muxedUrl || audioUrl) {
-        return { urls: [muxedUrl, audioUrl], proxyUrl };
+        return { meta: { urls: [muxedUrl, audioUrl], proxyUrl }, failure: 'content' };
       }
-    } catch {
-      /* next client */
+    } catch (error) {
+      const failure = playerExceptionFailure(error);
+      contentFailure ||= failure === 'content';
+      proxyFailure ||= failure === 'proxy';
     }
   }
-  return null;
+  return { meta: null, failure: contentFailure ? 'content' : proxyFailure ? 'proxy' : 'unknown' };
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -470,7 +518,7 @@ async function resolveViaProxyTier(
 
   // One exit's full attempt: bootstrap (a cold exit pays session setup here, a
   // warm one returns instantly) then probe the client ladder. Never throws — a
-  // failure resolves to null and marks the exit bad so the race can move on.
+  // content failure resolves to null while retaining the reachable exit.
   const attempt = async (proxy: WebshareProxy): Promise<ResolveMeta | null> => {
     log.info(
       `[YTJS] ${vid} Webshare exit ${proxy.address}:${proxy.port} (${proxy.countryCode || '??'})` +
@@ -479,18 +527,24 @@ async function resolveViaProxyTier(
     try {
       const bootBudget = Math.min(PROXY_BOOTSTRAP_TIMEOUT_MS, Math.max(1_000, deadline - Date.now()));
       const yt = await withTimeout(getProxiedInnertube(proxy.url), bootBudget, 'proxied innertube bootstrap');
-      const meta = await attemptResolveWithProxiedInnertube(vid, proxy.url, yt, deadline);
-      if (meta) {
+      const result = await attemptResolveWithProxiedInnertube(vid, proxy.url, yt, deadline);
+      if (result.meta) {
         websharePool.markOk(proxy.id);
         log.info(`[YTJS] ✅ ${vid} resolved via Webshare proxy (youtubei.js)`);
-        return meta;
+        return result.meta;
       }
-      PROXIED_INNERTUBE_POOL.delete(proxy.url);
-      websharePool.markBad(proxy.id);
+      if (result.failure === 'proxy') {
+        PROXIED_INNERTUBE_POOL.delete(proxy.url);
+        websharePool.markBad(proxy.id);
+      } else if (result.failure === 'content') {
+        websharePool.markOk(proxy.id);
+      }
     } catch (e) {
       log.warning(`[YTJS] proxied innertube attempt failed: ${String(e)}`);
-      PROXIED_INNERTUBE_POOL.delete(proxy.url);
-      websharePool.markBad(proxy.id);
+      if (playerExceptionFailure(e) === 'proxy') {
+        PROXIED_INNERTUBE_POOL.delete(proxy.url);
+        websharePool.markBad(proxy.id);
+      }
     }
     return null;
   };
@@ -530,7 +584,7 @@ async function resolveViaProxyTier(
   return null;
 }
 
-async function attemptResolve(vid: string): Promise<ResolveAttempt> {
+async function attemptResolve(vid: string, isCurrent: () => boolean): Promise<ResolveAttempt> {
   let yt: Innertube;
   try {
     yt = await getInnertube();
@@ -562,7 +616,7 @@ async function attemptResolve(vid: string): Promise<ResolveAttempt> {
 
       const [muxedUrl, audioUrl] = await extractStreamUrls(yt, info);
       if (muxedUrl || audioUrl) {
-        INFO_CACHE.set(vid, info);
+        if (isCurrent()) INFO_CACHE.set(vid, info);
         return { urls: [muxedUrl, audioUrl] };
       }
     } catch (e) {
@@ -591,35 +645,40 @@ export async function resolveBothWithMeta(
   const cached = RESOLVED_STREAM_CACHE.get(vid);
   if (cached) return cached;
 
-  let result: ResolveMeta | null = null;
-  let geo: GeoRestriction | null = null;
+  const active = { invalidated: false };
+  const attempts = ACTIVE_STREAM_RESOLVES.get(vid) ?? new Set();
+  attempts.add(active);
+  ACTIVE_STREAM_RESOLVES.set(vid, attempts);
+  try {
+    const directAttempt = await attemptResolve(vid, () => !active.invalidated);
+    let geo = geoFromAttempt(directAttempt);
+    let result: ResolveMeta = { urls: directAttempt.urls, proxyUrl: null };
 
-  const directAttempt = await attemptResolve(vid);
-  geo = geoFromAttempt(directAttempt);
-  result = { urls: directAttempt.urls, proxyUrl: null };
-
-  if (geo) {
-    const official = await fetchRegionRestriction(vid).catch(() => null);
-    if (official) {
-      geo = {
-        allowed: [...new Set([...geo.allowed, ...(official.allowed ?? [])])],
-        blocked: official.blocked ?? [],
-      };
+    if (geo) {
+      const official = await fetchRegionRestriction(vid).catch(() => null);
+      if (official) {
+        geo = {
+          allowed: [...new Set([...geo.allowed, ...(official.allowed ?? [])])],
+          blocked: official.blocked ?? [],
+        };
+      }
+      log.info(
+        `[YTJS] ${vid} geo-restricted — targeting proxy in [${geo.allowed.join(',') || 'any'}], avoiding [${geo.blocked.join(',') || 'none'}]`,
+      );
     }
-    log.info(
-      `[YTJS] ${vid} geo-restricted — targeting proxy in [${geo.allowed.join(',') || 'any'}], avoiding [${geo.blocked.join(',') || 'none'}]`,
-    );
-  }
 
-  if (result.urls[0] || result.urls[1]) {
-    RESOLVED_STREAM_CACHE.set(vid, result);
-  } else {
-    // Tier 4: Webshare geo-bypass for videos YouTube refuses to serve from
-    // this server's IP. Result is kind-specific and pinned to one proxy exit.
-    const viaProxy = await resolveViaProxyTier(vid, kind, geo ?? undefined);
-    if (viaProxy) result = viaProxy;
+    if (!(result.urls[0] || result.urls[1])) {
+      // Webshare retries use an exit binding and stay outside the direct memo.
+      const viaProxy = await resolveViaProxyTier(vid, kind, geo ?? undefined);
+      if (viaProxy) result = viaProxy;
+    }
+    if (active.invalidated) return resolveBothWithMeta(urlOrId, kind);
+    if (!result.proxyUrl && (result.urls[0] || result.urls[1])) RESOLVED_STREAM_CACHE.set(vid, result);
+    return result;
+  } finally {
+    attempts.delete(active);
+    if (!attempts.size) ACTIVE_STREAM_RESOLVES.delete(vid);
   }
-  return result;
 }
 
 export async function resolveBoth(

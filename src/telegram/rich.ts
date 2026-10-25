@@ -5,8 +5,7 @@
  * Bot API 10.2/10.3 delivers `InputRichMessage(html=...)` as
  * `rich_message: { html }`. When the server doesn't support rich messages (or the
  * bot isn't a group admin for ephemeral delivery) we degrade gracefully:
- *   * BOT_NOT_ADMIN on an ephemeral send -> resend without `receiver_user_id`,
- *     exactly like the Python `fallback_rich_message`.
+ *   * Ephemeral delivery unavailable -> use an explicit public fallback, or DM.
  *   * sendRichMessage unsupported        -> classic sendMessage with stripped text.
  */
 import { TelegramApi, type InlineButton, type InlineKeyboardMarkup, type TgMessage } from './api.js';
@@ -102,6 +101,7 @@ export function stripRichHtml(html: string): string {
 
 export interface SmartSendOptions {
   receiverUserId?: number | null;
+  /** Explicitly safe for public delivery; omitted content stays private. */
   fallbackHtml?: string;
   replyMarkup?: InlineKeyboardMarkup;
 }
@@ -130,8 +130,10 @@ export async function sendSmartRichMessage(
       });
     } catch (e) {
       const err = String(e).toLowerCase();
-      if (['bot_not_admin', 'ephemeral', '400', 'bad request'].some((k) => err.includes(k))) {
-        return await sendRichOrPlain(api, chatId, fallbackHtml ? renderCustomEmojis(fallbackHtml) : richHtml, replyMarkup);
+      if (!api.richAvailable || ['bot_not_admin', 'ephemeral', '400', 'bad request'].some((k) => err.includes(k))) {
+        return fallbackHtml !== undefined
+          ? await sendRichOrPlain(api, chatId, fallbackHtml, replyMarkup)
+          : await sendRichOrPlain(api, receiverUserId, richHtml, replyMarkup);
       }
       log.error('[RICH] ephemeral send failed', { err: String(e) });
       return null;

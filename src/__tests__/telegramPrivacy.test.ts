@@ -40,6 +40,18 @@ function api(rich: boolean) {
 beforeEach(() => vi.clearAllMocks());
 
 describe('Telegram privacy', () => {
+  it('redacts group help when ephemeral delivery is unavailable', async () => {
+    const client = api(true);
+    client.sendRichMessage.mockRejectedValueOnce(new Error('400 BOT_NOT_ADMIN'));
+    await dispatchMessage(client as unknown as TelegramApi, { ...cb.message!, from: cb.from, text: '/help' });
+    const payloads = client.sendRichMessage.mock.calls as unknown as Array<[any]>;
+    expect(payloads[0][0].ephemeral_message_parameters).toEqual({ receiver_user_id: 123 });
+    expect(payloads[1][0].chat_id).toBe(-1001);
+    expect(payloads[1][0].ephemeral_message_parameters).toBeUndefined();
+    expect(JSON.stringify(payloads[1][0])).not.toContain('auditDummyToken');
+    expect(JSON.stringify(payloads[1][0])).toContain('YOUR_TOKEN');
+  });
+
   it.each([true, false])('keeps callback cards private when rich=%s', async rich => {
     const client = api(rich);
     for (const data of ['help', 'impl_quick_ref', 'api_implementation', 'confirm_revoke', 'api_info_get', 'impl_python_all']) {

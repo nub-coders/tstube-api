@@ -6,9 +6,10 @@ bot's rich-message UI are ports of the Python original, not reinterpretations.
 
 ## Stack
 
-- **Runtime:** Node.js ≥ 22 (ESM). No web framework — a small router on `node:http`.
+- **Runtime:** Node.js ≥ 22.19 (ESM). No web framework — a small router on `node:http`.
 - **Redis:** `ioredis`, for bearer tokens, daily counters and stream-job state.
 - **Extraction:** the Innertube `player` endpoint via `youtubei.js` with client fallback ladder and Webshare proxy routing.
+- **SoundCloud:** public track and set links resolve through web-player metadata to progressive audio or HLS. HLS streams require an HLS-capable player, such as FFmpeg. Blocked and preview-only tracks are rejected.
 - **Bot:** raw Telegram Bot API over HTTPS (`sendRichMessage` / `editMessageText`
   with `rich_message: { html }`), long-polled with `getUpdates`. No MTProto client.
 
@@ -53,6 +54,10 @@ configured port. Invalid connection URLs fail at startup without logging credent
 
 - Quotas and their reset headers use the next midnight UTC. Granting quota does
   not extend the current day's window.
+- YouTube Data API key cooldowns follow Google's midnight reset in US Pacific,
+  including daylight-saving changes.
+- Stream extraction uses a separate 120-second Redis lease. Concurrent workers
+  share one attempt, and an expired worker cannot overwrite its successor.
 
 - **Auth runs before routing.** An unauthenticated request to any protected path
   (or an unknown path) returns the middleware's `401`, never a `404`/`422`.
@@ -61,6 +66,6 @@ configured port. Invalid connection URLs fail at startup without logging credent
   bytes. `{id}` is `base64url(sha256("{mode}:{url}"))`.
 - **Revoked URLs are retried once.** A `403`/`410` from the CDN triggers a single
   cache invalidation + re-extraction; `404` is deliberately not retried.
-- **Bot UI degrades.** If rich messages are unsupported (or the bot isn't a group
-  admin, so ephemeral delivery is rejected), the same card is sent as classic
-  HTML + inline keyboard rather than being lost.
+- **Bot UI degrades.** If rich or ephemeral delivery is unavailable, group cards
+  use an explicitly safe public fallback. Otherwise, delivery falls back to a
+  direct message. Credential-bearing content is never implicitly made public.

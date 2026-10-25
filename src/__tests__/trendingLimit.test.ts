@@ -74,7 +74,7 @@ describe('fetchTrending limit handling', () => {
     expect(warm).toHaveLength(2);
     expect(warm[0]!.title).toBe('Song 0');
 
-    // Warm: a larger limit must not leak past what the cache holds either.
+    // Warm: another smaller limit keeps the cached order.
     const warmBig = await svc.fetchTrending(4);
     expect(warmBig).toHaveLength(4);
   });
@@ -88,5 +88,16 @@ describe('fetchTrending limit handling', () => {
     expect(seeded).toHaveLength(6);
     const two = await svc.fetchTrending(2);
     expect(two.map((v) => v.video_id)).toEqual(seeded.slice(0, 2).map((v) => v.video_id));
+  });
+
+  it('returns larger limits after the cache was populated by a smaller request', async () => {
+    const svc = await fresh();
+    route = (u) =>
+      u.hostname === 'www.youtube.com' ? { status: 200, body: resultsPage(12) } : undefined;
+
+    expect(await svc.fetchTrending(2)).toHaveLength(2);
+    expect(await svc.fetchTrending(10)).toHaveLength(10);
+    expect(await svc.fetchTrending(3)).toHaveLength(3);
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

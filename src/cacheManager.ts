@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { resolveWithMeta as innertubeResolveMeta } from './innertube.js';
+import { extractId, invalidateResolvedStream, resolveWithMeta as innertubeResolveMeta } from './innertube.js';
 import { redis } from './redis.js';
 import { getLogger } from './logger.js';
 import { detectProvider, resolveToPlayableStream } from './platformResolvers.js';
@@ -48,23 +48,39 @@ export interface CachedStream {
   url: string;
   /** Webshare proxy URL the stream is IP-locked to, when resolved via the geo-bypass tier. */
   proxyUrl: string | null;
+  /** Resolved YouTube identity when the cache key is a platform page URL. */
+  videoId?: string;
 }
 
+interface StreamLookup {
+  invalidated: boolean;
+  videoId?: string;
+  write?: Promise<unknown>;
+}
+
+const ACTIVE_LOOKUPS = new Map<string, Set<StreamLookup>>();
+const INVALIDATIONS = new Map<string, Promise<void>>();
+
 /**
- * Cache envelope. New entries are JSON `{u, p}` so the proxy binding travels
- * with the URL through Redis and the file cache across replicas; pre-envelope
+ * Cache envelope. New entries are JSON `{u, p, v}` so the proxy binding and
+ * resolved video identity travel with the URL across replicas; pre-envelope
  * entries (plain URL strings) read back as direct streams.
  */
 export function encodeCached(value: CachedStream): string {
-  return JSON.stringify(value.proxyUrl ? { u: value.url, p: value.proxyUrl } : { u: value.url });
+  return JSON.stringify({
+    u: value.url,
+    ...(value.proxyUrl ? { p: value.proxyUrl } : {}),
+    ...(value.videoId ? { v: value.videoId } : {}),
+  });
 }
 
 export function decodeCached(raw: string): CachedStream | null {
   if (raw.startsWith('{')) {
     try {
-      const o = JSON.parse(raw) as { u?: unknown; p?: unknown };
+      const o = JSON.parse(raw) as { u?: unknown; p?: unknown; v?: unknown };
       if (typeof o.u === 'string' && o.u) {
-        return { url: o.u, proxyUrl: typeof o.p === 'string' && o.p ? o.p : null };
+        const videoId = typeof o.v === 'string' ? extractId(o.v) : null;
+        return { url: o.u, proxyUrl: typeof o.p === 'string' && o.p ? o.p : null, ...(videoId ? { videoId } : {}) };
       }
     } catch {
       return null;
@@ -84,17 +100,17 @@ export function extractExpire(streamUrl: string): number | null {
   }
 }
 
-/** Read cache, returning (url, remainingTtl, proxyUrl). TTL -1 means expired/missing. */
-function readCache(url: string, prefix: string): [string | null, number, string | null] {
+/** Read cache, returning (url, remainingTtl, proxyUrl, videoId). TTL -1 means expired/missing. */
+function readCache(url: string, prefix: string): [string | null, number, string | null, string | undefined] {
   const path = cachePath(url, prefix);
-  if (!existsSync(path)) return [null, -1, null];
+  if (!existsSync(path)) return [null, -1, null, undefined];
   try {
-    const data = JSON.parse(readFileSync(path, 'utf8')) as { url?: string; expire?: number; proxy?: string };
+    const data = JSON.parse(readFileSync(path, 'utf8')) as { url?: string; expire?: number; proxy?: string; videoId?: string };
     const expire = data.expire ?? 0;
     const remaining = expire - Date.now() / 1000;
     if (remaining > 15) {
-      log.debug(`[CACHE HIT] ${prefix}${url.slice(0, 80)}...`);
-      return [data.url ?? null, Math.floor(remaining), data.proxy ?? null];
+      log.debug(`[CACHE HIT] ${prefix}${url}`);
+      return [data.url ?? null, Math.floor(remaining), data.proxy ?? null, extractId(data.videoId ?? '') ?? undefined];
     }
     try {
       rmSync(path);
@@ -108,7 +124,7 @@ function readCache(url: string, prefix: string): [string | null, number, string 
       /* ignore */
     }
   }
-  return [null, -1, null];
+  return [null, -1, null, undefined];
 }
 
 function writeCache(
@@ -117,10 +133,11 @@ function writeCache(
   prefix: string,
   proxyUrl: string | null = null,
   maxTtlSec?: number,
+  videoId?: string,
 ): void {
   let expire = extractExpire(streamUrl);
   if (!expire) {
-    log.warning(`[CACHE SKIP] No expire found in stream URL for ${url.slice(0, 80)}`);
+    log.warning(`[CACHE SKIP] No expire found in stream URL for ${url}`);
     return;
   }
   if (maxTtlSec) expire = Math.min(expire, Math.floor(Date.now() / 1000) + maxTtlSec);
@@ -128,10 +145,10 @@ function writeCache(
   try {
     writeFileSync(
       cachePath(url, prefix),
-      JSON.stringify(proxyUrl ? { url: streamUrl, expire, proxy: proxyUrl } : { url: streamUrl, expire }),
+      JSON.stringify({ url: streamUrl, expire, ...(proxyUrl ? { proxy: proxyUrl } : {}), ...(videoId ? { videoId } : {}) }),
     );
     log.info(
-      `[CACHE WRITE] ${prefix}${url.slice(0, 80)}... (expires in ${Math.floor(expire - Date.now() / 1000)}s)`,
+      `[CACHE WRITE] ${prefix}${url} (expires in ${Math.floor(expire - Date.now() / 1000)}s)`,
     );
   } catch (e) {
     log.error(`[CACHE WRITE ERROR] ${String(e)}`);
@@ -140,21 +157,57 @@ function writeCache(
 
 /**
  * Forget a cached stream URL so the next resolve re-extracts. googlevideo can
- * revoke a URL (403/410) long before its `expire`, and both layers key off that
- * stamp — so both must be dropped or an already-dead URL keeps being served.
+ * revoke a URL (403/410) long before its `expire`. Invalidate Redis, the file
+ * entry and the underlying Innertube memo, including active cache writers.
  */
 export async function invalidate(url: string, prefix = ''): Promise<void> {
-  try {
-    rmSync(cachePath(url, prefix));
-  } catch {
-    /* not found */
+  const key = `${prefix}${url}`;
+  const previous = INVALIDATIONS.get(key);
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  INVALIDATIONS.set(key, barrier);
+  const lookups = [...(ACTIVE_LOOKUPS.get(key) ?? [])];
+  const videoIds = new Set<string>();
+  const inputId = extractId(url);
+  if (inputId) videoIds.add(inputId);
+  for (const lookup of lookups) {
+    lookup.invalidated = true;
+    if (lookup.videoId) videoIds.add(lookup.videoId);
   }
+  for (const id of videoIds) invalidateResolvedStream(id);
   try {
-    await redis().del(`cache:${prefix}${url}`);
-  } catch (e) {
-    log.error(`[CACHE INVALIDATE] redis delete failed: ${String(e)}`);
+    if (previous) await previous;
+    // Drain writes already sent to Redis before deleting the key. New writes
+    // from these lookups are suppressed by their invalidated flag.
+    await Promise.allSettled(lookups.flatMap((lookup) => lookup.write ? [lookup.write] : []));
+    try {
+      const data = JSON.parse(readFileSync(cachePath(url, prefix), 'utf8')) as { videoId?: string };
+      const id = extractId(data.videoId ?? '');
+      if (id) videoIds.add(id);
+    } catch { /* absent or legacy file entry */ }
+    try {
+      const raw = await redis().get(`cache:${key}`);
+      const id = raw ? decodeCached(raw)?.videoId : null;
+      if (id) videoIds.add(id);
+    } catch (e) {
+      log.error(`[CACHE INVALIDATE] redis identity lookup failed: ${String(e)}`);
+    }
+    for (const id of videoIds) invalidateResolvedStream(id);
+    try {
+      rmSync(cachePath(url, prefix));
+    } catch {
+      /* not found */
+    }
+    try {
+      await redis().del(`cache:${key}`);
+    } catch (e) {
+      log.error(`[CACHE INVALIDATE] redis delete failed: ${String(e)}`);
+    }
+    log.info(`[CACHE INVALIDATE] ${prefix}${url}`);
+  } finally {
+    release();
+    if (INVALIDATIONS.get(key) === barrier) INVALIDATIONS.delete(key);
   }
-  log.info(`[CACHE INVALIDATE] ${prefix}${url.slice(0, 80)}`);
 }
 
 export async function resolveTargetUrl(url: string): Promise<[string, boolean]> {
@@ -162,11 +215,8 @@ export async function resolveTargetUrl(url: string): Promise<[string, boolean]> 
     const provider = detectProvider(url);
     if (['apple_music', 'amazon_music', 'jiosaavn', 'soundcloud', 'spotify'].includes(provider)) {
       const res = await resolveToPlayableStream(url);
-      if (res?.stream_url && provider === 'jiosaavn') {
+      if (res?.stream_url && (provider === 'jiosaavn' || provider === 'soundcloud')) {
         return [res.stream_url, true];
-      }
-      if (provider === 'soundcloud') {
-        return [url, false];
       }
       if (res?.stream_url && (res.stream_url.includes('youtube.com') || res.stream_url.includes('youtu.be'))) {
         return [res.stream_url, false];
@@ -184,7 +234,7 @@ export async function resolveTargetUrl(url: string): Promise<[string, boolean]> 
       }
     }
   } catch (e) {
-    log.warning(`[PLATFORM RESOLVE ERROR] ${url.slice(0, 80)}: ${String(e)}`);
+    log.warning(`[PLATFORM RESOLVE ERROR] ${url}: ${String(e)}`);
   }
   return [url, false];
 }
@@ -197,8 +247,9 @@ async function resolveUrl(
   try {
     const res = await innertubeResolveMeta(url, kind);
     if (res.url) {
-      log.info(`[INNERTUBE] ✅ ${kind} ${url.slice(0, 80)}`);
-      return { url: res.url, proxyUrl: res.proxyUrl };
+      log.info(`[INNERTUBE] ✅ ${kind} ${url}`);
+      const videoId = extractId(url);
+      return { url: res.url, proxyUrl: res.proxyUrl, ...(videoId ? { videoId } : {}) };
     }
   } catch (e) {
     log.warning(`[INNERTUBE] Resolution failed: ${String(e)}`);
@@ -212,13 +263,45 @@ async function getStreamFor(
   kind: 'audio' | 'muxed',
   formatSelector: string,
 ): Promise<CachedStream | null> {
+  const key = `${prefix}${url}`;
+  // A lookup that overlaps invalidation must wait until both stores have
+  // been cleared before it retries, including delayed Redis writes.
+  while (INVALIDATIONS.has(key)) await INVALIDATIONS.get(key);
+  const lookup: StreamLookup = { invalidated: false, videoId: extractId(url) ?? undefined };
+  const active = ACTIVE_LOOKUPS.get(key) ?? new Set();
+  active.add(lookup);
+  ACTIVE_LOOKUPS.set(key, active);
+  try {
+    const result = await loadStreamFor(url, prefix, kind, formatSelector, lookup);
+    if (lookup.invalidated) return getStreamFor(url, prefix, kind, formatSelector);
+    return result;
+  } finally {
+    active.delete(lookup);
+    if (!active.size) ACTIVE_LOOKUPS.delete(key);
+  }
+}
+
+async function cacheRedis(key: string, ttl: number, stream: CachedStream, lookup: StreamLookup): Promise<void> {
+  if (lookup.invalidated) return;
+  const write = redis().setex(key, ttl, encodeCached(stream));
+  lookup.write = write;
+  try { await write; } finally { if (lookup.write === write) lookup.write = undefined; }
+}
+
+async function loadStreamFor(
+  url: string,
+  prefix: string,
+  kind: 'audio' | 'muxed',
+  formatSelector: string,
+  lookup: StreamLookup,
+): Promise<CachedStream | null> {
   // 1. Redis
   try {
     const cached = await redis().get(`cache:${prefix}${url}`);
     if (cached) {
       const decoded = decodeCached(cached);
       if (decoded) {
-        log.info(`[REDIS CACHE HIT] ${prefix}${url.slice(0, 80)}...`);
+        log.info(`[REDIS CACHE HIT] ${prefix}${url}`);
         return decoded;
       }
     }
@@ -227,11 +310,13 @@ async function getStreamFor(
   }
 
   // 2. Local file cache
-  const [fileUrl, remaining, fileProxy] = readCache(url, prefix);
+  if (lookup.invalidated) return null;
+  const [fileUrl, remaining, fileProxy, fileVideoId] = readCache(url, prefix);
   if (fileUrl) {
-    const entry: CachedStream = { url: fileUrl, proxyUrl: fileProxy };
+    const entry: CachedStream = { url: fileUrl, proxyUrl: fileProxy, ...(fileVideoId ? { videoId: fileVideoId } : {}) };
+    lookup.videoId = fileVideoId ?? lookup.videoId;
     try {
-      await redis().setex(`cache:${prefix}${url}`, remaining, encodeCached(entry));
+      await cacheRedis(`cache:${prefix}${url}`, remaining, entry, lookup);
     } catch {
       /* ignore */
     }
@@ -240,19 +325,24 @@ async function getStreamFor(
 
   // 3. Resolve target & stream URL
   const [targetUrl, isDirect] = await resolveTargetUrl(url);
+  lookup.videoId = extractId(targetUrl) ?? undefined;
+  if (lookup.invalidated) {
+    if (lookup.videoId) invalidateResolvedStream(lookup.videoId);
+    return null;
+  }
   const stream = isDirect
     ? ({ url: targetUrl, proxyUrl: null } as CachedStream)
     : await resolveUrl(targetUrl, kind, formatSelector);
-  if (stream) {
+  if (stream && !lookup.invalidated) {
     const maxTtl = stream.proxyUrl ? PROXY_STREAM_TTL_S : undefined;
-    writeCache(url, stream.url, prefix, stream.proxyUrl, maxTtl);
+    writeCache(url, stream.url, prefix, stream.proxyUrl, maxTtl, stream.videoId);
     const expire = extractExpire(stream.url);
     if (expire) {
       let ttl = Math.floor(expire - Date.now() / 1000);
       if (maxTtl) ttl = Math.min(ttl, maxTtl);
       if (ttl > 0) {
         try {
-          await redis().setex(`cache:${prefix}${url}`, ttl, encodeCached(stream));
+          await cacheRedis(`cache:${prefix}${url}`, ttl, stream, lookup);
         } catch {
           /* ignore */
         }

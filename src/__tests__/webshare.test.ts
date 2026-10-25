@@ -2,7 +2,7 @@
  * Tests for the Webshare geo-bypass proxy pool — parsing, safety guards,
  * and rotation semantics. All pure / offline; no network calls.
  */
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import {
   buildProxyUrl,
   formatBytes,
@@ -154,10 +154,12 @@ describe('WebsharePool rotation', () => {
     }));
 
   beforeEach(() => {
-    process.env.WEBSHARE_API_KEY = 'test-key';
+    vi.stubEnv('WEBSHARE_API_KEY', 'test-key');
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ results: [] })));
   });
   afterEach(() => {
-    delete process.env.WEBSHARE_API_KEY;
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
   });
 
   it('round-robins across candidates', async () => {

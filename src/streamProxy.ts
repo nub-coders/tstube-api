@@ -62,6 +62,8 @@ export interface ProxyOptions {
   userAgent?: string | null;
   /** Epoch milliseconds when the client request started (for TTFB). */
   startedMs?: number;
+  /** Cancel pending dials and the body when the player disconnects. */
+  signal?: AbortSignal;
   /**
    * HTTP proxy URL (with credentials) the target is reachable through — set
    * for geo-bypass streams whose googlevideo URL is IP-locked to the proxy
@@ -78,6 +80,20 @@ interface ParsedProxy {
   /** Pre-rendered Proxy-Authorization header value, or null. */
   authHeader: string | null;
 }
+
+interface TunnelOptions extends http.RequestOptions {
+  tunnelSignal?: AbortSignal;
+}
+
+// These Agent hooks exist in Node, but are not exposed by @types/node.
+const agentHooks = https.Agent.prototype as unknown as {
+  addRequest(req: http.ClientRequest, options: TunnelOptions): void;
+  createSocket(
+    req: http.ClientRequest,
+    options: TunnelOptions,
+    callback: (err: Error | null, socket?: Duplex) => void,
+  ): void;
+};
 
 function parseProxy(proxyUrl: string): ParsedProxy | null {
   if (!isSafeProxyUrlSync(proxyUrl)) return null;
@@ -101,12 +117,29 @@ function parseProxy(proxyUrl: string): ParsedProxy | null {
  * so proxied streams must dial back through it.
  */
 class TunnelAgent extends https.Agent {
+  private readonly signals = new WeakMap<http.ClientRequest, AbortSignal>();
+
   constructor(private readonly proxy: ParsedProxy) {
     super({ keepAlive: true, maxSockets: 16 });
   }
 
+  addRequest(req: http.ClientRequest, options: TunnelOptions): void {
+    if (options.tunnelSignal) this.signals.set(req, options.tunnelSignal);
+    agentHooks.addRequest.call(this, req, options);
+  }
+
+  createSocket(
+    req: http.ClientRequest,
+    options: TunnelOptions,
+    callback: (err: Error | null, socket?: Duplex) => void,
+  ): void {
+    // A queued request can inherit connection options from the previous
+    // socket. Always recover its own signal rather than that socket's signal.
+    agentHooks.createSocket.call(this, req, { ...options, tunnelSignal: this.signals.get(req) }, callback);
+  }
+
   override createConnection(
-    options: http.RequestOptions,
+    options: TunnelOptions,
     callback?: (err: Error | null, stream: Duplex) => void,
   ): Duplex | null | undefined {
     const cb = callback
@@ -124,32 +157,46 @@ class TunnelAgent extends https.Agent {
 
     const proxySocket = net.connect({ host: this.proxy.host, port: this.proxy.port });
     let settled = false;
+    let onData: ((chunk: Buffer) => void) | undefined;
+    const onClose = () => fail(new Error('tunnel: proxy closed connection early'));
+    const onAbort = () => fail(new Error('tunnel: request cancelled'));
+    // Bound the entire CONNECT exchange, including proxies that accept TCP
+    // and then never send their response headers.
+    const timer = setTimeout(() => fail(new Error('tunnel: proxy connect timeout')), CONNECT_TIMEOUT_MS);
+    timer.unref();
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      options.tunnelSignal?.removeEventListener('abort', onAbort);
+      proxySocket.off('error', fail);
+      proxySocket.off('close', onClose);
+      if (onData) proxySocket.off('data', onData);
+    };
     const fail = (err: Error): void => {
       if (settled) return;
       settled = true;
+      cleanup();
       proxySocket.destroy();
       cb(err);
     };
-    proxySocket.setTimeout(CONNECT_TIMEOUT_MS, () => fail(new Error('tunnel: proxy connect timeout')));
     proxySocket.once('error', fail);
-    proxySocket.once('close', () => {
-      if (!settled) fail(new Error('tunnel: proxy closed connection early'));
-    });
+    proxySocket.once('close', onClose);
+    options.tunnelSignal?.addEventListener('abort', onAbort, { once: true });
+    if (options.tunnelSignal?.aborted) {
+      onAbort();
+      return undefined;
+    }
 
     proxySocket.once('connect', () => {
-      proxySocket.setTimeout(0);
       let head = '';
-      const onData = (chunk: Buffer): void => {
+      onData = (chunk: Buffer): void => {
         head += chunk.toString('latin1');
         const end = head.indexOf('\r\n\r\n');
         if (end === -1) {
           if (head.length > 16 * 1024) {
-            proxySocket.removeListener('data', onData);
             fail(new Error('tunnel: oversized proxy response'));
           }
           return;
         }
-        proxySocket.removeListener('data', onData);
         const statusLine = head.slice(0, head.indexOf('\r\n'));
         const statusCode = Number.parseInt(statusLine.split(' ')[1] ?? '', 10);
         if (statusCode !== 200) {
@@ -163,6 +210,7 @@ class TunnelAgent extends https.Agent {
           return;
         }
         settled = true;
+        cleanup();
         // Bytes past the header (if any) belong to the TLS stream.
         const leftover = head.slice(end + 4);
         if (leftover) proxySocket.unshift(Buffer.from(leftover, 'latin1'));
@@ -205,11 +253,21 @@ function tunnelAgentFor(proxy: ParsedProxy): https.Agent {
 
 const MAX_REDIRECTS = 5;
 
+function cancelledResult(): ProxyUpstream {
+  return {
+    status: 499,
+    headers: { 'content-type': 'application/json' },
+    body: null,
+    error: { error: 'Client Closed Request' },
+  };
+}
+
 export function proxyStream(
   targetUrl: string,
   opts: ProxyOptions = {},
   redirectCount = 0,
 ): Promise<ProxyUpstream> {
+  if (opts.signal?.aborted) return Promise.resolve(cancelledResult());
   if (redirectCount > MAX_REDIRECTS) {
     return Promise.resolve({
       status: 502,
@@ -235,17 +293,36 @@ export function proxyStream(
 
   // SSRF guard: the stream dial is server-side — only public http/https
   // hosts are reachable, whatever the upstream URL claims to be.
-  return isPublicHost(parsed.hostname).then((hostOk) => {
-    if (!hostOk || (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')) {
-      log.error(`[STREAM_PROXY] upstream host rejected by safety check: ${parsed.hostname}`);
-      return {
-        status: 502,
-        headers: { 'content-type': 'application/json' },
-        body: null,
-        error: { error: 'Bad Gateway', message: 'Upstream host is not a permitted public address' },
-      } as ProxyUpstream;
+  return new Promise((resolve, reject) => {
+    let cancelled = false;
+    const onAbort = () => {
+      cancelled = true;
+      opts.signal?.removeEventListener('abort', onAbort);
+      resolve(cancelledResult());
+    };
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    if (opts.signal?.aborted) {
+      onAbort();
+      return;
     }
-    return dialStream(parsed, opts, startedMs, redirectCount);
+    void isPublicHost(parsed.hostname).then((hostOk) => {
+      opts.signal?.removeEventListener('abort', onAbort);
+      if (cancelled) return;
+      if (!hostOk || (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')) {
+        log.error(`[STREAM_PROXY] upstream host rejected by safety check: ${parsed.hostname}`);
+        resolve({
+          status: 502,
+          headers: { 'content-type': 'application/json' },
+          body: null,
+          error: { error: 'Bad Gateway', message: 'Upstream host is not a permitted public address' },
+        });
+        return;
+      }
+      resolve(dialStream(parsed, opts, startedMs, redirectCount));
+    }, (err: unknown) => {
+      opts.signal?.removeEventListener('abort', onAbort);
+      if (!cancelled) reject(err);
+    });
   });
 }
 
@@ -279,9 +356,89 @@ function dialStream(
     if (opts.rangeHeader) headers.range = opts.rangeHeader;
 
     const connectStarted = Date.now();
+    const tunnelController = new AbortController();
+    let upstreamBody: http.IncomingMessage | undefined;
+    let out: PassThrough | undefined;
+    let headersReceived = false;
+    let first = true;
+    let active = false;
+    let finished = false;
+    let cancelled = false;
     let req: http.ClientRequest;
+    let connectTimer: ReturnType<typeof setTimeout> | undefined;
+
+    function cleanup(): void {
+      if (finished) return;
+      finished = true;
+      clearTimeout(connectTimer);
+      opts.signal?.removeEventListener('abort', onAbort);
+      req.off('timeout', onReadTimeout);
+      req.setTimeout(0);
+      upstreamBody?.off('data', onData);
+      upstreamBody?.off('end', onEnd);
+      out?.off('close', onOutputClose);
+      if (active) metrics.streamFinished();
+    }
+
+    function stopUpstream(): void {
+      if (out) upstreamBody?.unpipe(out);
+      upstreamBody?.destroy();
+      req.destroy();
+      tunnelController.abort();
+    }
+
+    function onAbort(): void {
+      if (finished) return;
+      cancelled = true;
+      cleanup();
+      stopUpstream();
+      out?.destroy();
+      resolve(cancelledResult());
+    }
+
+    function onOutputClose(): void {
+      if (finished) return;
+      cleanup();
+      stopUpstream();
+    }
+
+    function onData(chunk: Buffer): void {
+      if (first) {
+        metrics.recordStreamTtfb((Date.now() - startedMs) / 1000);
+        first = false;
+      }
+      metrics.recordStreamBytes(chunk.length);
+    }
+
+    function onEnd(): void {
+      // Let pipe end the output normally. Destroying the completed request
+      // here would discard a healthy keep-alive connection.
+      cleanup();
+    }
+
+    function onUpstreamError(err: Error): void {
+      if (finished) return;
+      metrics.recordStreamError('transfer');
+      log.debug(`[STREAM_PROXY] Stream disconnected: ${String(err)}`);
+      cleanup();
+      stopUpstream();
+      out?.destroy(err);
+    }
+
+    function onUpstreamClose(): void {
+      upstreamBody?.off('error', onUpstreamError);
+      if (!finished) onUpstreamError(new Error('upstream closed before stream completed'));
+    }
+
+    function onReadTimeout(): void {
+      req.destroy(new Error('read timeout'));
+    }
+
     if (proxy && isHttps) {
-      req = https.request(parsed, { method: 'GET', headers, agent: tunnelAgentFor(proxy) }, (upstream) => {
+      const requestOptions: TunnelOptions = {
+        method: 'GET', headers, agent: tunnelAgentFor(proxy), tunnelSignal: tunnelController.signal,
+      };
+      req = https.request(parsed, requestOptions, (upstream) => {
         void handleUpstream(upstream);
       });
     } else if (proxy) {
@@ -300,7 +457,21 @@ function dialStream(
       });
     }
 
+    // Construct the request before starting its timer: header validation can
+    // throw synchronously, leaving no request for a timeout to destroy.
+    connectTimer = setTimeout(() => {
+      req.destroy(new Error('connect timeout'));
+      tunnelController.abort();
+    }, CONNECT_TIMEOUT_MS);
+    connectTimer.unref();
+
     function handleUpstream(upstream: http.IncomingMessage): void {
+      if (finished) {
+        upstream.destroy();
+        return;
+      }
+      headersReceived = true;
+      clearTimeout(connectTimer);
       metrics.recordUpstreamConnect((Date.now() - connectStarted) / 1000);
 
       const status = upstream.statusCode ?? 502;
@@ -310,8 +481,9 @@ function dialStream(
       // node:http does not follow them automatically, so we must follow them here.
       if ([301, 302, 303, 307, 308].includes(status) && upstream.headers.location) {
         log.info(`[STREAM_PROXY] Upstream ${status} redirect to: ${upstream.headers.location.slice(0, 100)}`);
-        upstream.resume(); // drain
+        cleanup();
         upstream.destroy();
+        req.destroy();
         try {
           const nextUrl = new URL(upstream.headers.location, parsed).href;
           resolve(proxyStream(nextUrl, opts, redirectCount + 1));
@@ -329,8 +501,9 @@ function dialStream(
       if (status >= 400) {
         metrics.recordStreamError(status);
         log.error(`[STREAM_PROXY] upstream ${status} (expired or IP-locked URL)`);
-        upstream.resume(); // drain
+        cleanup();
         upstream.destroy();
+        req.destroy();
         resolve({
           status,
           headers: { 'content-type': 'application/json' },
@@ -348,45 +521,36 @@ function dialStream(
       if (respHeaders['accept-ranges'] === undefined) respHeaders['accept-ranges'] = 'bytes';
 
       // Instrument the body: TTFB on first chunk, byte counter, active gauge.
-      const out = new PassThrough();
-      let first = true;
-      let finished = false;
-      const finish = () => {
-        if (finished) return;
-        finished = true;
-        metrics.streamFinished();
-      };
+      upstreamBody = upstream;
+      out = new PassThrough();
+      // A source can fail in the same packet as its headers, before the
+      // awaiting caller can attach its own error handler. Retain the error on
+      // the stream without letting that handoff window crash the process.
+      out.on('error', () => {});
+      active = true;
       metrics.streamStarted();
-      upstream.on('data', (chunk: Buffer) => {
-        if (first) {
-          metrics.recordStreamTtfb((Date.now() - startedMs) / 1000);
-          first = false;
-        }
-        metrics.recordStreamBytes(chunk.length);
-      });
-      upstream.on('end', finish);
-      upstream.on('close', finish);
-      upstream.on('error', (err) => {
-        metrics.recordStreamError('transfer');
-        log.debug(`[STREAM_PROXY] Stream disconnected: ${String(err)}`);
-        finish();
-        out.destroy(err);
-      });
+      upstream.on('data', onData);
+      upstream.once('end', onEnd);
+      upstream.once('close', onUpstreamClose);
+      upstream.on('error', onUpstreamError);
+      out.once('close', onOutputClose);
+      req.setTimeout(READ_TIMEOUT_MS);
       upstream.pipe(out);
 
       resolve({ status, headers: respHeaders, body: out });
     }
 
-    req.setTimeout(CONNECT_TIMEOUT_MS, () => {
-      req.destroy(new Error('connect timeout'));
-    });
-    // After headers, allow long body reads but bound a dead socket.
-    req.on('socket', (socket) => {
-      socket.setTimeout(READ_TIMEOUT_MS, () => {
-        socket.destroy(new Error('read timeout'));
-      });
-    });
+    // Request-owned timeout listeners are removed at completion, rather than
+    // accumulating on sockets reused by the keep-alive agent.
+    req.on('timeout', onReadTimeout);
     req.on('error', (e) => {
+      if (cancelled || finished) return;
+      if (headersReceived) {
+        onUpstreamError(e);
+        return;
+      }
+      cleanup();
+      tunnelController.abort();
       metrics.recordUpstreamConnect((Date.now() - connectStarted) / 1000);
       metrics.recordStreamError('connect');
       log.error(`[STREAM_PROXY] Upstream connection error: ${String(e)}`);
@@ -413,6 +577,11 @@ function dialStream(
         },
       });
     });
+    opts.signal?.addEventListener('abort', onAbort, { once: true });
+    if (opts.signal?.aborted) {
+      onAbort();
+      return;
+    }
     req.end();
   });
 }

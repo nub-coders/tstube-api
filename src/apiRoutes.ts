@@ -350,6 +350,7 @@ async function proxyFor(
     userAgent: Array.isArray(ua) ? ua[0] : (ua ?? null),
     startedMs,
     proxyUrl,
+    signal: ctx.signal,
   });
 }
 

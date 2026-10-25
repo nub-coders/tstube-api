@@ -38,7 +38,14 @@ export interface SearchOutput {
   suggested: SearchItem[];
 }
 
-export const MEMORY_CACHE = new BoundedCache<SearchOutput>(5000, 300);
+const SEARCH_CACHE_VERSION = 2;
+interface CachedSearchResults {
+  version: typeof SEARCH_CACHE_VERSION;
+  results: SearchItem[];
+}
+
+// Cache the complete parsed page; response limits belong to each caller.
+export const MEMORY_CACHE = new BoundedCache<SearchItem[]>(5000, 300);
 export const LOCKS = new BoundedCache<Promise<void>>(5000);
 
 function normalize(q: string): string {
@@ -92,7 +99,7 @@ async function fetchYtData(url: string, retries = 1): Promise<any | null> {
   return null;
 }
 
-function parseYtData(rawData: any, limit: number): SearchItem[] {
+function parseYtData(rawData: any): SearchItem[] {
   const contents: any[] = safeGet(
     rawData,
     'contents',
@@ -123,7 +130,6 @@ function parseYtData(rawData: any, limit: number): SearchItem[] {
         views: stripViews(v.viewCountText?.simpleText ?? '0 views'),
         thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
       });
-      if (results.length >= limit + 10) break;
     }
   }
   return results;
@@ -174,94 +180,96 @@ function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const gate = new Promise<void>((r) => {
     release = r;
   });
-  LOCKS.set(key, prev.then(() => gate));
+  const tail = prev.then(() => gate);
+  LOCKS.set(key, tail);
   return prev.then(fn).finally(() => {
     release();
     // Only remove if we are still the tail.
-    if (LOCKS.get(key) === undefined) LOCKS.delete(key);
+    if (LOCKS.get(key) === tail) LOCKS.delete(key);
   });
 }
 
 // ── Search ──────────────────────────────────────────────────────
 
-export async function fetchResults(query: string, limit = 1): Promise<SearchOutput> {
-  if (!query) return { main_results: [], suggested: [] };
+function parseCachedResults(raw: string): SearchItem[] | null {
+  try {
+    const data = JSON.parse(raw) as Partial<CachedSearchResults> | null;
+    if (data?.version !== SEARCH_CACHE_VERSION || !Array.isArray(data.results)) return null;
+    const fields: Array<keyof SearchItem> = ['title', 'video_id', 'url', 'time', 'duration', 'channel', 'views', 'thumbnail'];
+    if (!data.results.every((item) => item && fields.every((field) => typeof item[field] === 'string'))) return null;
+    return data.results;
+  } catch {
+    return null;
+  }
+}
 
-  const qkey = 'search_' + normalize(query);
-
-  const cached = MEMORY_CACHE.get(qkey);
+async function cachedResults(
+  key: string,
+  fetcher: () => Promise<SearchItem[]>,
+  cacheEmpty = false,
+): Promise<SearchItem[]> {
+  const cached = MEMORY_CACHE.get(key);
   if (cached !== undefined) return cached;
 
-  const raw = await redisGet(qkey);
-  if (raw) {
-    try {
-      const data = JSON.parse(raw) as SearchOutput;
-      MEMORY_CACHE.set(qkey, data);
-      return data;
-    } catch {
-      /* fall through */
-    }
-  }
-
-  return withLock(qkey, async () => {
-    const again = MEMORY_CACHE.get(qkey);
+  return withLock(key, async () => {
+    const again = MEMORY_CACHE.get(key);
     if (again !== undefined) return again;
 
-    try {
-      const url = YOUTUBE_SEARCH_URL + encodeURIComponent(query).replace(/%20/g, '+');
-      const rawData = await fetchYtData(url);
-      let results: SearchItem[] = rawData ? parseYtData(rawData, limit) : [];
-
-      // If synthetic prefixes or strict matching returned empty results, try relaxing the query.
-      if (!results.length) {
-        const relaxed = query.replace(/^[a-zA-Z0-9]+-\d+\s+/, '').trim();
-        if (relaxed && relaxed !== query) {
-          const relaxedUrl = YOUTUBE_SEARCH_URL + encodeURIComponent(relaxed).replace(/%20/g, '+');
-          const relaxedData = await fetchYtData(relaxedUrl, 0);
-          if (relaxedData) {
-            results = parseYtData(relaxedData, limit);
-          }
-        }
-      }
-
-      const output: SearchOutput = {
-        main_results: results.slice(0, limit),
-        suggested:
-          results.length > limit ? results.slice(limit, limit + 5) : results.slice(0, 5),
-      };
-      if (results.length > 0) {
-        MEMORY_CACHE.set(qkey, output);
-        // Fire-and-forget Redis write.
-        void redisSet(qkey, JSON.stringify(output));
-      }
-      return output;
-    } finally {
-      LOCKS.delete(qkey);
+    const raw = await redisGet(key);
+    const remote = raw ? parseCachedResults(raw) : null;
+    if (remote !== null) {
+      MEMORY_CACHE.set(key, remote);
+      return remote;
     }
+
+    const results = await fetcher();
+    if (results.length || cacheEmpty) {
+      MEMORY_CACHE.set(key, results);
+      const payload: CachedSearchResults = { version: SEARCH_CACHE_VERSION, results };
+      void redisSet(key, JSON.stringify(payload));
+    }
+    return results;
   });
 }
 
-export async function fetchTrending(limit = 10): Promise<SearchItem[]> {
-  const key = 'trending_music_search';
-  const cached = MEMORY_CACHE.get(key);
-  if (cached !== undefined) return cached.main_results.slice(0, limit);
+async function searchResults(query: string): Promise<SearchItem[]> {
+  if (!query) return [];
+  // Legacy values contain a caller's truncated response and cannot safely be
+  // upgraded into a complete page. New keys leave those values unused.
+  const key = `search_v${SEARCH_CACHE_VERSION}_` + normalize(query);
+  return cachedResults(key, async () => {
+    const url = YOUTUBE_SEARCH_URL + encodeURIComponent(query).replace(/%20/g, '+');
+    const rawData = await fetchYtData(url);
+    let results = rawData ? parseYtData(rawData) : [];
 
-  const raw = await redisGet(key);
-  if (raw) {
-    try {
-      const data = JSON.parse(raw) as SearchItem[];
-      MEMORY_CACHE.set(key, { main_results: data, suggested: [] });
-      return data.slice(0, limit);
-    } catch {
-      /* fall through */
+    // If synthetic prefixes or strict matching returned empty results, try relaxing the query.
+    if (!results.length) {
+      const relaxed = query.replace(/^[a-zA-Z0-9]+-\d+\s+/, '').trim();
+      if (relaxed && relaxed !== query) {
+        const relaxedUrl = YOUTUBE_SEARCH_URL + encodeURIComponent(relaxed).replace(/%20/g, '+');
+        const relaxedData = await fetchYtData(relaxedUrl, 0);
+        if (relaxedData) results = parseYtData(relaxedData);
+      }
     }
-  }
+    return results;
+  });
+}
 
-  const data = await fetchResults('music trending india', limit);
-  const results = [...data.main_results, ...data.suggested].slice(0, limit);
-  MEMORY_CACHE.set(key, { main_results: results, suggested: [] });
-  void redisSet(key, JSON.stringify(results));
-  return results;
+export async function fetchResults(query: string, limit = 1): Promise<SearchOutput> {
+  const results = await searchResults(query);
+  return {
+    main_results: results.slice(0, limit),
+    suggested: results.length > limit ? results.slice(limit, limit + 5) : results.slice(0, 5),
+  };
+}
+
+export async function fetchTrending(limit = 10): Promise<SearchItem[]> {
+  const results = await cachedResults(
+    `trending_music_search_v${SEARCH_CACHE_VERSION}`,
+    () => searchResults('music trending india'),
+    true,
+  );
+  return results.slice(0, limit);
 }
 
 export async function fetchSuggestions(

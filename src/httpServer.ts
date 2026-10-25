@@ -343,6 +343,10 @@ function writeResult(res: ServerResponse, result: Result, headOnly: boolean): vo
       bodyStream.destroy();
       return;
     }
+    if (bodyStream.errored || bodyStream.destroyed) {
+      res.destroy();
+      return;
+    }
     res.writeHead(result.status, headers);
     if (headOnly) {
       result.stream.destroy();

@@ -3,6 +3,7 @@
  *
  * Supports Apple Music, Amazon Music (Odesli API), JioSaavn, SoundCloud, Spotify, and plain-text search fallback.
  */
+import { resolveSoundCloudMedia } from './soundcloud.js';
 
 // ── Custom Exceptions ─────────────────────────────────────────────────────────
 
@@ -50,7 +51,7 @@ export class NetworkTimeoutError extends ResolverError {
 
 export const APPLE_MUSIC_RE = /^https?:\/\/music\.apple\.com\/([a-z]{2}\/)?(album|playlist|song|artist)\/([^/]+)(\/([^/\?]+))?/i;
 export const AMAZON_MUSIC_RE = /^https?:\/\/music\.amazon\.[a-z\.]+\/.*/i;
-export const SOUNDCLOUD_RE = /^https?:\/\/(www\.)?soundcloud\.com\/[^/]+\/.+/i;
+export const SOUNDCLOUD_RE = /^https?:\/\/(?:(?:www|m)\.)?soundcloud\.com\/[^/]+\/.+/i;
 export const JIOSAAVN_RE = /^https?:\/\/(www\.)?(jiosaavn|saavn)\.com\/.+/i;
 export const SPOTIFY_RE = /^https?:\/\/(open\.)?spotify\.com\/(track|album|playlist|artist)\/[^/\?]+/i;
 
@@ -528,22 +529,11 @@ export async function resolveJioSaavn(
 
 // ── SoundCloud Resolver ───────────────────────────────────────────────────────
 
-export function resolveSoundCloud(url: string): {
-  provider: string;
-  url: string;
-  bypass_search: boolean;
-  stream_url: string;
-} {
+export async function resolveSoundCloud(url: string, options?: { fetchFn?: typeof fetch }) {
   if (!isSoundCloud(url)) {
     throw new MalformedUrlError('Invalid SoundCloud URL format.');
   }
-
-  return {
-    provider: 'soundcloud',
-    url,
-    bypass_search: true,
-    stream_url: url,
-  };
+  return resolveSoundCloudMedia(url, options?.fetchFn);
 }
 
 // ── Master Dispatcher Function ────────────────────────────────────────────────
@@ -647,15 +637,7 @@ export async function resolveToPlayableStream(
       bypass_search: false,
     };
   } else if (provider === 'soundcloud') {
-    const res = resolveSoundCloud(cleanInput);
-    return {
-      provider: 'soundcloud',
-      title: null,
-      artist: null,
-      stream_url: cleanInput,
-      search_query: null,
-      bypass_search: true,
-    };
+    return resolveSoundCloud(cleanInput, options);
   } else if (provider === 'text_search') {
     return {
       provider: 'text_search',

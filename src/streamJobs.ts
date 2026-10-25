@@ -13,7 +13,7 @@
  * URLs the API issued to an authenticated caller resolve.
  *
  * Three in-process caches mirror the Python globals:
- *   _JOB_MEMO      completed jobs only (a pending job is what waiters watch change)
+ *   _JOB_MEMO      completed or failed jobs (pending jobs remain authoritative)
  *   _JOB_EVENTS    wakes local waiters the instant extraction finishes
  *   _REFRESH_LOCKS coalesces concurrent 403 refreshes of the same id
  */
@@ -32,6 +32,77 @@ const JOB_MEMO_TTL = 5.0;
 const REFRESH_WAIT_S = 20.0;
 const CROSS_REPLICA_POLL_S = 2.0;
 export const AWAIT_TIMEOUT_S = 45.0;
+/** A crashed or stalled extractor must not hold a four-hour capability hostage. */
+const EXTRACTION_LEASE_TTL_S = 120;
+
+// The capability outlives individual extraction attempts. A separate random
+// lease token fences both successful and failed results from expired workers.
+const ENSURE_JOB_SCRIPT = `-- stream-job:ensure
+local raw = redis.call('GET', KEYS[1])
+local job = nil
+if raw then
+  local ok, decoded = pcall(cjson.decode, raw)
+  if ok and type(decoded) == 'table' then job = decoded end
+end
+local pending = cjson.decode(ARGV[1])
+if not job then
+  job = pending
+  redis.call('DEL', KEYS[2])
+end
+local backfill = not job.secret or job.secret == cjson.null
+if backfill then job.secret = pending.secret end
+local owner = ''
+if (not job.extracted_url or job.extracted_url == cjson.null) and
+    redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3], 'NX') then
+  owner = ARGV[2]
+  pending.secret = job.secret
+  job = pending
+  redis.call('SET', KEYS[1], cjson.encode(job), 'EX', ARGV[4])
+elseif not raw or backfill then
+  local ttl = ARGV[4]
+  if job.proxy_url and job.proxy_url ~= cjson.null then ttl = ARGV[5] end
+  redis.call('SET', KEYS[1], cjson.encode(job), 'EX', ttl)
+end
+return {cjson.encode(job), owner}
+`;
+
+const REFRESH_JOB_SCRIPT = `-- stream-job:refresh
+local raw = redis.call('GET', KEYS[1])
+if not raw then return {'', ''} end
+local job = cjson.decode(raw)
+if job.secret and job.secret ~= cjson.null and job.secret ~= ARGV[2] then
+  return {'', ''}
+end
+local rejected = cjson.decode(ARGV[3])
+if job.extracted_url and job.extracted_url ~= cjson.null and job.extracted_url ~= rejected then
+  return {raw, ''}
+end
+if not redis.call('SET', KEYS[2], ARGV[1], 'EX', ARGV[4], 'NX') then
+  return {raw, ''}
+end
+job.secret = ARGV[2]
+job.extracted_url = cjson.null
+job.extracted_time = cjson.null
+job.proxy_url = cjson.null
+job.failed = false
+local pending = cjson.encode(job)
+redis.call('SET', KEYS[1], pending, 'EX', ARGV[5])
+return {pending, ARGV[1]}
+`;
+
+const FINISH_JOB_SCRIPT = `-- stream-job:finish
+if redis.call('GET', KEYS[2]) ~= ARGV[1] then return 0 end
+local raw = redis.call('GET', KEYS[1])
+if not raw or cjson.decode(raw).secret ~= ARGV[2] then return 0 end
+redis.call('SET', KEYS[1], ARGV[3], 'EX', ARGV[4])
+redis.call('DEL', KEYS[2])
+return 1
+`;
+
+const RELEASE_LEASE_SCRIPT = `-- stream-job:release
+if redis.call('GET', KEYS[1]) ~= ARGV[1] then return 0 end
+return redis.call('DEL', KEYS[1])
+`;
 
 export interface StreamJob {
   url: string;
@@ -102,6 +173,10 @@ function jobKey(streamId: string): string {
   return `stream_job:${streamId}`;
 }
 
+function leaseKey(streamId: string): string {
+  return `stream_job_lease:${streamId}`;
+}
+
 /** Stable stream id from mode+url: base64url(sha256("mode:url")) without padding. */
 export function encodeStreamId(url: string, mode: string): string {
   const digest = createHash('sha256').update(`${mode}:${url}`).digest();
@@ -134,7 +209,7 @@ export function resolveMode(mode: string): 'audio' | 'video' {
   return ['video', 'stream', 'muxed'].includes(String(mode).toLowerCase()) ? 'video' : 'audio';
 }
 
-/** Memo (completed jobs only), else Redis. Returns a copy for callers to mutate. */
+/** Memo (completed/failed jobs), else Redis. Returns a copy for callers to mutate. */
 async function jobGet(streamId: string): Promise<StreamJob | null> {
   const cached = JOB_MEMO.get(streamId);
   if (cached !== undefined) return { ...cached };
@@ -151,9 +226,8 @@ async function jobGet(streamId: string): Promise<StreamJob | null> {
 }
 
 /**
- * Make a completed job visible to *this* process and wake its waiters, before
- * the ~250ms remote-Redis write. The extracted URL is already valid; Redis only
- * exists to share it with other replicas and later requests.
+ * Publish a fenced completion or failure to this process and wake its waiters.
+ * Ownership must be confirmed by Redis first, even when extraction succeeds.
  */
 function jobPublishLocal(streamId: string, job: StreamJob): void {
   JOB_MEMO.set(streamId, { ...job });
@@ -168,22 +242,25 @@ function jobForgetLocal(streamId: string): void {
 }
 
 /**
- * Persist a job and keep local memo/waiters consistent.
- * `onlyIfExists` maps to SET XX so a job whose TTL lapsed mid-extraction is not
- * resurrected. Returns false when XX found no key.
+ * Atomically persist a result only while this attempt owns the lease and the
+ * original capability still exists. An expired owner cannot replace a newer
+ * completion, revive an expired capability, or release its successor's lease.
  */
-async function jobSet(streamId: string, job: StreamJob, onlyIfExists = false): Promise<boolean> {
-  const payload = JSON.stringify(job);
+async function finishExtraction(streamId: string, job: StreamJob, owner: string): Promise<boolean> {
   // Proxy-pinned jobs expire with the pinned exit (Webshare can replace it);
   // direct jobs keep the full googlevideo lifetime.
   const ttl = job.proxy_url ? Math.min(STREAM_TTL, PROXY_STREAM_TTL_S) : STREAM_TTL;
-  const stored = onlyIfExists
-    ? await redis().set(jobKey(streamId), payload, 'EX', ttl, 'XX')
-    : await redis().set(jobKey(streamId), payload, 'EX', ttl);
-  if (onlyIfExists && stored === null) return false;
-  if (job.extracted_url) jobPublishLocal(streamId, job);
-  else jobForgetLocal(streamId);
+  const stored = await redis().eval(
+    FINISH_JOB_SCRIPT, 2, jobKey(streamId), leaseKey(streamId),
+    owner, job.secret!, JSON.stringify(job), ttl,
+  );
+  if (Number(stored) !== 1) return false;
+  jobPublishLocal(streamId, job);
   return true;
+}
+
+async function releaseLease(streamId: string, owner: string): Promise<void> {
+  await redis().eval(RELEASE_LEASE_SCRIPT, 1, leaseKey(streamId), owner);
 }
 
 function startBackgroundExtraction(
@@ -191,8 +268,10 @@ function startBackgroundExtraction(
   url: string,
   mode: 'audio' | 'video',
   secret: string,
+  owner: string,
 ): void {
   void (async () => {
+    let job: StreamJob;
     try {
       let extracted =
         mode === 'video' ? await getVideoStream(url) : await getStream(url);
@@ -210,7 +289,7 @@ function startBackgroundExtraction(
       }
       if (!extracted?.url) {
         log.error(`[STREAM_RESOLVER] Failed to extract ${mode} for ${streamId}`);
-        const failedJob: StreamJob = {
+        job = {
           url,
           mode,
           extracted_url: null,
@@ -218,28 +297,19 @@ function startBackgroundExtraction(
           secret,
           failed: true,
         };
-        jobPublishLocal(streamId, failedJob);
-        await jobSet(streamId, failedJob, true);
-        return;
-      }
-      const job: StreamJob = {
-        url,
-        mode,
-        extracted_url: extracted.url,
-        extracted_time: Date.now() / 1000,
-        proxy_url: extracted.proxyUrl ?? null,
-        secret,
-      };
-      // Wake local waiters first, then persist.
-      jobPublishLocal(streamId, job);
-      if (await jobSet(streamId, job, true)) {
-        log.info(`[STREAM_RESOLVER] Extracted ${mode} URL for ${streamId}`);
       } else {
-        log.info(`[STREAM_RESOLVER] Job ${streamId} expired before extraction finished`);
+        job = {
+          url,
+          mode,
+          extracted_url: extracted.url,
+          extracted_time: Date.now() / 1000,
+          proxy_url: extracted.proxyUrl ?? null,
+          secret,
+        };
       }
     } catch (e) {
       log.error(`[STREAM_RESOLVER] Failed to extract ${mode}: ${String(e)}`);
-      const failedJob: StreamJob = {
+      job = {
         url,
         mode,
         extracted_url: null,
@@ -247,64 +317,64 @@ function startBackgroundExtraction(
         secret,
         failed: true,
       };
-      jobPublishLocal(streamId, failedJob);
-      await jobSet(streamId, failedJob, true);
     }
-  })();
+
+    // Persistence failures are separate from extraction failures: attempting
+    // another failing write in an extraction catch must never escape this task.
+    try {
+      if (await finishExtraction(streamId, job, owner)) {
+        if (job.extracted_url) {
+          log.info(`[STREAM_RESOLVER] Extracted ${mode} URL for ${streamId}: ${url} -> ${job.extracted_url}`);
+        }
+      } else {
+        log.info(`[STREAM_RESOLVER] Job ${streamId} expired or its extraction lease changed`);
+      }
+    } catch (e) {
+      log.error(`[STREAM_RESOLVER] Failed to persist ${mode} job ${streamId}: ${String(e)}`);
+    } finally {
+      try {
+        await releaseLease(streamId, owner);
+      } catch (e) {
+        log.error(`[STREAM_RESOLVER] Failed to release extraction lease ${streamId}: ${String(e)}`);
+      }
+      // Also wake waiters after a rejected write. They reread authoritative
+      // state instead of receiving an unconfirmed or stale local completion.
+      jobEvent(streamId).set();
+    }
+  })().catch((e: unknown) => {
+    // Last boundary for the detached runner, including errors while reporting
+    // another error. No background rejection may terminate the HTTP process.
+    log.error(`[STREAM_RESOLVER] Background extraction failed for ${streamId}: ${String(e)}`);
+  });
 }
 
 /**
- * Claim (SET NX) or reuse a job, starting background extraction when none is
- * running. Mirrors main._ensure_stream_job.
+ * Atomically create/reuse the capability and acquire an extraction lease.
+ * Pending jobs reuse active work; failed or abandoned jobs can acquire a new
+ * attempt without rotating the capability handed to existing clients.
  */
 export async function ensureStreamJob(url: string, mode: string): Promise<string> {
   validateYoutubeTarget(url); // SSRF guard: only valid YouTube targets reach resolver
   const resolvedMode = resolveMode(mode);
   const streamId = encodeStreamId(url, resolvedMode);
-  let secret = newStreamSecret();
-
-  const pending: StreamJob = { url, mode: resolvedMode, extracted_url: null, extracted_time: null, secret };
-  const created = await redis().set(
-    jobKey(streamId),
-    JSON.stringify(pending),
-    'EX',
-    STREAM_TTL,
-    'NX',
-  );
-
-  if (created) {
-    // A fresh pending job supersedes anything this process remembers for that id.
+  const pending: StreamJob = {
+    url, mode: resolvedMode, extracted_url: null, extracted_time: null, secret: newStreamSecret(),
+  };
+  const [raw, owner] = await redis().eval(
+    ENSURE_JOB_SCRIPT, 2, jobKey(streamId), leaseKey(streamId),
+    JSON.stringify(pending), newStreamSecret(), EXTRACTION_LEASE_TTL_S,
+    STREAM_TTL, Math.min(STREAM_TTL, PROXY_STREAM_TTL_S),
+  ) as [string, string];
+  const job = JSON.parse(raw) as StreamJob;
+  if (owner) {
     jobForgetLocal(streamId);
-    startBackgroundExtraction(streamId, url, resolvedMode, secret);
+    startBackgroundExtraction(streamId, url, resolvedMode, job.secret!, owner);
+  } else if (job.extracted_url || job.failed) {
+    jobPublishLocal(streamId, job);
   } else {
-    // A long TTL means a job whose extraction failed would otherwise stay dead
-    // for hours. Retry it — repeat resolves are cheap, the cache serves them.
-    const job = await jobGet(streamId);
-    if (job === null) {
-      // Lost the claim but the key lapsed before we could read it: claim it
-      // outright so the capability returned below stays valid.
-      await redis().set(jobKey(streamId), JSON.stringify(pending), 'EX', STREAM_TTL);
-      startBackgroundExtraction(streamId, url, resolvedMode, secret);
-      return streamCapability(streamId, secret);
-    }
-    if (job.secret) {
-      // Same job everybody gets for this url+mode: reuse its capability.
-      secret = job.secret;
-    } else {
-      // Pre-capability job: backfill a secret so the URL issued now is the
-      // only valid resolver token for it. Bare-id URLs stay rejected.
-      secret = newStreamSecret();
-      await jobSet(streamId, { ...job, secret }, true);
-    }
-    if (job.extracted_url === null && !job.failed) {
-      startBackgroundExtraction(streamId, url, resolvedMode, secret);
-    } else if (job.failed) {
-      job.failed = false;
-      await jobSet(streamId, job, true);
-      startBackgroundExtraction(streamId, url, resolvedMode, secret);
-    }
+    jobForgetLocal(streamId);
   }
-  return streamCapability(streamId, secret);
+  return streamCapability(streamId, job.secret!);
 }
 
 /** Wait (up to `timeout` seconds) for a job with extracted_url or failure, or null if gone. */
@@ -323,6 +393,9 @@ export async function awaitExtracted(
     await event.wait(Math.min(CROSS_REPLICA_POLL_S, remaining / 1000) * 1000);
     job = await jobGet(streamId);
     if (job === null || job.extracted_url || job.failed) break;
+    // A local attempt may have finished after losing its lease or failing to
+    // persist. Subsequent waits should poll at the normal interval, not spin.
+    event.clear();
   }
   return job;
 }
@@ -381,21 +454,28 @@ export async function refreshStreamUrl(
   const secret = job.secret ?? newStreamSecret();
 
   return withRefreshLock(streamId, async () => {
-    // A concurrent request may have already refreshed this while we queued.
-    const current = await jobGet(streamId);
-    if (current && current.extracted_url !== null && current.extracted_url !== deadUrl) {
+    // Redis decides ownership and checks the rejected URL. A replica's five-
+    // second completion memo can still contain the pre-refresh result.
+    const [raw, owner] = await redis().eval(
+      REFRESH_JOB_SCRIPT, 2, jobKey(streamId), leaseKey(streamId),
+      newStreamSecret(), secret, JSON.stringify(deadUrl), EXTRACTION_LEASE_TTL_S, STREAM_TTL,
+    ) as [string, string];
+    if (!raw) return null;
+    const current = JSON.parse(raw) as StreamJob;
+    if (current.extracted_url || current.failed) {
+      jobPublishLocal(streamId, current);
       return current;
     }
+    jobForgetLocal(streamId);
 
-    try {
-      await invalidate(url, mode === 'video' ? 'video:' : 'audio:');
-    } catch (e) {
-      log.error(`[STREAM_PROXY] Cache invalidation failed for ${streamId}: ${String(e)}`);
+    if (owner) {
+      try {
+        await invalidate(url, mode === 'video' ? 'video:' : 'audio:');
+      } catch (e) {
+        log.error(`[STREAM_PROXY] Cache invalidation failed for ${streamId}: ${String(e)}`);
+      }
+      startBackgroundExtraction(streamId, url, mode, current.secret!, owner);
     }
-
-    const pending: StreamJob = { ...job, extracted_url: null, extracted_time: null, proxy_url: null, secret };
-    await jobSet(streamId, pending);
-    startBackgroundExtraction(streamId, url, mode, secret);
     return awaitExtracted(streamId, REFRESH_WAIT_S);
   });
 }

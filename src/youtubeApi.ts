@@ -5,7 +5,7 @@
  * so the endpoint works without any Google key.
  */
 import { config } from './config.js';
-import { nextUtcMidnightEpoch } from './quota.js';
+import { nextPacificMidnightEpoch } from './quota.js';
 import { metadata } from './innertube.js';
 import { formatInd, formatSeconds, parseDur, processVideo, extractArtist } from './formatters.js';
 import type { ProcessedVideo } from './formatters.js';
@@ -42,9 +42,8 @@ export function getRandomKey(): string {
 
 // ── Key health ──────────────────────────────────────────────────
 // Quota is per project (one key per project) and Google resets it at midnight
-// US Pacific; a quota-dead key is skipped until UTC midnight, matching the
-// app-wide reset convention. Reviving early costs one failed probe, after
-// which the key is re-marked — never more than one wasted call per key per day.
+// US Pacific, including daylight-saving changes. Keep exhausted keys out of
+// rotation until that reset; the application's user quotas use UTC separately.
 
 const QUOTA_DEAD_UNTIL = new Map<string, number>();
 const REMOVED_KEYS = new Set<string>();
@@ -82,8 +81,8 @@ export function classifyKeyFailure(reason: string, message: string): 'quota-day'
 function markKeyFailure(key: string, reason: string, message: string): void {
   const kind = classifyKeyFailure(reason, message);
   if (kind === 'quota-day') {
-    QUOTA_DEAD_UNTIL.set(key, nextUtcMidnightEpoch() * 1000);
-    log.warning(`[YOUTUBE_API] key ${keyTag(key)} quota-dead until UTC midnight (${reason})`);
+    QUOTA_DEAD_UNTIL.set(key, nextPacificMidnightEpoch() * 1000);
+    log.warning(`[YOUTUBE_API] key ${keyTag(key)} quota-dead until Pacific midnight (${reason})`);
   } else if (kind === 'removed') {
     REMOVED_KEYS.add(key);
     log.error(`[YOUTUBE_API] key ${keyTag(key)} removed from rotation (${reason || message})`);

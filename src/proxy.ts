@@ -44,6 +44,19 @@ export interface WebshareProxy {
   lastVerification: number;
 }
 
+interface PendingCountryFetch {
+  state: 'pending';
+  inflight: Promise<WebshareProxy | null>;
+  invalidatedIds: Set<string>;
+  invalidatedUrls: Set<string>;
+}
+
+type CountryFetchEntry = PendingCountryFetch | {
+  state: 'complete';
+  at: number;
+  proxy: WebshareProxy | null;
+};
+
 export interface ParsedProxyList {
   proxies: WebshareProxy[];
   droppedInvalid: number;
@@ -340,7 +353,7 @@ export class WebsharePool {
   private rrIndex = 0;
   private warmIndex = 0;
   private failures = new Map<string, number>();
-  private countryFetches = new Map<string, { at: number; proxy: WebshareProxy | null; inflight?: Promise<WebshareProxy | null> }>();
+  private countryFetches = new Map<string, CountryFetchEntry>();
   private timer: NodeJS.Timeout | null = null;
   private refreshInflight: Promise<void> | null = null;
   private lastRefreshAt = 0;
@@ -632,22 +645,38 @@ export class WebsharePool {
 
   /** Country-filtered on-demand fetch (5-min cache, single-flight per country). */
   private async fetchCountryProxy(code: string): Promise<WebshareProxy | null> {
+    // The normalized two-letter key space bounds the cache to 26² entries.
+    if (!/^[A-Z]{2}$/.test(code)) return null;
+    const now = Date.now();
+    for (const [cachedCode, cached] of this.countryFetches) {
+      if (cached.state === 'complete' && now - cached.at >= COUNTRY_FETCH_TTL_MS) {
+        this.countryFetches.delete(cachedCode);
+      }
+    }
     const entry = this.countryFetches.get(code);
-    if (entry && Date.now() - entry.at < COUNTRY_FETCH_TTL_MS) return entry.proxy ?? null;
-    if (entry?.inflight) return entry.inflight;
+    if (entry?.state === 'pending') return entry.inflight;
+    if (entry?.state === 'complete') return entry.proxy;
 
-    const inflight = this.doCountryFetch(code).finally(() => {
-      const current = this.countryFetches.get(code);
-      if (current) current.inflight = undefined;
+    let pending: PendingCountryFetch;
+    const inflight = this.doCountryFetch(code).then((proxies) => {
+      // A close/reset or replacement lookup invalidates this writer, including
+      // its result for callers still waiting on the old promise.
+      if (this.countryFetches.get(code) !== pending) return null;
+      const proxy = proxies.find((candidate) =>
+        !pending.invalidatedIds.has(candidate.id) && !pending.invalidatedUrls.has(candidate.url),
+      ) ?? null;
+      this.countryFetches.set(code, { state: 'complete', at: Date.now(), proxy });
+      return proxy;
     });
-    this.countryFetches.set(code, { at: Date.now(), proxy: null, inflight });
+    pending = { state: 'pending', inflight, invalidatedIds: new Set(), invalidatedUrls: new Set() };
+    this.countryFetches.set(code, pending);
     return inflight;
   }
 
-  private async doCountryFetch(code: string): Promise<WebshareProxy | null> {
+  private async doCountryFetch(code: string): Promise<WebshareProxy[]> {
     const key = apiKey();
     const base = guardedApiUrl();
-    if (!key || !base) return null;
+    if (!key || !base) return [];
     // Same guarded origin as the pool refresh; only the country filter varies.
     base.searchParams.set('country_code', code);
     try {
@@ -657,20 +686,40 @@ export class WebsharePool {
       });
       if (!resp.ok) {
         log.warning(`[WEBSHARE] Country fetch ${code} failed: HTTP ${resp.status}`);
-        return null;
+        return [];
       }
       const parsed = parseProxyList(await resp.json(), { countries: code });
       const proxy = parsed.proxies[0] ?? null;
-      this.countryFetches.set(code, { at: Date.now(), proxy });
       log.info(
         `[WEBSHARE] Country fetch ${code}: ${parsed.proxies.length} proxy(ies)` +
           (proxy ? ` — ${proxy.address}` : ''),
       );
-      return proxy;
+      return parsed.proxies;
     } catch (e) {
       log.warning(`[WEBSHARE] Country fetch ${code} failed: ${String(e)}`);
-      return null;
+      return [];
     }
+  }
+
+  /** Remove an exit from every selector and prevent pending fetches restoring it. */
+  private evictProxy(selector: { id: string } | { url: string }): boolean {
+    const matches = (proxy: WebshareProxy): boolean =>
+      'id' in selector ? proxy.id === selector.id : proxy.url === selector.url;
+    const before = this.candidates.length;
+    this.candidates = this.candidates.filter((proxy) => !matches(proxy));
+    let removed = this.candidates.length < before;
+    for (const [code, entry] of this.countryFetches) {
+      if (entry.state === 'pending') {
+        // A pending result's identity is not known yet. Retain exclusions only
+        // for the lifetime of that fetch; completion discards these sets.
+        if ('id' in selector) entry.invalidatedIds.add(selector.id);
+        else entry.invalidatedUrls.add(selector.url);
+      } else if (entry.proxy && matches(entry.proxy)) {
+        this.countryFetches.delete(code);
+        removed = true;
+      }
+    }
+    return removed;
   }
 
   /** A resolution succeeded through this proxy — clear its failure count. */
@@ -684,9 +733,7 @@ export class WebsharePool {
     this.failures.set(id, count);
     if (count >= MAX_FAILURES_PER_PROXY) {
       this.failures.delete(id);
-      const before = this.candidates.length;
-      this.candidates = this.candidates.filter((p) => p.id !== id);
-      if (this.candidates.length < before) {
+      if (this.evictProxy({ id })) {
         log.warning(
           `[WEBSHARE] Evicting proxy after ${count} consecutive failures — ${this.candidates.length} left in pool`,
         );
@@ -701,9 +748,7 @@ export class WebsharePool {
    * the normal refresh guard) so rotation hands out only live exits.
    */
   evictByUrl(proxyUrl: string): boolean {
-    const before = this.candidates.length;
-    this.candidates = this.candidates.filter((p) => p.url !== proxyUrl);
-    if (this.candidates.length < before) {
+    if (this.evictProxy({ url: proxyUrl })) {
       log.warning(
         `[WEBSHARE] Evicting replaced/stale proxy after 407 — ${this.candidates.length} left in pool, refreshing list`,
       );

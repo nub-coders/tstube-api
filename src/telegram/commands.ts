@@ -170,6 +170,7 @@ export async function cmdHelp(api: TelegramApi, msg: TgMessage): Promise<void> {
   const card = help(token);
   await sendSmartRichMessage(api, msg.chat.id, card.html, {
     receiverUserId: isGrp ? userId : null,
+    fallbackHtml: isGrp ? help('YOUR_TOKEN').html : undefined,
     replyMarkup: card.keyboard ?? startKeyboard(),
   });
 }

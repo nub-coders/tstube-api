@@ -99,6 +99,19 @@ describe('TelegramApi rich payloads', () => {
 });
 
 describe('sendSmartRichMessage fallbacks', () => {
+  it('keeps an unspecified public fallback private, even when direct delivery fails', async () => {
+    mockFetch((_method, body) => {
+      if (body.ephemeral_message_parameters) return new Error('Bad Request: BOT_NOT_ADMIN');
+      return new Error('Forbidden: bot was blocked');
+    });
+    const result = await sendSmartRichMessage(new TelegramApi('T'), -100, '<p>secret token</p>', {
+      receiverUserId: 42,
+    });
+    expect(result).toBeNull();
+    expect(calls.length).toBeGreaterThan(1);
+    for (const call of calls.slice(1)) expect(call.body.chat_id).toBe(42);
+  });
+
   it('falls back to non-ephemeral delivery on BOT_NOT_ADMIN', async () => {
     mockFetch((method) => {
       if (method === 'sendRichMessage' && calls.length === 1) {

@@ -216,7 +216,7 @@ export function platformsCard(): Card {
   <tr><th>Category</th><th>Platforms</th><th>Capabilities</th></tr>
   <tr><td><b>🎥 Video &amp; Shorts</b></td><td>YouTube, YouTube Shorts, Music</td><td>4K, 1080p, 720p, 480p, 360p (MP4/WebM)</td></tr>
   <tr><td><b>🎵 Streaming Services</b></td><td>Spotify, Apple Music, Amazon Music</td><td>Metadata + automated high-fidelity audio matching</td></tr>
-  <tr><td><b>🎼 Direct Audio</b></td><td>SoundCloud, JioSaavn</td><td>Direct 320kbps / 160kbps streaming audio tracks</td></tr>
+  <tr><td><b>🎼 Direct Audio</b></td><td>SoundCloud, JioSaavn</td><td>Available source audio quality; SoundCloud may require an HLS-capable player</td></tr>
 </table>
 
 <h2>📋 Supported Link Examples</h2>

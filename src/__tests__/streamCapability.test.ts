@@ -6,29 +6,15 @@
  * endpoint from serving streams for every known video.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { StreamJobRedis } from './helpers/streamJobRedis.js';
 
 const state = vi.hoisted(() => ({
-  store: new Map<string, string>(),
+  redis: null as unknown as StreamJobRedis,
   extractedUrl: 'https://rr3---sn-test.googlevideo.com/videoplayback?expire=4102444800&ip=203.0.113.9',
 }));
 
-vi.mock('../redis.js', () => ({
-  redis: () => ({
-    get: async (key: string) => state.store.get(key) ?? null,
-    set: async (key: string, value: string, ...rest: unknown[]) => {
-      const opts = rest.map(String);
-      if (opts.includes('NX') && state.store.has(key)) return null;
-      if (opts.includes('XX') && !state.store.has(key)) return null;
-      state.store.set(key, value);
-      return 'OK';
-    },
-    del: async (...keys: string[]) => {
-      let removed = 0;
-      for (const key of keys) if (state.store.delete(key)) removed += 1;
-      return removed;
-    },
-  }),
-}));
+state.redis = new StreamJobRedis();
+vi.mock('../redis.js', () => ({ redis: () => state.redis }));
 
 vi.mock('../cacheManager.js', () => ({
   PROXY_STREAM_TTL_S: 3600,
@@ -49,7 +35,7 @@ import {
 /** The extraction is fire-and-forget; wait until the job carries a URL. */
 async function waitForExtraction(streamId: string): Promise<Record<string, unknown>> {
   for (let i = 0; i < 50; i++) {
-    const raw = state.store.get(`stream_job:${streamId}`);
+    const raw = state.redis.store.get(`stream_job:${streamId}`);
     const job = raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
     if (job?.extracted_url) return job;
     await new Promise((resolve) => setTimeout(resolve, 10));
@@ -64,7 +50,7 @@ function secretOf(capability: string): string {
 }
 
 beforeEach(() => {
-  state.store.clear();
+  state.redis.clear();
   resetJobState();
 });
 
@@ -150,12 +136,12 @@ describe('resolver capability flow', () => {
   it('backfills a secret on pre-capability jobs and retires bare-id URLs', async () => {
     const coreId = encodeStreamId(url, 'audio');
     const legacy = { url, mode: 'audio', extracted_url: state.extractedUrl, extracted_time: 1 };
-    state.store.set(`stream_job:${coreId}`, JSON.stringify(legacy));
+    state.redis.store.set(`stream_job:${coreId}`, JSON.stringify(legacy));
 
     const capability = await ensureStreamJob(url, 'audio');
     expect(capability.startsWith(`${coreId}.`)).toBe(true);
 
-    const stored = JSON.parse(state.store.get(`stream_job:${coreId}`)!) as Record<string, unknown>;
+    const stored = JSON.parse(state.redis.store.get(`stream_job:${coreId}`)!) as Record<string, unknown>;
     expect(stored.secret).toBe(secretOf(capability));
 
     expect((await awaitStreamJob(capability))?.job.extracted_url).toBe(state.extractedUrl);
