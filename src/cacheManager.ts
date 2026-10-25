@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { extractId, invalidateResolvedStream, resolveWithMeta as innertubeResolveMeta } from './innertube.js';
+import { extractId, invalidateResolvedStream, resolveWithMeta as innertubeResolveMeta, type ResolveOptions } from './innertube.js';
 import { redis } from './redis.js';
 import { getLogger } from './logger.js';
 import { detectProvider, resolveToPlayableStream } from './platformResolvers.js';
@@ -243,9 +243,10 @@ async function resolveUrl(
   url: string,
   kind: 'audio' | 'muxed',
   _formatSelector: string,
+  options: ResolveOptions,
 ): Promise<CachedStream | null> {
   try {
-    const res = await innertubeResolveMeta(url, kind);
+    const res = await innertubeResolveMeta(url, kind, options);
     if (res.url) {
       log.info(`[INNERTUBE] ✅ ${kind} ${url}`);
       const videoId = extractId(url);
@@ -262,6 +263,7 @@ async function getStreamFor(
   prefix: string,
   kind: 'audio' | 'muxed',
   formatSelector: string,
+  options: ResolveOptions,
 ): Promise<CachedStream | null> {
   const key = `${prefix}${url}`;
   // A lookup that overlaps invalidation must wait until both stores have
@@ -272,8 +274,8 @@ async function getStreamFor(
   active.add(lookup);
   ACTIVE_LOOKUPS.set(key, active);
   try {
-    const result = await loadStreamFor(url, prefix, kind, formatSelector, lookup);
-    if (lookup.invalidated) return getStreamFor(url, prefix, kind, formatSelector);
+    const result = await loadStreamFor(url, prefix, kind, formatSelector, lookup, options);
+    if (lookup.invalidated) return getStreamFor(url, prefix, kind, formatSelector, options);
     return result;
   } finally {
     active.delete(lookup);
@@ -294,33 +296,38 @@ async function loadStreamFor(
   kind: 'audio' | 'muxed',
   formatSelector: string,
   lookup: StreamLookup,
+  options: ResolveOptions,
 ): Promise<CachedStream | null> {
-  // 1. Redis
-  try {
-    const cached = await redis().get(`cache:${prefix}${url}`);
-    if (cached) {
-      const decoded = decodeCached(cached);
-      if (decoded) {
-        log.info(`[REDIS CACHE HIT] ${prefix}${url}`);
-        return decoded;
-      }
-    }
-  } catch (e) {
-    log.error(`[REDIS GET ERROR] ${String(e)}`);
-  }
-
-  // 2. Local file cache
-  if (lookup.invalidated) return null;
-  const [fileUrl, remaining, fileProxy, fileVideoId] = readCache(url, prefix);
-  if (fileUrl) {
-    const entry: CachedStream = { url: fileUrl, proxyUrl: fileProxy, ...(fileVideoId ? { videoId: fileVideoId } : {}) };
-    lookup.videoId = fileVideoId ?? lookup.videoId;
+  // A concurrent normal lookup can repopulate a rejected route after refresh
+  // invalidates it. Recovery must bypass every cache, not only the player memo.
+  if (!options.forceProxy) {
+    // 1. Redis
     try {
-      await cacheRedis(`cache:${prefix}${url}`, remaining, entry, lookup);
-    } catch {
-      /* ignore */
+      const cached = await redis().get(`cache:${prefix}${url}`);
+      if (cached) {
+        const decoded = decodeCached(cached);
+        if (decoded) {
+          log.info(`[REDIS CACHE HIT] ${prefix}${url}`);
+          return decoded;
+        }
+      }
+    } catch (e) {
+      log.error(`[REDIS GET ERROR] ${String(e)}`);
     }
-    return entry;
+
+    // 2. Local file cache
+    if (lookup.invalidated) return null;
+    const [fileUrl, remaining, fileProxy, fileVideoId] = readCache(url, prefix);
+    if (fileUrl) {
+      const entry: CachedStream = { url: fileUrl, proxyUrl: fileProxy, ...(fileVideoId ? { videoId: fileVideoId } : {}) };
+      lookup.videoId = fileVideoId ?? lookup.videoId;
+      try {
+        await cacheRedis(`cache:${prefix}${url}`, remaining, entry, lookup);
+      } catch {
+        /* ignore */
+      }
+      return entry;
+    }
   }
 
   // 3. Resolve target & stream URL
@@ -332,7 +339,7 @@ async function loadStreamFor(
   }
   const stream = isDirect
     ? ({ url: targetUrl, proxyUrl: null } as CachedStream)
-    : await resolveUrl(targetUrl, kind, formatSelector);
+    : await resolveUrl(targetUrl, kind, formatSelector, options);
   if (stream && !lookup.invalidated) {
     const maxTtl = stream.proxyUrl ? PROXY_STREAM_TTL_S : undefined;
     writeCache(url, stream.url, prefix, stream.proxyUrl, maxTtl, stream.videoId);
@@ -352,12 +359,12 @@ async function loadStreamFor(
   return stream;
 }
 
-export function getStream(url: string): Promise<CachedStream | null> {
-  return getStreamFor(url, 'audio:', 'audio', '251/250/140/bestaudio[ext=m4a]/bestaudio/best');
+export function getStream(url: string, options: ResolveOptions = {}): Promise<CachedStream | null> {
+  return getStreamFor(url, 'audio:', 'audio', '251/250/140/bestaudio[ext=m4a]/bestaudio/best', options);
 }
 
-export function getVideoStream(url: string): Promise<CachedStream | null> {
-  return getStreamFor(url, 'video:', 'muxed', 'best[ext=mp4]/22/18/best');
+export function getVideoStream(url: string, options: ResolveOptions = {}): Promise<CachedStream | null> {
+  return getStreamFor(url, 'video:', 'muxed', 'best[ext=mp4]/22/18/best', options);
 }
 
 /** Test/ops hook to point the file cache at a temp dir. */

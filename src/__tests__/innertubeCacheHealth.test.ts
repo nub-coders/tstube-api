@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { StreamJobRedis } from './helpers/streamJobRedis.js';
+import { Readable } from 'node:stream';
 
 const state = vi.hoisted(() => ({
   create: vi.fn(),
@@ -9,6 +10,7 @@ const state = vi.hoisted(() => ({
   files: new Map<string, string>(),
   platformResolve: vi.fn(),
   cacheWrite: vi.fn(),
+  mediaProbe: vi.fn(),
   jobRedis: undefined as StreamJobRedis | undefined,
 }));
 
@@ -26,6 +28,7 @@ vi.mock('../config.js', () => ({
   config: () => ({ WEBSHARE_API_KEY: state.proxiesEnabled ? 'dummy-key' : null }),
 }));
 vi.mock('../youtubeApi.js', () => ({ fetchRegionRestriction: async () => null }));
+vi.mock('../streamProxy.js', () => ({ proxyStream: state.mediaProbe }));
 vi.mock('../platformResolvers.js', () => ({
   detectProvider: (url: string) => url.includes('music.apple.com') ? 'apple_music' : url.includes('soundcloud.com') ? 'soundcloud' : 'youtube',
   resolveToPlayableStream: state.platformResolve,
@@ -83,6 +86,9 @@ beforeEach(() => {
   state.create.mockReset();
   state.player.mockReset();
   state.platformResolve.mockReset();
+  state.mediaProbe.mockReset().mockImplementation(async () => ({
+    status: 206, headers: { 'content-type': 'video/mp4' }, body: Readable.from([Buffer.from([1])]),
+  }));
   state.proxiesEnabled = false;
   state.jobRedis!.clear();
   state.cacheWrite.mockReset().mockImplementation(async (key: string, _ttl: number, value: string) => {
@@ -226,6 +232,104 @@ describe('proxy health after player failures', () => {
     websharePool._setCandidatesForTest(proxies);
     return proxies;
   }
+
+  function configureRecoveryPlayers(direct: string, proxied: string) {
+    state.player.mockResolvedValue(playable(direct));
+    const proxyPlayer = vi.fn().mockResolvedValue(playable(proxied));
+    state.create.mockImplementation(async (options: { fetch?: unknown }) => ({
+      session: { player: {} }, getBasicInfo: options.fetch ? proxyPlayer : state.player,
+    }));
+    return proxyPlayer;
+  }
+
+  it('bypasses Redis, file and direct-player caches when recovering a rejected route', async () => {
+    const proxies = configureProxies();
+    const id = videoId();
+    const original = streamUrl('rejected-direct');
+    const fresh = streamUrl('fresh-proxy');
+    configureRecoveryPlayers(original, fresh);
+    expect((await getStream(id))?.url).toBe(original);
+    expect(state.files.size).toBeGreaterThan(0);
+    expect(state.redis.size).toBeGreaterThan(0);
+
+    const recovered = await getStream(id, { forceProxy: true });
+    expect(recovered?.url).toBe(fresh);
+    expect(proxies.map(p => p.url)).toContain(recovered?.proxyUrl);
+    expect(state.player).toHaveBeenCalledTimes(1);
+    // A proxied URL must not become a direct, unbound player-cache entry.
+    expect(await resolveBothWithMeta(id)).toEqual({ urls: [original, original], proxyUrl: null });
+  });
+
+  it.each(['audio', 'video'])('refreshes a rejected %s job through a new route with the same capability', async mode => {
+    const proxies = configureProxies();
+    const id = videoId();
+    const original = streamUrl('job-rejected-direct');
+    const fresh = streamUrl('job-fresh-proxy');
+    configureRecoveryPlayers(original, fresh);
+    const capability = await ensureStreamJob(`https://youtu.be/${id}`, mode);
+    const resolved = (await awaitStreamJob(capability))!;
+    expect(resolved.job.extracted_url).toBe(original);
+    const recovered = await refreshStreamUrl(resolved.streamId, resolved.job);
+    expect(recovered?.extracted_url).toBe(fresh);
+    expect(proxies.map(p => p.url)).toContain(recovered?.proxy_url);
+    expect(recovered?.secret).toBe(resolved.job.secret);
+    expect(state.player).toHaveBeenCalledTimes(1);
+    expect((await awaitStreamJob(capability))?.job.extracted_url).toBe(fresh);
+  });
+
+  it('excludes the failed proxy from warm and fallback selections', async () => {
+    configureProxies();
+    const id = videoId();
+    configureRecoveryPlayers(streamUrl('direct'), streamUrl('proxy'));
+    const first = await resolveBothWithMeta(id, 'audio', { forceProxy: true });
+    expect(first.proxyUrl).toBeTruthy();
+    const recovered = await resolveBothWithMeta(id, 'audio', {
+      forceProxy: true, excludeProxyUrl: first.proxyUrl,
+    });
+    expect(recovered.proxyUrl).toBeTruthy();
+    expect(recovered.proxyUrl).not.toBe(first.proxyUrl);
+    expect(state.player).not.toHaveBeenCalled();
+  });
+
+  it('does not reuse the rejected route when no replacement proxy exists', async () => {
+    const [proxy] = configureProxies();
+    websharePool._setCandidatesForTest([proxy!]);
+    const id = videoId();
+    configureRecoveryPlayers(streamUrl('direct'), streamUrl('proxy'));
+    const recovered = await resolveBothWithMeta(id, 'audio', {
+      forceProxy: true, excludeProxyUrl: proxy!.url,
+    });
+    expect(recovered).toEqual({ urls: [null, null], proxyUrl: null });
+    expect(state.create).not.toHaveBeenCalled();
+    expect(websharePool.size).toBe(1);
+  });
+
+  it('rejects player successes whose CDN responds 403 before caching a replacement', async () => {
+    const proxies = configureProxies();
+    configureRecoveryPlayers(streamUrl('direct'), streamUrl('proxy'));
+    const bodies: Readable[] = [];
+    state.mediaProbe.mockImplementation(async (_url: string, options: { proxyUrl: string; rangeHeader: string }) => {
+      expect(options.rangeHeader).toBe('bytes=0-0');
+      const body = Readable.from([Buffer.from([1])]);
+      bodies.push(body);
+      return { status: options.proxyUrl === proxies[0]!.url ? 403 : 206, headers: {}, body };
+    });
+    const recovered = await getStream(videoId(), { forceProxy: true });
+    expect(recovered?.proxyUrl).toBeTruthy();
+    expect(recovered?.proxyUrl).not.toBe(proxies[0]!.url);
+    expect(state.player).not.toHaveBeenCalled();
+    expect(bodies.every(body => body.destroyed)).toBe(true);
+    expect(websharePool.size).toBe(4);
+  });
+
+  it('does not publish a recovery candidate with a successful status but no media bytes', async () => {
+    configureProxies();
+    configureRecoveryPlayers(streamUrl('direct'), streamUrl('proxy'));
+    state.mediaProbe.mockImplementation(async () => ({ status: 206, headers: {}, body: Readable.from([]) }));
+    expect(await getStream(videoId(), { forceProxy: true })).toBeNull();
+    expect(state.files.size).toBe(0);
+    expect(state.redis.size).toBe(0);
+  });
 
   it.each([
     ['UNPLAYABLE', 'This video is unavailable'],

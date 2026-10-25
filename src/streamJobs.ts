@@ -23,13 +23,13 @@ import { redis } from './redis.js';
 import { getStream, getVideoStream, invalidate, PROXY_STREAM_TTL_S } from './cacheManager.js';
 import { validateYoutubeTarget } from './urlValidation.js';
 import { getLogger } from './logger.js';
+import type { ResolveOptions } from './innertube.js';
 
 const log = getLogger('ytube_api.stream');
 
 /** 4 hours — matches YouTube stream URL lifetime. */
 const STREAM_TTL = 14400;
 const JOB_MEMO_TTL = 5.0;
-const REFRESH_WAIT_S = 20.0;
 const CROSS_REPLICA_POLL_S = 2.0;
 export const AWAIT_TIMEOUT_S = 45.0;
 /** A crashed or stalled extractor must not hold a four-hour capability hostage. */
@@ -269,22 +269,23 @@ function startBackgroundExtraction(
   mode: 'audio' | 'video',
   secret: string,
   owner: string,
+  options?: ResolveOptions,
 ): void {
   void (async () => {
     let job: StreamJob;
     try {
       let extracted =
-        mode === 'video' ? await getVideoStream(url) : await getStream(url);
+        mode === 'video' ? await getVideoStream(url, options) : await getStream(url, options);
       if (!extracted?.url && mode === 'video') {
         log.warning(`[STREAM_RESOLVER] Muxed stream extraction returned null for ${streamId}, falling back to audio stream`);
-        extracted = await getStream(url);
+        extracted = await getStream(url, options);
       }
       if (!extracted?.url) {
         log.warning(`[STREAM_RESOLVER] Retrying stream extraction for ${streamId}`);
         await new Promise((r) => setTimeout(r, 1000));
-        extracted = mode === 'video' ? await getVideoStream(url) : await getStream(url);
+        extracted = mode === 'video' ? await getVideoStream(url, options) : await getStream(url, options);
         if (!extracted?.url && mode === 'video') {
-          extracted = await getStream(url);
+          extracted = await getStream(url, options);
         }
       }
       if (!extracted?.url) {
@@ -437,10 +438,9 @@ async function withRefreshLock<T>(streamId: string, fn: () => Promise<T>): Promi
 }
 
 /**
- * Drop a revoked stream URL and re-extract it. Recovering from a 403 needs all
- * three of: invalidate the cache (it keys expiry off `expire`, and googlevideo
- * revokes well before that), clear `extracted_url` BEFORE re-extracting so
- * awaitExtracted actually waits, then start extraction.
+ * Drop a revoked stream URL and re-extract it. Clear the cache and pending job
+ * before extraction, and carry the rejected route into recovery so a fresh
+ * signed URL does not repeat the same failed direct connection or proxy exit.
  */
 export async function refreshStreamUrl(
   streamId: string,
@@ -474,9 +474,12 @@ export async function refreshStreamUrl(
       } catch (e) {
         log.error(`[STREAM_PROXY] Cache invalidation failed for ${streamId}: ${String(e)}`);
       }
-      startBackgroundExtraction(streamId, url, mode, current.secret!, owner);
+      startBackgroundExtraction(streamId, url, mode, current.secret!, owner, {
+        forceProxy: true,
+        excludeProxyUrl: job.proxy_url ?? null,
+      });
     }
-    return awaitExtracted(streamId, REFRESH_WAIT_S);
+    return awaitExtracted(streamId, AWAIT_TIMEOUT_S);
   });
 }
 

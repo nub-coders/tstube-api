@@ -66,6 +66,9 @@ configured port. Invalid connection URLs fail at startup without logging credent
   bytes. `{id}` is `base64url(sha256("{mode}:{url}"))`.
 - **Revoked URLs are retried once.** A `403`/`410` from the CDN triggers a single
   cache invalidation + re-extraction; `404` is deliberately not retried.
+  When Webshare is configured, recovery bypasses the rejected direct route and
+  excludes the previous proxy exit. It checks that a replacement serves media
+  bytes before caching it. The original resolver URL stays valid.
 - **Bot UI degrades.** If rich or ephemeral delivery is unavailable, group cards
   use an explicitly safe public fallback. Otherwise, delivery falls back to a
   direct message. Credential-bearing content is never implicitly made public.

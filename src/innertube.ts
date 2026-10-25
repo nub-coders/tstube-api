@@ -9,6 +9,7 @@ import { BoundedCache } from './boundedCache.js';
 import { websharePool } from './proxy.js';
 import { fetchRegionRestriction } from './youtubeApi.js';
 import type { WebshareProxy } from './proxy.js';
+import { proxyStream } from './streamProxy.js';
 
 (Platform.shim as any).eval = async (d: any) => new Function(d.output)();
 
@@ -81,6 +82,12 @@ Parser.setParserErrorHandler((error) => {
 
 const ID_RE = /(?:v=|\/shorts\/|youtu\.be\/|\/embed\/|\/v\/|\/live\/)([A-Za-z0-9_-]{11})/;
 const BARE_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+
+export interface ResolveOptions {
+  /** The CDN rejected the previous route; do not repeat direct extraction. */
+  forceProxy?: boolean;
+  excludeProxyUrl?: string | null;
+}
 
 // INFO_CACHE: caches getBasicInfo results for 1 hour.
 const INFO_CACHE = new BoundedCache<any>(2048, 3600);
@@ -500,10 +507,41 @@ function raceUsable<T>(tasks: Promise<T | null>[]): Promise<T | null> {
   });
 }
 
+/** Player metadata can be OK even when the CDN rejects the signed URL. */
+async function probeProxyMedia(meta: ResolveMeta, kind: 'audio' | 'muxed', deadline: number): Promise<boolean> {
+  const url = meta.urls[kind === 'audio' ? 1 : 0];
+  const budget = Math.min(5_000, deadline - Date.now());
+  if (!url || budget <= 0) return false;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), budget);
+  let body: import('node:stream').Readable | null = null;
+  try {
+    const response = await proxyStream(url, {
+      proxyUrl: meta.proxyUrl,
+      rangeHeader: 'bytes=0-0',
+      signal: controller.signal,
+    });
+    body = response.body;
+    if ((response.status !== 200 && response.status !== 206) || !body) return false;
+    for await (const chunk of body) {
+      if (chunk.length) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+    body?.destroy();
+    controller.abort();
+  }
+}
+
 async function resolveViaProxyTier(
   vid: string,
-  _kind: 'audio' | 'muxed',
+  kind: 'audio' | 'muxed',
   geo?: GeoRestriction,
+  excludeProxyUrl?: string | null,
+  verifyMedia = false,
 ): Promise<ResolveMeta | null> {
   if (!websharePool.enabled) return null;
 
@@ -529,6 +567,10 @@ async function resolveViaProxyTier(
       const yt = await withTimeout(getProxiedInnertube(proxy.url), bootBudget, 'proxied innertube bootstrap');
       const result = await attemptResolveWithProxiedInnertube(vid, proxy.url, yt, deadline);
       if (result.meta) {
+        if (verifyMedia && !await probeProxyMedia(result.meta, kind, deadline)) {
+          log.info(`[YTJS] ${vid} recovery candidate failed media probe; trying another exit`);
+          return null;
+        }
         websharePool.markOk(proxy.id);
         log.info(`[YTJS] ✅ ${vid} resolved via Webshare proxy (youtubei.js)`);
         return result.meta;
@@ -564,9 +606,9 @@ async function resolveViaProxyTier(
       candidates = websharePool.getWarmCandidates(PROXY_CANDIDATES, isProxiedInnertubeWarm);
     }
 
-    let untried = candidates.filter((p) => !tried.has(p.id));
+    let untried = candidates.filter((p) => !tried.has(p.id) && p.url !== excludeProxyUrl);
     if (!untried.length) {
-      const all = websharePool.getAllCandidates().filter((p) => !tried.has(p.id));
+      const all = websharePool.getAllCandidates().filter((p) => !tried.has(p.id) && p.url !== excludeProxyUrl);
       if (!all.length) break;
       untried = all.slice(0, PROXY_CANDIDATES);
     }
@@ -638,11 +680,13 @@ function geoFromAttempt(attempt: ResolveAttempt): GeoRestriction | null {
 export async function resolveBothWithMeta(
   urlOrId: string,
   kind: 'audio' | 'muxed' = 'audio',
+  options: ResolveOptions = {},
 ): Promise<ResolveMeta> {
   const vid = extractId(urlOrId);
   if (!vid) return { urls: [null, null], proxyUrl: null };
 
-  const cached = RESOLVED_STREAM_CACHE.get(vid);
+  const proxyRecovery = options.forceProxy && websharePool.enabled;
+  const cached = proxyRecovery ? undefined : RESOLVED_STREAM_CACHE.get(vid);
   if (cached) return cached;
 
   const active = { invalidated: false };
@@ -650,6 +694,11 @@ export async function resolveBothWithMeta(
   attempts.add(active);
   ACTIVE_STREAM_RESOLVES.set(vid, attempts);
   try {
+    if (proxyRecovery) {
+      const result = await resolveViaProxyTier(vid, kind, undefined, options.excludeProxyUrl, true);
+      if (active.invalidated) return resolveBothWithMeta(urlOrId, kind, options);
+      return result ?? { urls: [null, null], proxyUrl: null };
+    }
     const directAttempt = await attemptResolve(vid, () => !active.invalidated);
     let geo = geoFromAttempt(directAttempt);
     let result: ResolveMeta = { urls: directAttempt.urls, proxyUrl: null };
@@ -672,7 +721,7 @@ export async function resolveBothWithMeta(
       const viaProxy = await resolveViaProxyTier(vid, kind, geo ?? undefined);
       if (viaProxy) result = viaProxy;
     }
-    if (active.invalidated) return resolveBothWithMeta(urlOrId, kind);
+    if (active.invalidated) return resolveBothWithMeta(urlOrId, kind, options);
     if (!result.proxyUrl && (result.urls[0] || result.urls[1])) RESOLVED_STREAM_CACHE.set(vid, result);
     return result;
   } finally {
@@ -691,10 +740,11 @@ export async function resolveBoth(
 export async function resolveWithMeta(
   urlOrId: string,
   kind: 'audio' | 'muxed',
+  options: ResolveOptions = {},
 ): Promise<{ url: string | null; proxyUrl: string | null }> {
   const vid = extractId(urlOrId);
   if (!vid) return { url: null, proxyUrl: null };
-  const meta = await resolveBothWithMeta(urlOrId, kind);
+  const meta = await resolveBothWithMeta(urlOrId, kind, options);
   return { url: kind === 'audio' ? meta.urls[1] : meta.urls[0], proxyUrl: meta.proxyUrl };
 }
 
