@@ -26,6 +26,8 @@ const log = getLogger('ytube_api.main');
 
 const HTTP_PORT = 8000;
 const HTTP_HOST = '0.0.0.0';
+const BOT_START_MAX_ATTEMPTS = 5;
+const BOT_START_RETRY_BASE_MS = 1_000;
 
 const routeTable: RouteSpec[] = [
   ['/', routes.root],
@@ -44,6 +46,25 @@ const routeTable: RouteSpec[] = [
   ['/favicon.ico', routes.faviconIco],
   ['/favicon.svg', routes.faviconSvg],
 ];
+
+async function startBotWithRetry(cfg: ReturnType<typeof loadConfig>): Promise<() => Promise<void>> {
+  for (let attempt = 1; attempt <= BOT_START_MAX_ATTEMPTS; attempt++) {
+    try {
+      const { startBot } = await import('./telegram/bot.js');
+      return await startBot(cfg);
+    } catch (e) {
+      const isNetworkFailure = String(e).includes('Network request');
+      if (!isNetworkFailure || attempt === BOT_START_MAX_ATTEMPTS) throw e;
+      const delayMs = BOT_START_RETRY_BASE_MS * 2 ** (attempt - 1);
+      log.warning(
+        `[STARTUP] Bot network initialization failed (attempt ${attempt}/${BOT_START_MAX_ATTEMPTS}); ` +
+        `retrying in ${delayMs}ms: ${String(e)}`,
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  throw new Error('Bot startup exhausted retry attempts');
+}
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
@@ -80,8 +101,7 @@ async function main(): Promise<void> {
   let stopBot: (() => Promise<void>) | null = null;
   if (cfg.BOT_TOKEN && cfg.START_BOT) {
     try {
-      const { startBot } = await import('./telegram/bot.js');
-      stopBot = await startBot(cfg);
+      stopBot = await startBotWithRetry(cfg);
     } catch (e) {
       log.error(`[STARTUP] Bot failed: ${String(e)} — running HTTP API standalone`);
     }
