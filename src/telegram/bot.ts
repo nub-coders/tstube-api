@@ -6,6 +6,7 @@
  * commands from admin.py / broadcast.py.
  */
 import { Bot } from 'grammy';
+import { setTimeout as delay } from 'node:timers/promises';
 import { TelegramApi, type CallbackQuery, type TgMessage } from './api.js';
 import { BOT_COMMANDS, cmdHelp, cmdMenu, cmdPing, cmdPlatforms, cmdRevoke, cmdStart, cmdStatus, cmdToken } from './commands.js';
 import {
@@ -116,6 +117,7 @@ export async function startBot(cfg: Config): Promise<() => Promise<void>> {
   await bot.api.deleteWebhook({ drop_pending_updates: false });
   await bot.api.setMyCommands(BOT_COMMANDS);
   const me = await bot.api.getMe();
+  bot.botInfo = me;
   log.info(`[BOT] Started @${me.username ?? me.first_name} (${me.id}) via grammY (Bot API 10.3)`);
 
   // Pre-warm stats cache in background so admin button responds instantly
@@ -141,11 +143,38 @@ export async function startBot(cfg: Config): Promise<() => Promise<void>> {
     log.error('[BOT] grammY error caught', { err: String(err.error) });
   });
 
-  void bot.start({
-    allowed_updates: ['message', 'callback_query'],
+  const stopping = new AbortController();
+  // grammY's middleware error handler does not handle polling failures.
+  // Supervise this promise for its entire lifetime, including restarts.
+  const polling = (async () => {
+    while (!stopping.signal.aborted) {
+      try {
+        await bot.start({ allowed_updates: ['message', 'callback_query'] });
+        return;
+      } catch (error) {
+        if (stopping.signal.aborted) return;
+        const code = (error as { error_code?: number })?.error_code;
+        if (code !== 409) {
+          log.error('[BOT] Polling stopped; HTTP API remains available', { err: String(error) });
+          return; // Invalid credentials and other terminal failures need operator action.
+        }
+        log.warning('[BOT] Polling conflict; retrying in 30 seconds');
+        await delay(30_000, undefined, { signal: stopping.signal }).catch((error: unknown) => {
+          if (!stopping.signal.aborted) throw error;
+        });
+      }
+    }
+  })().catch((error: unknown) => {
+    log.error('[BOT] Polling supervisor failed', { err: String(error) });
   });
 
   return async () => {
-    await bot.stop();
+    stopping.abort();
+    try {
+      if (bot.isRunning()) await bot.stop();
+    } catch (error) {
+      log.warning('[BOT] Failed to confirm polling shutdown', { err: String(error) });
+    }
+    await polling;
   };
 }

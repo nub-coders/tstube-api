@@ -26,15 +26,19 @@ import {
   resolveMode,
   awaitStreamJob,
   refreshStreamUrl,
+  AWAIT_TIMEOUT_S,
+  type StreamJob,
 } from './streamJobs.js';
-import { proxyStream } from './streamProxy.js';
+import { proxyPlayback, type ProxyUpstream, type ProxyOptions } from './streamProxy.js';
+import { proxyHlsManifest, resolveHlsResource } from './hlsProxy.js';
 import {
   fetchResults as scrapeSearch,
   fetchTrending,
   fetchSuggestions,
 } from './searchService.js';
-import { fetchResults as apiSearch, getVideoById } from './youtubeApi.js';
-import { related } from './innertube.js';
+import { getVideoById } from './youtubeApi.js';
+import { fetchResults as apiSearch } from './dataApiSearch.js';
+import { extractId, related } from './innertube.js';
 import { extractPlaylist, ValueError } from './playlistParser.js';
 
 const log = getLogger('ytube_api.routes');
@@ -57,23 +61,6 @@ function makeTempProxy(ctx: Ctx, streamToken: string): string {
 async function resolveStreamUrlForInfo(ctx: Ctx, url: string): Promise<string> {
   const streamId = await ensureStreamJob(url, 'video');
   return makeTempProxy(ctx, streamId);
-}
-
-function extractVideoIdFromUrl(value: string): string | null {
-  let p: URL;
-  try {
-    p = new URL(value);
-  } catch {
-    return null;
-  }
-  if (p.hostname.includes('youtu.be')) {
-    const candidate = p.pathname.replace(/^\/+|\/+$/g, '');
-    return candidate || null;
-  }
-  if (p.hostname.includes('youtube.com')) {
-    return p.searchParams.get('v');
-  }
-  return null;
 }
 
 function errorBody(e: unknown, start: number): Record<string, unknown> {
@@ -279,7 +266,18 @@ export async function streamResolver(ctx: Ctx): Promise<Result> {
   const started = Date.now();
   // Validate the "<id>.<secret>" capability before waiting: unknown ids and
   // wrong secrets 404 identically, so job existence is not observable.
-  const resolved = await awaitStreamJob(ctx.params.stream_id!);
+  const capability = ctx.params.stream_id!;
+  if (capability.startsWith('hls_')) {
+    const upstream = await resolveHlsResource(capability, {
+      ...playbackOptions(ctx, started),
+      childUrl: token => `/stream/proxy/${token}`,
+    });
+    if (!upstream) return json(404, { error: 'Stream not found' });
+    if (upstream.status >= 400 || !upstream.body) return json(upstream.status, { error: 'Live stream resource unavailable' });
+    return streamResponse(upstream.status, upstream.headers, upstream.body);
+  }
+  const resolved = await awaitStreamJob(capability, AWAIT_TIMEOUT_S, ctx.signal);
+  const remainingWait = () => Math.max(0, AWAIT_TIMEOUT_S - (Date.now() - started) / 1000);
 
   if (resolved === null) {
     return json(404, {
@@ -290,10 +288,12 @@ export async function streamResolver(ctx: Ctx): Promise<Result> {
   const { streamId, job } = resolved;
 
   if (!job.extracted_url) {
-    return json(500, { error: 'Failed to extract stream URL', url: job.url });
+    if (!job.failed) return pendingStream();
+    return json(502, { error: 'Failed to extract stream URL', url: job.url });
   }
 
-  let upstream = await proxyFor(ctx, job.extracted_url, started, job.proxy_url ?? null);
+  let upstream = await proxyFor(ctx, job.extracted_url, started, job.proxy_url ?? null, job.stream_type, job.mode, sourceAuthorityExpires(job));
+  let recovered = false;
   if (upstream.status === 502 && upstream.error) {
     // A refused or stalled dial through a pinned exit (HTTP 407 replacement, or
     // connect/tunnel timeout) is recoverable: the pool already evicted the dead
@@ -301,11 +301,13 @@ export async function streamResolver(ctx: Ctx): Promise<Result> {
     // revoked-URL path.
     const retriable = Boolean((upstream.error as { retriable?: boolean }).retriable);
     if (retriable && job.proxy_url) {
+      recovered = true;
       log.info(`[STREAM_PROXY] Dial failed for ${streamId} — refreshing via a new exit...`);
-      const refreshed = await refreshStreamUrl(streamId, job);
+      const refreshed = await refreshStreamUrl(streamId, job, remainingWait(), ctx.signal);
+      if (refreshed && !refreshed.extracted_url && !refreshed.failed) return pendingStream();
       const newUrl = refreshed?.extracted_url;
-      if (newUrl && newUrl !== job.extracted_url) {
-        upstream = await proxyFor(ctx, newUrl, started, refreshed?.proxy_url ?? null);
+      if (newUrl) {
+        upstream = await proxyFor(ctx, newUrl, started, refreshed?.proxy_url ?? null, refreshed?.stream_type, job.mode, refreshed ? sourceAuthorityExpires(refreshed) : undefined);
       }
     }
     if (upstream.status === 502 && upstream.error) {
@@ -313,15 +315,15 @@ export async function streamResolver(ctx: Ctx): Promise<Result> {
     }
   }
 
-  // Revoked-URL recovery, capped at a single retry: googlevideo answers 403/410
-  // for a URL it has invalidated. 404 is the video being gone — re-extracting it
-  // would just fail again more slowly.
-  if (upstream.status === 403 || upstream.status === 410) {
+  // A CDN resource may disappear independently of the video's availability.
+  // Refresh a rejected source once, preserving the caller's capability.
+  if (!recovered && [403, 404, 410].includes(upstream.status)) {
     log.info(`[STREAM_PROXY] Got ${upstream.status} from upstream for ${streamId}, refreshing...`);
-    const refreshed = await refreshStreamUrl(streamId, job);
+    const refreshed = await refreshStreamUrl(streamId, job, remainingWait(), ctx.signal);
+    if (refreshed && !refreshed.extracted_url && !refreshed.failed) return pendingStream();
     const newUrl = refreshed?.extracted_url;
-    if (newUrl && newUrl !== job.extracted_url) {
-      upstream = await proxyFor(ctx, newUrl, started, refreshed?.proxy_url ?? null);
+    if (newUrl) {
+      upstream = await proxyFor(ctx, newUrl, started, refreshed?.proxy_url ?? null, refreshed?.stream_type, job.mode, refreshed ? sourceAuthorityExpires(refreshed) : undefined);
       if (upstream.status === 502 && upstream.error) {
         return json(502, upstream.error);
       }
@@ -337,21 +339,44 @@ export async function streamResolver(ctx: Ctx): Promise<Result> {
   return streamResponse(upstream.status, upstream.headers, upstream.body!);
 }
 
+function sourceAuthorityExpires(job: StreamJob): number {
+  return ((job.extracted_time ?? Date.now() / 1000) + (job.proxy_url ? 3600 : 14400)) * 1000;
+}
+
+function pendingStream(): Result {
+  const result = json(202, { status: 'pending', message: 'Stream extraction is still running', retry_after: 2 });
+  result.headers['retry-after'] = '2';
+  result.headers['cache-control'] = 'no-store';
+  return result;
+}
+
+function playbackOptions(ctx: Ctx, startedMs: number, proxyUrl: string | null = null): ProxyOptions {
+  const range = ctx.req.headers.range;
+  const ua = ctx.req.headers['user-agent'];
+  return {
+    rangeHeader: Array.isArray(range) ? range[0] : (range ?? null),
+    userAgent: Array.isArray(ua) ? ua[0] : (ua ?? null),
+    startedMs, proxyUrl, signal: ctx.signal,
+  };
+}
+
 async function proxyFor(
   ctx: Ctx,
   target: string,
   startedMs: number,
   proxyUrl: string | null = null,
-): Promise<{ status: number; headers: Record<string, string>; body: import('node:stream').Readable | null; error?: unknown }> {
-  const range = ctx.req.headers.range;
-  const ua = ctx.req.headers['user-agent'];
-  return proxyStream(target, {
-    rangeHeader: Array.isArray(range) ? range[0] : (range ?? null),
-    userAgent: Array.isArray(ua) ? ua[0] : (ua ?? null),
-    startedMs,
-    proxyUrl,
-    signal: ctx.signal,
-  });
+  streamType?: 'hls',
+  mode: 'audio' | 'video' = 'video',
+  expiresAt?: number,
+): Promise<ProxyUpstream> {
+  const options = playbackOptions(ctx, startedMs, proxyUrl);
+  if (streamType === 'hls') {
+    return proxyHlsManifest(target, {
+      ...options, mode, scope: ctx.params.stream_id!, expiresAt,
+      childUrl: token => `/stream/proxy/${token}`,
+    });
+  }
+  return proxyPlayback(target, options);
 }
 
 // ── /info ───────────────────────────────────────────────────────
@@ -370,7 +395,7 @@ export async function videoInfo(ctx: Ctx): Promise<Result> {
     const isUrl = /(youtube\.com|youtu\.be)/.test(q);
 
     if (isUrl) {
-      const videoId = extractVideoIdFromUrl(q);
+      const videoId = extractId(q);
       const metadataTask = videoId ? getVideoById(videoId) : Promise.resolve(null);
       const relatedTask = videoId ? related(videoId, 5) : Promise.resolve([]);
       const streamUrlTask = resolveStreamUrlForInfo(ctx, q);

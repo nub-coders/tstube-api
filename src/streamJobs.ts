@@ -3,7 +3,7 @@
  * (`stream_job:{id}` -> {url, mode, extracted_url, extracted_time}).
  *
  * Job state lives in Redis so /stream/redirect and /stream/resolver can land on
- * different replicas behind a non-sticky load balancer. TTL covers the 45s
+ * different replicas behind a non-sticky load balancer. TTL covers the 105s
  * resolver wait + buffer.
  *
  * Resolver URLs are bearer capabilities: "<coreId>.<secret>". The coreId is
@@ -12,10 +12,9 @@
  * endpoint from being an open stream for every known video. Only capability
  * URLs the API issued to an authenticated caller resolve.
  *
- * Three in-process caches mirror the Python globals:
+ * Two in-process caches coordinate completion and notification:
  *   _JOB_MEMO      completed or failed jobs (pending jobs remain authoritative)
  *   _JOB_EVENTS    wakes local waiters the instant extraction finishes
- *   _REFRESH_LOCKS coalesces concurrent 403 refreshes of the same id
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { BoundedCache } from './boundedCache.js';
@@ -24,6 +23,9 @@ import { getStream, getVideoStream, invalidate, PROXY_STREAM_TTL_S } from './cac
 import { validateYoutubeTarget } from './urlValidation.js';
 import { getLogger } from './logger.js';
 import type { ResolveOptions } from './innertube.js';
+import { withRequestDeadline } from './requestDeadline.js';
+import { invalidateMediaProbe } from './mediaProbe.js';
+import { STREAM_VALIDATION_VERSION } from './streamPolicy.js';
 
 const log = getLogger('ytube_api.stream');
 
@@ -31,7 +33,9 @@ const log = getLogger('ytube_api.stream');
 const STREAM_TTL = 14400;
 const JOB_MEMO_TTL = 5.0;
 const CROSS_REPLICA_POLL_S = 2.0;
-export const AWAIT_TIMEOUT_S = 45.0;
+// Leave time for the whole extraction deadline and publication before giving up.
+export const AWAIT_TIMEOUT_S = 105.0;
+export const EXTRACTION_TIMEOUT_MS = 100_000;
 /** A crashed or stalled extractor must not hold a four-hour capability hostage. */
 const EXTRACTION_LEASE_TTL_S = 120;
 
@@ -52,7 +56,7 @@ end
 local backfill = not job.secret or job.secret == cjson.null
 if backfill then job.secret = pending.secret end
 local owner = ''
-if (not job.extracted_url or job.extracted_url == cjson.null) and
+if (not job.extracted_url or job.extracted_url == cjson.null or job.validation_version ~= tonumber(ARGV[6])) and
     redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3], 'NX') then
   owner = ARGV[2]
   pending.secret = job.secret
@@ -119,11 +123,13 @@ export interface StreamJob {
    */
   secret?: string;
   failed?: boolean;
+  /** Cache policy applied when this source was selected. */
+  validation_version?: number;
+  stream_type?: 'hls';
 }
 
 const JOB_MEMO = new BoundedCache<StreamJob>(2048, JOB_MEMO_TTL);
 const JOB_EVENTS = new BoundedCache<Signal>(4096);
-const REFRESH_LOCKS = new BoundedCache<Promise<void>>(1024);
 
 /** One-shot broadcast, the JS stand-in for asyncio.Event. */
 class Signal {
@@ -142,20 +148,24 @@ class Signal {
   }
 
   /** Resolve after `ms` at the latest; resolves immediately if already set. */
-  wait(ms: number): Promise<void> {
+  wait(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
     if (this.flag) return Promise.resolve();
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       let done = false;
-      const fn = (): void => {
+      const finish = (error?: unknown): void => {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        // Drop ourselves from the waiter list.
-        this.waiters = this.waiters.filter((w) => w !== fn);
-        resolve();
+        this.waiters = this.waiters.filter(w => w !== fn);
+        signal?.removeEventListener('abort', aborted);
+        if (error !== undefined) reject(error); else resolve();
       };
+      const fn = () => finish();
+      const aborted = () => finish(signal?.reason ?? new Error('Resolver cancelled'));
       const timer = setTimeout(fn, ms);
       this.waiters.push(fn);
+      signal?.addEventListener('abort', aborted, { once: true });
     });
   }
 }
@@ -274,40 +284,37 @@ function startBackgroundExtraction(
   void (async () => {
     let job: StreamJob;
     try {
-      let extracted =
-        mode === 'video' ? await getVideoStream(url, options) : await getStream(url, options);
-      if (!extracted?.url && mode === 'video') {
-        log.warning(`[STREAM_RESOLVER] Muxed stream extraction returned null for ${streamId}, falling back to audio stream`);
-        extracted = await getStream(url, options);
-      }
-      if (!extracted?.url) {
-        log.warning(`[STREAM_RESOLVER] Retrying stream extraction for ${streamId}`);
-        await new Promise((r) => setTimeout(r, 1000));
-        extracted = mode === 'video' ? await getVideoStream(url, options) : await getStream(url, options);
-        if (!extracted?.url && mode === 'video') {
-          extracted = await getStream(url, options);
+      job = await withRequestDeadline(EXTRACTION_TIMEOUT_MS, 'stream extraction', async () => {
+        let extracted =
+          mode === 'video' ? await getVideoStream(url, options) : await getStream(url, options);
+        if (!extracted?.url) {
+          log.warning(`[STREAM_RESOLVER] Retrying stream extraction for ${streamId}`);
+          await new Promise((r) => setTimeout(r, 1000));
+          extracted = mode === 'video' ? await getVideoStream(url, options) : await getStream(url, options);
         }
-      }
-      if (!extracted?.url) {
-        log.error(`[STREAM_RESOLVER] Failed to extract ${mode} for ${streamId}`);
-        job = {
-          url,
-          mode,
-          extracted_url: null,
-          extracted_time: Date.now() / 1000,
-          secret,
-          failed: true,
-        };
-      } else {
-        job = {
-          url,
-          mode,
-          extracted_url: extracted.url,
-          extracted_time: Date.now() / 1000,
-          proxy_url: extracted.proxyUrl ?? null,
-          secret,
-        };
-      }
+        if (!extracted?.url) {
+          log.error(`[STREAM_RESOLVER] Failed to extract ${mode} for ${streamId}`);
+          return {
+            url,
+            mode,
+            extracted_url: null,
+            extracted_time: Date.now() / 1000,
+            secret,
+            failed: true,
+          };
+        } else {
+          return {
+            url,
+            mode,
+            extracted_url: extracted.url,
+            extracted_time: Date.now() / 1000,
+            proxy_url: extracted.proxyUrl ?? null,
+            validation_version: STREAM_VALIDATION_VERSION,
+            ...(extracted.streamType === 'hls' ? { stream_type: 'hls' as const } : {}),
+            secret,
+          };
+        }
+      });
     } catch (e) {
       log.error(`[STREAM_RESOLVER] Failed to extract ${mode}: ${String(e)}`);
       job = {
@@ -360,11 +367,12 @@ export async function ensureStreamJob(url: string, mode: string): Promise<string
   const streamId = encodeStreamId(url, resolvedMode);
   const pending: StreamJob = {
     url, mode: resolvedMode, extracted_url: null, extracted_time: null, secret: newStreamSecret(),
+    validation_version: STREAM_VALIDATION_VERSION,
   };
   const [raw, owner] = await redis().eval(
     ENSURE_JOB_SCRIPT, 2, jobKey(streamId), leaseKey(streamId),
     JSON.stringify(pending), newStreamSecret(), EXTRACTION_LEASE_TTL_S,
-    STREAM_TTL, Math.min(STREAM_TTL, PROXY_STREAM_TTL_S),
+    STREAM_TTL, Math.min(STREAM_TTL, PROXY_STREAM_TTL_S), STREAM_VALIDATION_VERSION,
   ) as [string, string];
   const job = JSON.parse(raw) as StreamJob;
   if (owner) {
@@ -382,23 +390,30 @@ export async function ensureStreamJob(url: string, mode: string): Promise<string
 export async function awaitExtracted(
   streamId: string,
   timeout = AWAIT_TIMEOUT_S,
+  signal?: AbortSignal,
 ): Promise<StreamJob | null> {
+  signal?.throwIfAborted();
   let job = await jobGet(streamId);
-  if (job === null || job.extracted_url || job.failed) return job;
+  if (job === null || isCurrentSource(job) || job.failed) return job;
 
   const event = jobEvent(streamId);
   const deadline = Date.now() + timeout * 1000;
   for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
-    await event.wait(Math.min(CROSS_REPLICA_POLL_S, remaining / 1000) * 1000);
+    await event.wait(Math.min(CROSS_REPLICA_POLL_S, remaining / 1000) * 1000, signal);
+    signal?.throwIfAborted();
     job = await jobGet(streamId);
-    if (job === null || job.extracted_url || job.failed) break;
+    if (job === null || isCurrentSource(job) || job.failed) break;
     // A local attempt may have finished after losing its lease or failing to
     // persist. Subsequent waits should poll at the normal interval, not spin.
     event.clear();
   }
-  return job;
+  return job?.extracted_url && !isCurrentSource(job) ? { ...job, extracted_url: null, failed: false } : job;
+}
+
+function isCurrentSource(job: StreamJob): boolean {
+  return Boolean(job.extracted_url) && job.validation_version === STREAM_VALIDATION_VERSION;
 }
 
 /**
@@ -411,30 +426,24 @@ export async function awaitExtracted(
 export async function awaitStreamJob(
   capability: string,
   timeout = AWAIT_TIMEOUT_S,
+  signal?: AbortSignal,
 ): Promise<{ streamId: string; job: StreamJob } | null> {
+  signal?.throwIfAborted();
   const parsed = parseStreamCapability(capability);
   if (!parsed) return null;
   const known = await jobGet(parsed.streamId);
+  signal?.throwIfAborted();
   if (known === null || known.secret !== parsed.secret) return null;
-  const job = await awaitExtracted(parsed.streamId, timeout);
+  if ((!known.extracted_url && !known.failed) || (known.extracted_url && !isCurrentSource(known))) {
+    // Reuse live leases, recover abandoned work, or migrate an old source.
+    // All three preserve the issued capability secret.
+    const activeLease = await redis().get(leaseKey(parsed.streamId));
+    signal?.throwIfAborted();
+    if (!activeLease) await ensureStreamJob(known.url, known.mode);
+  }
+  const job = await awaitExtracted(parsed.streamId, timeout, signal);
   if (job === null || job.secret !== parsed.secret) return null;
   return { streamId: parsed.streamId, job };
-}
-
-/** Serialize refreshes per stream id (Python's per-id asyncio.Lock). */
-async function withRefreshLock<T>(streamId: string, fn: () => Promise<T>): Promise<T> {
-  const prev = REFRESH_LOCKS.get(streamId) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>((r) => {
-    release = r;
-  });
-  REFRESH_LOCKS.set(streamId, prev.then(() => gate));
-  await prev;
-  try {
-    return await fn();
-  } finally {
-    release();
-  }
 }
 
 /**
@@ -445,15 +454,21 @@ async function withRefreshLock<T>(streamId: string, fn: () => Promise<T>): Promi
 export async function refreshStreamUrl(
   streamId: string,
   job: StreamJob,
+  timeout = AWAIT_TIMEOUT_S,
+  signal?: AbortSignal,
 ): Promise<StreamJob | null> {
+  signal?.throwIfAborted();
+  const deadline = Date.now() + Math.max(0, timeout) * 1000;
   const { url, mode } = job;
   if (!url || !mode) return null;
   const deadUrl = job.extracted_url;
+  if (deadUrl) invalidateMediaProbe(deadUrl, job.proxy_url);
   // Re-extractions keep the capability secret so the resolver URL issued for
   // the original job keeps working across refreshes.
   const secret = job.secret ?? newStreamSecret();
 
-  return withRefreshLock(streamId, async () => {
+  // Redis owns refresh serialization across both local and remote callers.
+  {
     // Redis decides ownership and checks the rejected URL. A replica's five-
     // second completion memo can still contain the pre-refresh result.
     const [raw, owner] = await redis().eval(
@@ -479,13 +494,12 @@ export async function refreshStreamUrl(
         excludeProxyUrl: job.proxy_url ?? null,
       });
     }
-    return awaitExtracted(streamId, AWAIT_TIMEOUT_S);
-  });
+    return awaitExtracted(streamId, Math.max(0, deadline - Date.now()) / 1000, signal);
+  }
 }
 
 /** Test hook — drop all in-process job state. */
 export function resetJobState(): void {
   JOB_MEMO.clear();
   JOB_EVENTS.clear();
-  REFRESH_LOCKS.clear();
 }

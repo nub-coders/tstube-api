@@ -46,6 +46,8 @@ export interface ProxyUpstream {
   headers: Record<string, string>;
   /** Instrumented body stream, or null when the response is a JSON error. */
   body: Readable | null;
+  /** Effective source URL after redirects; internal consumers must not publish it. */
+  finalUrl?: string;
   /** Present for proxy-generated errors (502, connect failure). */
   error?: {
     error: string;
@@ -75,6 +77,7 @@ export interface ProxyOptions {
 // ── HTTP-proxy tunneling (geo-bypass streams) ──────────────────────
 
 interface ParsedProxy {
+  secure: boolean;
   host: string;
   port: number;
   /** Pre-rendered Proxy-Authorization header value, or null. */
@@ -104,7 +107,8 @@ function parseProxy(proxyUrl: string): ParsedProxy | null {
     const authHeader = user
       ? `Basic ${Buffer.from(`${user}:${pass}`).toString('base64')}`
       : null;
-    return { host: parsed.hostname, port: Number(parsed.port || 80), authHeader };
+    const secure = parsed.protocol === 'https:';
+    return { secure, host: parsed.hostname, port: Number(parsed.port || (secure ? 443 : 80)), authHeader };
   } catch {
     return null;
   }
@@ -118,6 +122,8 @@ function parseProxy(proxyUrl: string): ParsedProxy | null {
  */
 class TunnelAgent extends https.Agent {
   private readonly signals = new WeakMap<http.ClientRequest, AbortSignal>();
+  private activeRequests = 0;
+  private retired = false;
 
   constructor(private readonly proxy: ParsedProxy) {
     super({ keepAlive: true, maxSockets: 16 });
@@ -125,7 +131,25 @@ class TunnelAgent extends https.Agent {
 
   addRequest(req: http.ClientRequest, options: TunnelOptions): void {
     if (options.tunnelSignal) this.signals.set(req, options.tunnelSignal);
-    agentHooks.addRequest.call(this, req, options);
+    this.activeRequests++;
+    const release = () => {
+      this.activeRequests--;
+      if (this.retired && this.activeRequests === 0) this.destroy();
+    };
+    req.once('close', release);
+    try {
+      agentHooks.addRequest.call(this, req, options);
+    } catch (error) {
+      req.off('close', release);
+      release();
+      throw error;
+    }
+  }
+
+  /** Cache eviction stops reuse; request owners decide when sockets may close. */
+  retire(): void {
+    this.retired = true;
+    if (this.activeRequests === 0) this.destroy();
   }
 
   createSocket(
@@ -155,7 +179,9 @@ class TunnelAgent extends https.Agent {
       return null;
     }
 
-    const proxySocket = net.connect({ host: this.proxy.host, port: this.proxy.port });
+    const proxySocket = this.proxy.secure
+      ? tls.connect({ host: this.proxy.host, port: this.proxy.port, servername: this.proxy.host })
+      : net.connect({ host: this.proxy.host, port: this.proxy.port });
     let settled = false;
     let onData: ((chunk: Buffer) => void) | undefined;
     const onClose = () => fail(new Error('tunnel: proxy closed connection early'));
@@ -186,7 +212,7 @@ class TunnelAgent extends https.Agent {
       return undefined;
     }
 
-    proxySocket.once('connect', () => {
+    proxySocket.once(this.proxy.secure ? 'secureConnect' : 'connect', () => {
       let head = '';
       onData = (chunk: Buffer): void => {
         head += chunk.toString('latin1');
@@ -232,18 +258,22 @@ class TunnelAgent extends https.Agent {
 }
 
 // One agent per proxy exit so keep-alive tunnels are reused across streams.
-const TUNNEL_AGENTS = new Map<string, https.Agent>();
+const TUNNEL_AGENTS = new Map<string, TunnelAgent>();
 const TUNNEL_AGENT_MAX = 8;
 
 function tunnelAgentFor(proxy: ParsedProxy): https.Agent {
-  const key = `${proxy.host}:${proxy.port}`;
+  const key = JSON.stringify([proxy.secure, proxy.host, proxy.port, proxy.authHeader]);
   const existing = TUNNEL_AGENTS.get(key);
-  if (existing) return existing;
+  if (existing) {
+    TUNNEL_AGENTS.delete(key);
+    TUNNEL_AGENTS.set(key, existing);
+    return existing;
+  }
   const agent = new TunnelAgent(proxy);
   if (TUNNEL_AGENTS.size >= TUNNEL_AGENT_MAX) {
     const oldestKey = TUNNEL_AGENTS.keys().next().value;
     if (oldestKey !== undefined) {
-      TUNNEL_AGENTS.get(oldestKey)?.destroy();
+      TUNNEL_AGENTS.get(oldestKey)?.retire();
       TUNNEL_AGENTS.delete(oldestKey);
     }
   }
@@ -260,6 +290,173 @@ function cancelledResult(): ProxyUpstream {
     body: null,
     error: { error: 'Client Closed Request' },
   };
+}
+
+interface MediaInterval {
+  url: string;
+  identity: string;
+  start: number;
+  end: number;
+  total: number;
+  mime: string;
+}
+
+function safeInteger(value: string | undefined | null): number | null {
+  if (!value || !/^\d+$/.test(value)) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
+}
+
+function mediaIdentity(value: string): { identity: string; total: number } | null {
+  try {
+    const url = new URL(value), params = url.searchParams;
+    if (url.protocol !== 'https:' || !url.hostname.endsWith('.googlevideo.com') || url.pathname !== '/videoplayback' ||
+      params.get('source') !== 'youtube' || params.has('live') || params.has('sq') || params.has('range')) return null;
+    const signed = new Set((params.get('sparams') ?? '').split(','));
+    const fields = ['id', 'itag', 'clen', 'lmt'];
+    if (!fields.every(field => signed.has(field) && params.get(field)) ||
+      !(params.get('sig') || params.get('signature'))) return null;
+    const total = safeInteger(params.get('clen'));
+    if (!total || !/^\d+$/.test(params.get('lmt')!)) return null;
+    return { total, identity: JSON.stringify(fields.map(field => params.get(field))) };
+  } catch { return null; }
+}
+
+function contentRange(value: string | undefined): { start: number; end: number; total: number } | null {
+  const match = /^bytes (\d+)-(\d+)\/(\d+)$/i.exec(value ?? '');
+  if (!match) return null;
+  const start = safeInteger(match[1]), end = safeInteger(match[2]), total = safeInteger(match[3]);
+  return start !== null && end !== null && total !== null && end >= start && total > end
+    ? { start, end, total } : null;
+}
+
+function requestedInterval(value: string | null | undefined, total: number): { start: number; end: number } | null {
+  const match = /^bytes=(\d*)-(\d*)$/i.exec(value ?? '');
+  if (!match || (!match[1] && !match[2])) return null;
+  if (!match[1]) {
+    const count = safeInteger(match[2]);
+    return count ? { start: Math.max(0, total - count), end: total - 1 } : null;
+  }
+  const start = safeInteger(match[1]), end = match[2] ? safeInteger(match[2]) : total - 1;
+  return start !== null && start < total && end !== null && end >= start
+    ? { start, end: Math.min(end, total - 1) } : null;
+}
+
+function identityEncoding(headers: Record<string, string>): boolean {
+  return !headers['content-encoding'] || headers['content-encoding'].trim().toLowerCase() === 'identity';
+}
+
+function finiteMediaInterval(targetUrl: string, response: ProxyUpstream, opts: ProxyOptions): MediaInterval | null {
+  const url = response.finalUrl ?? targetUrl, media = mediaIdentity(url);
+  const length = safeInteger(response.headers['content-length']);
+  const mime = (response.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  if (!media || !response.body || !length || !/^(audio|video)\//.test(mime) || !identityEncoding(response.headers)) return null;
+  if (response.status === 200 && length === media.total && !response.headers['content-range']) {
+    return { url, ...media, start: 0, end: media.total - 1, mime };
+  }
+  if (response.status !== 206) return null;
+  const range = contentRange(response.headers['content-range']), requested = requestedInterval(opts.rangeHeader, media.total);
+  return range && requested && range.total === media.total && range.start === requested.start && range.end === requested.end &&
+    length === range.end - range.start + 1 ? { url, ...media, ...range, mime } : null;
+}
+
+function validResumption(response: ProxyUpstream, media: MediaInterval, start: number): boolean {
+  const range = contentRange(response.headers['content-range']);
+  const identity = mediaIdentity(response.finalUrl ?? media.url);
+  return response.status === 206 && !!response.body && !!identity && identity.identity === media.identity &&
+    !!range && range.start === start && range.end === media.end && range.total === media.total &&
+    safeInteger(response.headers['content-length']) === media.end - start + 1 && identityEncoding(response.headers) &&
+    (response.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase() === media.mime;
+}
+
+function transientBodyError(error: unknown): boolean {
+  return ['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ERR_STREAM_PREMATURE_CLOSE'].includes((error as NodeJS.ErrnoException)?.code ?? '');
+}
+
+function waitForDrain(body: PassThrough): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { body.off('drain', onDrain).off('close', onClose).off('error', onError); };
+    const onDrain = () => { cleanup(); resolve(); };
+    const onClose = () => { cleanup(); reject(new Error('Playback cancelled')); };
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    body.once('drain', onDrain).once('close', onClose).once('error', onError);
+    if (body.destroyed) onClose();
+  });
+}
+
+/**
+ * Playback may recover an interrupted finite signed representation without
+ * changing downstream headers or regenerating the URL. Source probes use
+ * proxyStream directly so they still validate the original ordinary GET.
+ */
+export async function proxyPlayback(targetUrl: string, opts: ProxyOptions = {}): Promise<ProxyUpstream> {
+  const initial = await proxyStream(targetUrl, opts);
+  const media = finiteMediaInterval(targetUrl, initial, opts);
+  if (!media) return initial;
+
+  const output = new PassThrough({ highWaterMark: CHUNK });
+  output.on('error', () => {});
+  const controller = new AbortController();
+  const signal = opts.signal ? AbortSignal.any([opts.signal, controller.signal]) : controller.signal;
+  let current = initial.body!, accepted = 0, resumes = 0;
+  const length = media.end - media.start + 1;
+  const stop = () => { controller.abort(); current.destroy(); };
+  const onAbort = () => output.destroy();
+  const detachCallerAbort = () => {
+    opts.signal?.removeEventListener('abort', onAbort);
+    output.off('end', detachCallerAbort).off('close', detachCallerAbort);
+  };
+  output.once('close', stop);
+  if (opts.signal) {
+    // Origin EOF can leave unread bytes in this output. Its cancellation
+    // owner remains the player until those bytes are consumed or discarded.
+    output.once('end', detachCallerAbort).once('close', detachCallerAbort);
+    opts.signal.addEventListener('abort', onAbort, { once: true });
+  }
+
+  void (async () => {
+    try {
+      while (!signal.aborted && !output.destroyed) {
+        try {
+          for await (const chunk of current) {
+            if (signal.aborted || output.destroyed) return;
+            const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+            if (bytes.length > length - accepted) throw new Error('Source exceeded the declared media interval');
+            // Queued bytes belong to this output even when the player pauses.
+            // Resume after them, never after origin read-ahead or socket bytes.
+            accepted += bytes.length;
+            if (!output.write(bytes)) await waitForDrain(output);
+          }
+          if (accepted !== length) throw Object.assign(new Error('Source ended before its declared media interval'),
+            { code: 'ERR_STREAM_PREMATURE_CLOSE' });
+          output.end();
+          return;
+        } catch (error) {
+          if (signal.aborted || output.destroyed) return;
+          if (!transientBodyError(error) || accepted >= length || resumes >= 2) throw error;
+          resumes++;
+          current.destroy();
+          const offset = media.start + accepted;
+          const replacement = await proxyStream(media.url, {
+            ...opts, signal, rangeHeader: `bytes=${offset}-${media.end}`,
+          });
+          if (signal.aborted || output.destroyed) { replacement.body?.destroy(); return; }
+          if (!validResumption(replacement, media, offset)) {
+            replacement.body?.destroy();
+            throw new Error('Source did not provide the exact remaining media interval');
+          }
+          current = replacement.body!;
+        }
+      }
+    } catch (error) {
+      if (!signal.aborted && !output.destroyed) output.destroy(error as Error);
+    } finally {
+      output.off('close', stop);
+      stop();
+    }
+  })();
+  if (opts.signal?.aborted) output.destroy();
+  return { ...initial, body: output };
 }
 
 export function proxyStream(
@@ -287,7 +484,7 @@ export function proxyStream(
       status: 502,
       headers: { 'content-type': 'application/json' },
       body: null,
-      error: { error: 'Bad Gateway', message: `Invalid upstream URL: ${String(e)}` },
+      error: { error: 'Bad Gateway', message: 'Invalid upstream URL' },
     });
   }
 
@@ -427,11 +624,12 @@ function dialStream(
 
     function onUpstreamClose(): void {
       upstreamBody?.off('error', onUpstreamError);
-      if (!finished) onUpstreamError(new Error('upstream closed before stream completed'));
+      if (!finished) onUpstreamError(Object.assign(new Error('upstream closed before stream completed'),
+        { code: 'ERR_STREAM_PREMATURE_CLOSE' }));
     }
 
     function onReadTimeout(): void {
-      req.destroy(new Error('read timeout'));
+      req.destroy(Object.assign(new Error('read timeout'), { code: 'ETIMEDOUT' }));
     }
 
     if (proxy && isHttps) {
@@ -445,7 +643,7 @@ function dialStream(
       // Plain-HTTP target through a forward proxy: absolute-form request line.
       const viaProxyHeaders: Record<string, string> = { ...headers, host: parsed.host };
       if (proxy.authHeader) viaProxyHeaders['proxy-authorization'] = proxy.authHeader;
-      req = http.request(
+      req = (proxy.secure ? https : http).request(
         { host: proxy.host, port: proxy.port, path: parsed.href, method: 'GET', headers: viaProxyHeaders },
         (upstream) => {
           void handleUpstream(upstream);
@@ -480,7 +678,7 @@ function dialStream(
       // Googlevideo frequently issues 302 redirects to specific edge CDN clusters (rr*.googlevideo.com).
       // node:http does not follow them automatically, so we must follow them here.
       if ([301, 302, 303, 307, 308].includes(status) && upstream.headers.location) {
-        log.info(`[STREAM_PROXY] Upstream ${status} redirect to: ${upstream.headers.location.slice(0, 100)}`);
+        log.info(`[STREAM_PROXY] Following upstream ${status} redirect`);
         cleanup();
         upstream.destroy();
         req.destroy();
@@ -492,7 +690,7 @@ function dialStream(
             status: 502,
             headers: { 'content-type': 'application/json' },
             body: null,
-            error: { error: 'Bad Gateway', message: `Invalid redirect location: ${String(e)}` },
+            error: { error: 'Bad Gateway', message: 'Invalid redirect location' },
           });
         }
         return;
@@ -537,7 +735,7 @@ function dialStream(
       req.setTimeout(READ_TIMEOUT_MS);
       upstream.pipe(out);
 
-      resolve({ status, headers: respHeaders, body: out });
+      resolve({ status, headers: respHeaders, body: out, finalUrl: parsed.href });
     }
 
     // Request-owned timeout listeners are removed at completion, rather than

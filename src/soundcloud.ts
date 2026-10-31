@@ -1,4 +1,5 @@
 /** Public SoundCloud track/set extraction using the metadata served to its web player. */
+import { boundedFetch } from './requestDeadline.js';
 interface Transcoding {
   url?: string;
   snipped?: boolean;
@@ -42,7 +43,7 @@ async function fetchResource(
   // Check each redirect before dialing it, and share a deadline across the chain.
   const signal = AbortSignal.timeout(10_000);
   for (let redirects = 0; redirects <= 3; redirects++) {
-    const response = await fetchFn(url, { redirect: 'manual', signal });
+    const response = await boundedFetch(fetchFn, 10_000)(url, { redirect: 'manual', signal });
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = response.headers.get('location');
       await response.body?.cancel();

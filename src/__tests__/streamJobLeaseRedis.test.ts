@@ -117,7 +117,7 @@ describe.skipIf(!process.env.TEST_REDIS_URL)('extraction leases (isolated Redis)
     expect((await second.awaitStreamJob(capability, 0))?.job.extracted_url).toBe(newUrl);
   });
 
-  it('backfills one legacy secret across concurrent workers', async () => {
+  it('migrates a legacy source with one owner and preserves the shared secret', async () => {
     const first = replicas[0]!;
     const second = await replica();
     await state.client!.set(keys[0]!, JSON.stringify({
@@ -125,7 +125,9 @@ describe.skipIf(!process.env.TEST_REDIS_URL)('extraction leases (isolated Redis)
     }), 'EX', 60);
     const capabilities = await Promise.all([first.ensureStreamJob(url, 'audio'), second.ensureStreamJob(url, 'audio')]);
     expect(new Set(capabilities).size).toBe(1);
-    expect(state.extract).not.toHaveBeenCalled();
-    expect((await second.awaitStreamJob(capabilities[0]!, 0))?.job.extracted_url).toBe(oldUrl);
+    expect(state.extract).toHaveBeenCalledTimes(1);
+    completions[0]!({ url: newUrl, proxyUrl: null });
+    await waitFor(async () => !(await state.client!.exists(keys[1]!)));
+    expect((await second.awaitStreamJob(capabilities[0]!, 0))?.job.extracted_url).toBe(newUrl);
   });
 });

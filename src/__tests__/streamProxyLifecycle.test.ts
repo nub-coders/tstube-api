@@ -17,6 +17,7 @@ vi.mock('../urlValidation.js', async importOriginal => ({
   isSafeProxyUrlSync: () => true,
 }));
 vi.mock('../streamJobs.js', () => ({
+  AWAIT_TIMEOUT_S: 105,
   ensureStreamJob: vi.fn(),
   resolveMode: vi.fn(),
   refreshStreamUrl: vi.fn(),

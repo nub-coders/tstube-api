@@ -8,6 +8,8 @@
  * live key (config order KEYA, KEYB, KEYC) — failure sequences are predictable.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+// These tests isolate key health; shared Redis admission has integration coverage.
+vi.mock('../youtubeSearchBudget.js', () => ({ withSearchSlot: (call: () => Promise<unknown>) => call() }));
 
 vi.mock('../config.js', () => ({
   config: () => ({ YOUTUBE_API_KEYS: 'KEYA,KEYB,KEYC' }),

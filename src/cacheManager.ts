@@ -2,8 +2,8 @@
  * Stream URL cache — port of utils/cache_manager.py.
  *
  * Two layers: Redis (shared, authoritative) and a container-local file cache
- * that survives a Redis flush. Both key off the `expire` stamped into the
- * googlevideo URL.
+ * that survives a Redis flush. Validated entries use the signed URL's expiry;
+ * live manifests also have a short lifetime because their playback URLs rotate.
  */
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -14,6 +14,9 @@ import { redis } from './redis.js';
 import { getLogger } from './logger.js';
 import { detectProvider, resolveToPlayableStream } from './platformResolvers.js';
 import { fetchResults as scrapeSearch } from './searchService.js';
+import { requestSignal } from './requestDeadline.js';
+import { invalidateMediaProbe, probeMedia } from './mediaProbe.js';
+import { HLS_STREAM_TTL_S, STREAM_VALIDATION_VERSION } from './streamPolicy.js';
 
 const log = getLogger('ytube_api.Stream');
 
@@ -50,11 +53,14 @@ export interface CachedStream {
   proxyUrl: string | null;
   /** Resolved YouTube identity when the cache key is a platform page URL. */
   videoId?: string;
+  /** Live HLS manifests require playlist handling and a bounded freshness window. */
+  streamType?: 'hls';
 }
 
 interface StreamLookup {
   invalidated: boolean;
   videoId?: string;
+  stream?: CachedStream;
   write?: Promise<unknown>;
 }
 
@@ -62,32 +68,43 @@ const ACTIVE_LOOKUPS = new Map<string, Set<StreamLookup>>();
 const INVALIDATIONS = new Map<string, Promise<void>>();
 
 /**
- * Cache envelope. New entries are JSON `{u, p, v}` so the proxy binding and
- * resolved video identity travel with the URL across replicas; pre-envelope
- * entries (plain URL strings) read back as direct streams.
+ * The validation version prevents pre-policy URLs from bypassing playback
+ * checks after deployment. Legacy decoding remains available for invalidation.
  */
 export function encodeCached(value: CachedStream): string {
   return JSON.stringify({
+    validationVersion: STREAM_VALIDATION_VERSION,
     u: value.url,
     ...(value.proxyUrl ? { p: value.proxyUrl } : {}),
     ...(value.videoId ? { v: value.videoId } : {}),
+    ...(value.streamType === 'hls' ? { streamType: value.streamType } : {}),
   });
 }
 
-export function decodeCached(raw: string): CachedStream | null {
+function decodeCacheValue(raw: string, requireCurrentValidation: boolean): CachedStream | null {
   if (raw.startsWith('{')) {
     try {
-      const o = JSON.parse(raw) as { u?: unknown; p?: unknown; v?: unknown };
+      const o = JSON.parse(raw) as { u?: unknown; p?: unknown; v?: unknown; streamType?: unknown; validationVersion?: unknown };
+      if (requireCurrentValidation && o.validationVersion !== STREAM_VALIDATION_VERSION) return null;
       if (typeof o.u === 'string' && o.u) {
         const videoId = typeof o.v === 'string' ? extractId(o.v) : null;
-        return { url: o.u, proxyUrl: typeof o.p === 'string' && o.p ? o.p : null, ...(videoId ? { videoId } : {}) };
+        return {
+          url: o.u,
+          proxyUrl: typeof o.p === 'string' && o.p ? o.p : null,
+          ...(videoId ? { videoId } : {}),
+          ...(o.streamType === 'hls' ? { streamType: 'hls' } : {}),
+        };
       }
     } catch {
       return null;
     }
     return null;
   }
-  return raw ? { url: raw, proxyUrl: null } : null;
+  return !requireCurrentValidation && raw ? { url: raw, proxyUrl: null } : null;
+}
+
+export function decodeCached(raw: string): CachedStream | null {
+  return decodeCacheValue(raw, false);
 }
 
 export function extractExpire(streamUrl: string): number | null {
@@ -100,17 +117,25 @@ export function extractExpire(streamUrl: string): number | null {
   }
 }
 
-/** Read cache, returning (url, remainingTtl, proxyUrl, videoId). TTL -1 means expired/missing. */
-function readCache(url: string, prefix: string): [string | null, number, string | null, string | undefined] {
+/** Read only entries validated under the current playback policy. */
+function readCache(url: string, prefix: string): [CachedStream | null, number] {
   const path = cachePath(url, prefix);
-  if (!existsSync(path)) return [null, -1, null, undefined];
+  if (!existsSync(path)) return [null, -1];
   try {
-    const data = JSON.parse(readFileSync(path, 'utf8')) as { url?: string; expire?: number; proxy?: string; videoId?: string };
+    const data = JSON.parse(readFileSync(path, 'utf8')) as {
+      url?: string; expire?: number; proxy?: string; videoId?: string; streamType?: unknown; validationVersion?: unknown;
+    };
     const expire = data.expire ?? 0;
     const remaining = expire - Date.now() / 1000;
-    if (remaining > 15) {
+    if (data.validationVersion === STREAM_VALIDATION_VERSION && typeof data.url === 'string' && data.url && remaining > 15) {
       log.debug(`[CACHE HIT] ${prefix}${url}`);
-      return [data.url ?? null, Math.floor(remaining), data.proxy ?? null, extractId(data.videoId ?? '') ?? undefined];
+      const videoId = extractId(data.videoId ?? '');
+      return [{
+        url: data.url,
+        proxyUrl: typeof data.proxy === 'string' && data.proxy ? data.proxy : null,
+        ...(videoId ? { videoId } : {}),
+        ...(data.streamType === 'hls' ? { streamType: 'hls' } : {}),
+      }, Math.floor(remaining)];
     }
     try {
       rmSync(path);
@@ -124,28 +149,40 @@ function readCache(url: string, prefix: string): [string | null, number, string 
       /* ignore */
     }
   }
-  return [null, -1, null, undefined];
+  return [null, -1];
 }
 
-function writeCache(
-  url: string,
-  streamUrl: string,
-  prefix: string,
-  proxyUrl: string | null = null,
-  maxTtlSec?: number,
-  videoId?: string,
-): void {
-  let expire = extractExpire(streamUrl);
-  if (!expire) {
-    log.warning(`[CACHE SKIP] No expire found in stream URL for ${url}`);
-    return;
+function streamExpire(stream: CachedStream): number | null {
+  const now = Math.floor(Date.now() / 1000);
+  let expire = extractExpire(stream.url);
+  if (stream.streamType === 'hls') {
+    // A missing expiry is normal for live manifests. An explicitly expired or
+    // malformed signed expiry must not receive a new fallback lifetime.
+    if (!expire) {
+      try {
+        if (new URL(stream.url).searchParams.has('expire')) return null;
+      } catch { return null; }
+      expire = now + HLS_STREAM_TTL_S;
+    }
+    expire = Math.min(expire, now + HLS_STREAM_TTL_S);
   }
-  if (maxTtlSec) expire = Math.min(expire, Math.floor(Date.now() / 1000) + maxTtlSec);
+  if (expire && stream.proxyUrl) expire = Math.min(expire, now + PROXY_STREAM_TTL_S);
+  return expire;
+}
+
+function writeCache(url: string, stream: CachedStream, prefix: string, expire: number): void {
   ensureCacheDir();
   try {
     writeFileSync(
       cachePath(url, prefix),
-      JSON.stringify({ url: streamUrl, expire, ...(proxyUrl ? { proxy: proxyUrl } : {}), ...(videoId ? { videoId } : {}) }),
+      JSON.stringify({
+        validationVersion: STREAM_VALIDATION_VERSION,
+        url: stream.url,
+        expire,
+        ...(stream.proxyUrl ? { proxy: stream.proxyUrl } : {}),
+        ...(stream.videoId ? { videoId: stream.videoId } : {}),
+        ...(stream.streamType === 'hls' ? { streamType: stream.streamType } : {}),
+      }),
     );
     log.info(
       `[CACHE WRITE] ${prefix}${url} (expires in ${Math.floor(expire - Date.now() / 1000)}s)`,
@@ -172,6 +209,7 @@ export async function invalidate(url: string, prefix = ''): Promise<void> {
   if (inputId) videoIds.add(inputId);
   for (const lookup of lookups) {
     lookup.invalidated = true;
+    if (lookup.stream) invalidateMediaProbe(lookup.stream.url, lookup.stream.proxyUrl);
     if (lookup.videoId) videoIds.add(lookup.videoId);
   }
   for (const id of videoIds) invalidateResolvedStream(id);
@@ -181,13 +219,16 @@ export async function invalidate(url: string, prefix = ''): Promise<void> {
     // from these lookups are suppressed by their invalidated flag.
     await Promise.allSettled(lookups.flatMap((lookup) => lookup.write ? [lookup.write] : []));
     try {
-      const data = JSON.parse(readFileSync(cachePath(url, prefix), 'utf8')) as { videoId?: string };
+      const data = JSON.parse(readFileSync(cachePath(url, prefix), 'utf8')) as { videoId?: string; url?: string; proxy?: string };
+      if (data.url) invalidateMediaProbe(data.url, data.proxy);
       const id = extractId(data.videoId ?? '');
       if (id) videoIds.add(id);
     } catch { /* absent or legacy file entry */ }
     try {
       const raw = await redis().get(`cache:${key}`);
-      const id = raw ? decodeCached(raw)?.videoId : null;
+      const cached = raw ? decodeCached(raw) : null;
+      if (cached) invalidateMediaProbe(cached.url, cached.proxyUrl);
+      const id = cached?.videoId;
       if (id) videoIds.add(id);
     } catch (e) {
       log.error(`[CACHE INVALIDATE] redis identity lookup failed: ${String(e)}`);
@@ -250,7 +291,12 @@ async function resolveUrl(
     if (res.url) {
       log.info(`[INNERTUBE] ✅ ${kind} ${url}`);
       const videoId = extractId(url);
-      return { url: res.url, proxyUrl: res.proxyUrl, ...(videoId ? { videoId } : {}) };
+      return {
+        url: res.url,
+        proxyUrl: res.proxyUrl,
+        ...(videoId ? { videoId } : {}),
+        ...(res.streamType === 'hls' ? { streamType: 'hls' } : {}),
+      };
     }
   } catch (e) {
     log.warning(`[INNERTUBE] Resolution failed: ${String(e)}`);
@@ -265,6 +311,7 @@ async function getStreamFor(
   formatSelector: string,
   options: ResolveOptions,
 ): Promise<CachedStream | null> {
+  requestSignal()?.throwIfAborted();
   const key = `${prefix}${url}`;
   // A lookup that overlaps invalidation must wait until both stores have
   // been cleared before it retries, including delayed Redis writes.
@@ -275,7 +322,11 @@ async function getStreamFor(
   ACTIVE_LOOKUPS.set(key, active);
   try {
     const result = await loadStreamFor(url, prefix, kind, formatSelector, lookup, options);
-    if (lookup.invalidated) return getStreamFor(url, prefix, kind, formatSelector, options);
+    requestSignal()?.throwIfAborted();
+    if (lookup.invalidated) {
+      if (result) invalidateMediaProbe(result.url, result.proxyUrl);
+      return getStreamFor(url, prefix, kind, formatSelector, options);
+    }
     return result;
   } finally {
     active.delete(lookup);
@@ -305,7 +356,7 @@ async function loadStreamFor(
     try {
       const cached = await redis().get(`cache:${prefix}${url}`);
       if (cached) {
-        const decoded = decodeCached(cached);
+        const decoded = decodeCacheValue(cached, true);
         if (decoded) {
           log.info(`[REDIS CACHE HIT] ${prefix}${url}`);
           return decoded;
@@ -317,10 +368,9 @@ async function loadStreamFor(
 
     // 2. Local file cache
     if (lookup.invalidated) return null;
-    const [fileUrl, remaining, fileProxy, fileVideoId] = readCache(url, prefix);
-    if (fileUrl) {
-      const entry: CachedStream = { url: fileUrl, proxyUrl: fileProxy, ...(fileVideoId ? { videoId: fileVideoId } : {}) };
-      lookup.videoId = fileVideoId ?? lookup.videoId;
+    const [entry, remaining] = readCache(url, prefix);
+    if (entry) {
+      lookup.videoId = entry.videoId ?? lookup.videoId;
       try {
         await cacheRedis(`cache:${prefix}${url}`, remaining, entry, lookup);
       } catch {
@@ -332,21 +382,28 @@ async function loadStreamFor(
 
   // 3. Resolve target & stream URL
   const [targetUrl, isDirect] = await resolveTargetUrl(url);
+  requestSignal()?.throwIfAborted();
   lookup.videoId = extractId(targetUrl) ?? undefined;
   if (lookup.invalidated) {
     if (lookup.videoId) invalidateResolvedStream(lookup.videoId);
     return null;
   }
+  // The direct provider branch supplies SoundCloud/JioSaavn audio. Successful
+  // media probing does not make those sources suitable for video playback.
+  if (isDirect && kind === 'muxed') return null;
   const stream = isDirect
     ? ({ url: targetUrl, proxyUrl: null } as CachedStream)
     : await resolveUrl(targetUrl, kind, formatSelector, options);
+  lookup.stream = stream ?? undefined;
+  // YouTube checks candidates inside its fallback ladder. Direct provider
+  // URLs need the same check here before either cache can publish them.
+  if (stream && isDirect && !await probeMedia(stream.url, { proxyUrl: stream.proxyUrl })) return null;
+  requestSignal()?.throwIfAborted();
   if (stream && !lookup.invalidated) {
-    const maxTtl = stream.proxyUrl ? PROXY_STREAM_TTL_S : undefined;
-    writeCache(url, stream.url, prefix, stream.proxyUrl, maxTtl, stream.videoId);
-    const expire = extractExpire(stream.url);
+    const expire = streamExpire(stream);
     if (expire) {
-      let ttl = Math.floor(expire - Date.now() / 1000);
-      if (maxTtl) ttl = Math.min(ttl, maxTtl);
+      writeCache(url, stream, prefix, expire);
+      const ttl = Math.floor(expire - Date.now() / 1000);
       if (ttl > 0) {
         try {
           await cacheRedis(`cache:${prefix}${url}`, ttl, stream, lookup);

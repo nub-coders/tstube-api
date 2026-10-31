@@ -4,6 +4,7 @@
  * Supports Apple Music, Amazon Music (Odesli API), JioSaavn, SoundCloud, Spotify, and plain-text search fallback.
  */
 import { resolveSoundCloudMedia } from './soundcloud.js';
+import { boundedFetch } from './requestDeadline.js';
 
 // ── Custom Exceptions ─────────────────────────────────────────────────────────
 
@@ -219,7 +220,7 @@ export async function resolveAppleMusic(
     throw new MalformedUrlError('Invalid Apple Music URL format.');
   }
 
-  const fetchImpl = options?.fetchFn || globalThis.fetch;
+  const fetchImpl = boundedFetch(options?.fetchFn || globalThis.fetch, 10_000);
   let response: Response;
 
   try {
@@ -311,7 +312,7 @@ export async function resolveAmazonMusic(
 
   const encodedUrl = encodeURIComponent(url);
   const odesliApiUrl = `https://api.song.link/v1-alpha.1/links?url=${encodedUrl}`;
-  const fetchImpl = options?.fetchFn || globalThis.fetch;
+  const fetchImpl = boundedFetch(options?.fetchFn || globalThis.fetch, 10_000);
 
   let response: Response;
   try {
@@ -362,7 +363,7 @@ export async function resolveSpotify(
 
   const encodedUrl = encodeURIComponent(url);
   const odesliApiUrl = `https://api.song.link/v1-alpha.1/links?url=${encodedUrl}`;
-  const fetchImpl = options?.fetchFn || globalThis.fetch;
+  const fetchImpl = boundedFetch(options?.fetchFn || globalThis.fetch, 10_000);
 
   let response: Response;
   try {
@@ -492,7 +493,7 @@ export async function resolveJioSaavn(
   }
 
   const apiUrl = `https://www.jiosaavn.com/api.php?__call=webapi.get&token=${encodeURIComponent(url)}&type=song&_format=json&_marker=0`;
-  const fetchImpl = options?.fetchFn || globalThis.fetch;
+  const fetchImpl = boundedFetch(options?.fetchFn || globalThis.fetch, 10_000);
 
   let response: Response;
   try {

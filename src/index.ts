@@ -10,7 +10,7 @@ import { createRedis, closeRedis } from './redis.js';
 import { createAppServer, metricsHandler, rateLimitStatus, type RouteSpec } from './httpServer.js';
 import * as routes from './apiRoutes.js';
 import { setDefaultResultOrder } from 'node:dns';
-import { getInnertube, prewarmProxiedInnertube } from './innertube.js';
+import { prewarmProxiedInnertube } from './innertube.js';
 import { websharePool } from './proxy.js';
 import { fetchTrending } from './searchService.js';
 import { setGlobalDispatcher, Agent } from 'undici';
@@ -72,7 +72,7 @@ async function main(): Promise<void> {
   createRedis(cfg);
 
   if (!cfg.TESTING) {
-    // Geo-bypass proxy pool (no-op unless WEBSHARE_API_KEY is set).
+    // Required for fresh YouTube extraction; cached streams can still be served.
     websharePool.init();
     prewarmProxiedInnertube(10);
   }
@@ -81,14 +81,6 @@ async function main(): Promise<void> {
   server.listen(HTTP_PORT, HTTP_HOST, () => {
     log.info(`[STARTUP] HTTP API listening on http://${HTTP_HOST}:${HTTP_PORT}`);
   });
-
-  // Prefetch Innertube at startup to eliminate ~300ms cold-start on first request.
-  void (async () => {
-    try {
-      await getInnertube();
-      log.info('[STARTUP] Innertube pre-warmed');
-    } catch { /* first request will retry */ }
-  })();
 
   // Pre-warm trending cache so the first /trending request is fast.
   void (async () => {

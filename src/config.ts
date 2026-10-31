@@ -88,6 +88,9 @@ export interface Config {
 
   // ── Optional YouTube Data API ────────────────────────────────
   YOUTUBE_API_KEYS: string;
+  YOUTUBE_SEARCH_DAILY_BUDGET: number;
+  YOUTUBE_SEARCH_REQUESTS_PER_MINUTE: number;
+  YOUTUBE_SEARCH_MAX_CONCURRENCY: number;
 
   // ── Tuning ───────────────────────────────────────────────────
   WEB_CONCURRENCY: number;
@@ -100,6 +103,12 @@ let cached: Config | null = null;
 /** Parse env into a frozen config object. Call once at startup. */
 export function loadConfig(): Config {
   loadDotenv();
+
+  function searchLimit(name: string, fallback: number, minimum: number): number {
+    const value = Number(process.env[name] || fallback);
+    if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`${name} must be an integer >= ${minimum}`);
+    return value;
+  }
 
   const apiIDRaw = process.env.API_ID ?? '2040';
   const apiID = Number.parseInt(apiIDRaw, 10);
@@ -187,6 +196,9 @@ export function loadConfig(): Config {
     BASE_URL: getenv('BASE_URL', `https://${apiHost}`).replace(/\/+$/, ''),
 
     YOUTUBE_API_KEYS: process.env.YOUTUBE_API_KEYS ?? '',
+    YOUTUBE_SEARCH_DAILY_BUDGET: searchLimit('YOUTUBE_SEARCH_DAILY_BUDGET', 5000, 0),
+    YOUTUBE_SEARCH_REQUESTS_PER_MINUTE: searchLimit('YOUTUBE_SEARCH_REQUESTS_PER_MINUTE', 10, 1),
+    YOUTUBE_SEARCH_MAX_CONCURRENCY: searchLimit('YOUTUBE_SEARCH_MAX_CONCURRENCY', 4, 1),
 
     WEB_CONCURRENCY: getint('WEB_CONCURRENCY', 1),
 

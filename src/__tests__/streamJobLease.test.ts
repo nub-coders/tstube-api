@@ -43,12 +43,28 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  vi.useRealTimers();
   for (const complete of completions) complete({ url: oldUrl, proxyUrl: null });
   await drain();
   for (const jobs of replicas) jobs.resetJobState();
 });
 
 describe('distributed extraction ownership', () => {
+  it('publishes a failure before lease expiry when extraction never completes', async () => {
+    vi.useFakeTimers();
+    const jobs = await replica();
+    const capability = await jobs.ensureStreamJob(url, 'video');
+    await vi.advanceTimersByTimeAsync(100_001);
+    const resolved = await jobs.awaitStreamJob(capability, 0);
+    expect(resolved?.job.failed).toBe(true);
+    expect(resolved?.job.extracted_url).toBeNull();
+    expect(state.redis.store.has(`stream_job_lease:${jobs.encodeStreamId(url, 'video')}`)).toBe(false);
+    // A transport that ignores cancellation cannot publish a late completion.
+    completions[0]!({ url: newUrl, proxyUrl: null });
+    await vi.advanceTimersByTimeAsync(0);
+    expect((await jobs.awaitStreamJob(capability, 0))?.job.failed).toBe(true);
+  });
+
   it('coalesces pending work across independent module instances', async () => {
     const first = await replica();
     const second = await replica();
@@ -194,8 +210,10 @@ describe('distributed extraction ownership', () => {
     }));
     const capabilities = await Promise.all([first.ensureStreamJob(url, 'audio'), second.ensureStreamJob(url, 'audio')]);
     expect(new Set(capabilities).size).toBe(1);
-    expect(state.extract).not.toHaveBeenCalled();
-    expect((await first.awaitStreamJob(capabilities[0]!, 0))?.job.extracted_url).toBe(oldUrl);
+    expect(state.extract).toHaveBeenCalledTimes(1);
+    completions[0]!({ url: newUrl, proxyUrl: null });
+    await drain();
+    expect((await first.awaitStreamJob(capabilities[0]!, 0))?.job.extracted_url).toBe(newUrl);
   });
 
   it('keeps proxy-pinned results bounded by the exit lifetime', async () => {

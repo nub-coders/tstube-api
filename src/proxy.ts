@@ -1,13 +1,8 @@
 /**
- * Webshare proxy pool — the geo-bypass fallback tier.
- *
- * When the direct resolver cannot resolve a video —
- * typically publisher geo-blocks — the resolver retries through a Webshare
- * datacenter proxy in another region. The pool is fetched live from the
- * Webshare API so burnt IPs are replaced without a redeploy.
- *
- * Disabled entirely when WEBSHARE_API_KEY is unset; every failure path is
- * contained so the proxy tier can never take the main resolver down.
+ * Webshare proxy pool for YouTube extraction, with country-aware retries.
+ * The pool is fetched live from the Webshare API so burnt IPs are replaced
+ * without a redeploy. Fresh YouTube extraction requires a usable exit;
+ * media transfer can use the server's direct connection after verification.
  */
 import { config } from './config.js';
 import { getLogger } from './logger.js';
@@ -23,6 +18,11 @@ const PLAN_API_URL = 'https://proxy.webshare.io/api/v2/subscription/plan/';
 const FETCH_TIMEOUT_MS = 15_000;
 /** Consecutive failed resolutions before a proxy is pulled from rotation. */
 const MAX_FAILURES_PER_PROXY = 3;
+/** Rejected exits get a bounded recovery window, including after API refresh. */
+const PROXY_COOLDOWN_MS = 5 * 60_000;
+/** Recent extraction results are useful; departed credentials must age out. */
+const PROXY_HEALTH_TTL_MS = 30 * 60_000;
+const MAX_PROXY_HEALTH_ENTRIES = 2_000;
 /** Never re-fetch more often than this (rate-limit headroom for the API). */
 const MIN_REFRESH_INTERVAL_MS = 30_000;
 /** How long an on-demand country-filtered fetch stays authoritative. */
@@ -47,15 +47,20 @@ export interface WebshareProxy {
 interface PendingCountryFetch {
   state: 'pending';
   inflight: Promise<WebshareProxy | null>;
-  invalidatedIds: Set<string>;
-  invalidatedUrls: Set<string>;
 }
 
 type CountryFetchEntry = PendingCountryFetch | {
   state: 'complete';
   at: number;
-  proxy: WebshareProxy | null;
+  proxies: WebshareProxy[];
 };
+
+interface ProxyHealth {
+  failures: number;
+  lastSuccessAt: number;
+  touchedAt: number;
+  cooldownUntil: number;
+}
 
 export interface ParsedProxyList {
   proxies: WebshareProxy[];
@@ -345,17 +350,18 @@ export function parseWebshareStats(
 
 /**
  * Round-robin pool of Webshare proxies with live API refresh.
- * `getProxy()` hands out exits one by one; `markBad()` rotates and eventually
- * evicts repeatedly-failing proxies; `refresh()` re-reads the account's list.
+ * Selectors rotate within health tiers; repeated failures start a cooldown
+ * that survives `refresh()`. The API list describes inventory, while local
+ * extraction results decide which of those exits are currently usable.
  */
 export class WebsharePool {
   private candidates: WebshareProxy[] = [];
   private rrIndex = 0;
-  private warmIndex = 0;
-  private failures = new Map<string, number>();
+  private health = new Map<string, ProxyHealth>();
   private countryFetches = new Map<string, CountryFetchEntry>();
   private timer: NodeJS.Timeout | null = null;
   private refreshInflight: Promise<void> | null = null;
+  private generation = 0;
   private lastRefreshAt = 0;
   private initialized = false;
   private cachedStats: WebshareBandwidthStats | null = null;
@@ -371,7 +377,81 @@ export class WebsharePool {
   }
 
   get size(): number {
-    return this.candidates.length;
+    return this.availableCandidates().length;
+  }
+
+  private pruneHealth(now = Date.now()): void {
+    for (const [identity, health] of this.health) {
+      if (now - health.touchedAt >= PROXY_HEALTH_TTL_MS ||
+          (health.cooldownUntil > 0 && now >= health.cooldownUntil)) {
+        this.health.delete(identity);
+      }
+    }
+  }
+
+  private proxyHealth(proxy: WebshareProxy): ProxyHealth | undefined {
+    return this.health.get(proxy.url) ?? this.health.get(`id:${proxy.id}`);
+  }
+
+  private availableCandidates(proxies = this.candidates): WebshareProxy[] {
+    this.pruneHealth();
+    return proxies.filter((proxy) => !this.proxyHealth(proxy)?.cooldownUntil);
+  }
+
+  /** Prefer proven extraction, then warm sessions; rotate only within a tier. */
+  private orderedCandidates(
+    proxies: WebshareProxy[],
+    isWarm?: (url: string) => boolean,
+    index = this.rrIndex,
+  ): WebshareProxy[] {
+    const tiers = new Map<number, WebshareProxy[]>();
+    const now = Date.now();
+    for (const proxy of this.availableCandidates(proxies)) {
+      const health = this.proxyHealth(proxy);
+      const proven = !!health?.lastSuccessAt && now - health.lastSuccessAt < PROXY_HEALTH_TTL_MS;
+      const tier = (health?.failures ? 2 : proven ? 0 : 1) * 2 +
+        (isWarm && !isWarm(proxy.url) ? 1 : 0);
+      const group = tiers.get(tier) ?? [];
+      group.push(proxy);
+      tiers.set(tier, group);
+    }
+    return [...tiers.keys()].sort((a, b) => a - b).flatMap((tier) => {
+      const group = tiers.get(tier)!;
+      const start = index % group.length;
+      return [...group.slice(start), ...group.slice(0, start)];
+    });
+  }
+
+  /** URL identity includes credentials, so late results cannot poison a replacement. */
+  private healthIdentity(id: string, proxyUrl?: string): string {
+    if (proxyUrl) {
+      this.bindHealthIdentity(id, proxyUrl);
+      return proxyUrl;
+    }
+    const proxy = this.candidates.find((candidate) => candidate.id === id) ??
+      [...this.countryFetches.values()].flatMap((entry) =>
+        entry.state === 'complete' ? entry.proxies : [],
+      ).find((candidate) => candidate.id === id);
+    // Backwards-compatible id-only notifications can also invalidate pending
+    // discovery before that exit's URL is known.
+    if (proxy) this.bindHealthIdentity(proxy.id, proxy.url);
+    return proxy?.url ?? `id:${id}`;
+  }
+
+  /** Bind reports received before discovery to their first observed credentials. */
+  private bindHealthIdentity(id: string, proxyUrl: string): void {
+    const fallback = this.health.get(`id:${id}`);
+    if (!fallback) return;
+    this.health.delete(`id:${id}`);
+    if (!this.health.has(proxyUrl)) this.recordHealth(proxyUrl, fallback);
+  }
+
+  private recordHealth(identity: string, health: ProxyHealth): void {
+    this.health.delete(identity);
+    this.health.set(identity, health);
+    while (this.health.size > MAX_PROXY_HEALTH_ENTRIES) {
+      this.health.delete(this.health.keys().next().value!);
+    }
   }
 
   /** Start the periodic refresh; disabled pools stay inert. */
@@ -379,15 +459,17 @@ export class WebsharePool {
     if (this.initialized) return;
     this.initialized = true;
     if (!this.enabled) {
-      log.info('[WEBSHARE] WEBSHARE_API_KEY not set — proxy fallback tier disabled');
+      log.info('[WEBSHARE] WEBSHARE_API_KEY not set — fresh YouTube extraction unavailable');
       return;
     }
     void this.refresh();
+    const generation = this.generation;
     // A transient failure (e.g. container DNS not ready at boot) must not
     // leave the tier empty until the next 10-minute timer tick.
     const retryBoot = (attempt: number): void => {
-      if (!this.initialized || this.candidates.length || attempt >= 5) return;
+      if (generation !== this.generation || !this.initialized || this.size || attempt >= 5) return;
       const t = setTimeout(() => {
+        if (generation !== this.generation || !this.initialized) return;
         void this.refresh().then(() => retryBoot(attempt + 1));
       }, 30_000 * (attempt + 1));
       t.unref?.();
@@ -402,13 +484,17 @@ export class WebsharePool {
   }
 
   async close(): Promise<void> {
+    this.generation++;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
     }
     this.candidates = [];
+    this.health.clear();
     this.countryFetches.clear();
     this.initialized = false;
+    this.refreshInflight = null;
+    this.lastRefreshAt = 0;
     this.cachedStats = null;
     this.statsFetchInflight = null;
     this.lastStatsFetchAt = 0;
@@ -417,13 +503,15 @@ export class WebsharePool {
   /** Fetch the account's proxy list (single-flight; keeps old list on failure). */
   async refresh(): Promise<void> {
     if (this.refreshInflight) return this.refreshInflight;
-    this.refreshInflight = this.doRefresh().finally(() => {
-      this.refreshInflight = null;
+    const inflight = this.doRefresh().finally(() => {
+      if (this.refreshInflight === inflight) this.refreshInflight = null;
     });
-    return this.refreshInflight;
+    this.refreshInflight = inflight;
+    return inflight;
   }
 
   private async doRefresh(): Promise<void> {
+    const generation = this.generation;
     const now = Date.now();
     if (now - this.lastRefreshAt < MIN_REFRESH_INTERVAL_MS) return;
     this.lastRefreshAt = now;
@@ -459,13 +547,16 @@ export class WebsharePool {
         return;
       }
       const payload = (await resp.json()) as unknown;
+      if (generation !== this.generation) return;
       const parsed = parseProxyList(payload, { countries });
+      for (const proxy of parsed.proxies) this.bindHealthIdentity(proxy.id, proxy.url);
       this.candidates = parsed.proxies;
       this.rrIndex = 0;
+      const usable = this.availableCandidates();
       log.info(
-        `[WEBSHARE] Refreshed proxy pool: ${parsed.proxies.length} usable` +
-          (parsed.proxies.length
-            ? ` (${summary(parsed.proxies)})`
+        `[WEBSHARE] Refreshed proxy pool: ${usable.length} usable` +
+          (usable.length
+            ? ` (${summary(usable)})`
             : ` — dropped ${parsed.droppedInvalid} invalid, ${parsed.droppedUnsafe} unsafe, ${parsed.droppedCountry} country-filtered`),
       );
     } catch (e) {
@@ -476,13 +567,13 @@ export class WebsharePool {
   /** Next proxy in rotation; triggers one on-demand refresh when the pool is empty. */
   async getProxy(): Promise<WebshareProxy | null> {
     if (!this.enabled) return null;
-    if (!this.candidates.length) {
+    if (!this.availableCandidates().length) {
       if (Date.now() - this.lastRefreshAt >= MIN_REFRESH_INTERVAL_MS) {
         await this.refresh().catch(() => {});
       }
-      if (!this.candidates.length) return null;
+      if (!this.availableCandidates().length) return null;
     }
-    const proxy = this.candidates[this.rrIndex % this.candidates.length]!;
+    const proxy = this.orderedCandidates(this.candidates)[0]!;
     this.rrIndex = (this.rrIndex + 1) % this.candidates.length;
     return proxy;
   }
@@ -513,14 +604,9 @@ export class WebsharePool {
       )];
       for (const code of wanted) {
         if (out.length >= limit) break;
-        const matches = this.candidates.filter((p) => p.countryCode === code);
+        const matches = this.availableCandidates().filter((p) => p.countryCode === code);
         if (!matches.length) continue;
-        const sorted = isWarm
-          ? [...matches].sort((a, b) => (isWarm(b.url) ? 1 : 0) - (isWarm(a.url) ? 1 : 0))
-          : matches;
-        // Rotate within the country so repeated jobs lead with different exits.
-        const start = isWarm ? 0 : this.rrIndex % sorted.length;
-        for (const p of [...sorted.slice(start), ...sorted.slice(0, start)]) {
+        for (const p of this.orderedCandidates(matches, isWarm)) {
           push(p);
           if (out.length >= limit) break;
         }
@@ -531,12 +617,8 @@ export class WebsharePool {
 
     if (codes.blocked?.length) {
       const blocked = new Set(codes.blocked.map((c) => c.trim().toUpperCase()));
-      const matches = this.candidates.filter((p) => !blocked.has(p.countryCode));
-      const sorted = isWarm
-        ? [...matches].sort((a, b) => (isWarm(b.url) ? 1 : 0) - (isWarm(a.url) ? 1 : 0))
-        : matches;
-      const start = isWarm ? 0 : (sorted.length ? this.rrIndex % sorted.length : 0);
-      for (const p of [...sorted.slice(start), ...sorted.slice(0, start)]) {
+      const matches = this.availableCandidates().filter((p) => !blocked.has(p.countryCode));
+      for (const p of this.orderedCandidates(matches, isWarm)) {
         push(p);
         if (out.length >= limit) break;
       }
@@ -546,8 +628,8 @@ export class WebsharePool {
   }
 
   /**
-   * Return candidate proxies, prioritizing warm ones (if predicate matches).
-   * Falls back to round-robin.
+   * Return usable candidates, prioritizing extraction success ahead of session
+   * warmth. Rotate within each priority tier to spread requests across exits.
    */
   getWarmCandidates(
     limit = 3,
@@ -558,35 +640,20 @@ export class WebsharePool {
       if (out.length < limit && !out.some((q) => q.id === p.id)) out.push(p);
     };
 
-    if (isWarm && this.candidates.length > 0) {
-      const warmList = this.candidates.filter((p) => isWarm(p.url));
-      if (warmList.length > 0) {
-        const start = this.warmIndex % warmList.length;
-        for (let i = 0; i < warmList.length && out.length < limit; i++) {
-          push(warmList[(start + i) % warmList.length]!);
-        }
-        this.warmIndex = (this.warmIndex + Math.min(limit, warmList.length)) % warmList.length;
-      }
+    for (const proxy of this.orderedCandidates(this.candidates, isWarm)) {
+      push(proxy);
+      if (out.length >= limit) break;
     }
-
-    if (this.candidates.length > 0 && out.length < limit) {
-      const start = this.rrIndex % this.candidates.length;
-      for (let i = 0; i < this.candidates.length && out.length < limit; i++) {
-        const p = this.candidates[(start + i) % this.candidates.length]!;
-        push(p);
-      }
-      this.rrIndex = (this.rrIndex + limit) % this.candidates.length;
-    }
-
+    if (out.length) this.rrIndex = (this.rrIndex + out.length) % Math.max(1, this.candidates.length);
     return out;
   }
 
   getSomeProxies(count = 3): WebshareProxy[] {
-    return this.candidates.slice(0, count);
+    return this.orderedCandidates(this.candidates, undefined, 0).slice(0, count);
   }
 
   getAllCandidates(): WebshareProxy[] {
-    return [...this.candidates];
+    return this.orderedCandidates(this.candidates, undefined, 0);
   }
 
   /**
@@ -595,7 +662,8 @@ export class WebsharePool {
    * country-filtered API fetch. null when nothing matches; callers fall
    * back to plain rotation.
    */
-  async getProxyForCountries(codes: string[]): Promise<WebshareProxy | null> {    const wanted = [...new Set(
+  async getProxyForCountries(codes: string[]): Promise<WebshareProxy | null> {
+    const wanted = [...new Set(
       codes.map((c) => c.trim().toUpperCase()).filter((c) => /^[A-Z]{2}$/.test(c)),
     )];
     if (!this.enabled || !wanted.length) return null;
@@ -623,9 +691,9 @@ export class WebsharePool {
    */
   getProxyNotInCountries(codes: string[]): WebshareProxy | null {
     const blocked = new Set(codes.map((c) => c.trim().toUpperCase()));
-    const matches = this.candidates.filter((p) => !blocked.has(p.countryCode));
+    const matches = this.availableCandidates().filter((p) => !blocked.has(p.countryCode));
     if (!matches.length) return null;
-    const proxy = matches[this.rrIndex % matches.length]!;
+    const proxy = this.orderedCandidates(matches)[0]!;
     this.rrIndex = (this.rrIndex + 1) % matches.length;
     return proxy;
   }
@@ -633,9 +701,9 @@ export class WebsharePool {
   /** Rotate within the cached candidates restricted to `codes` (priority order). */
   private pickForCountries(codes: string[]): WebshareProxy | null {
     for (const code of codes) {
-      const matches = this.candidates.filter((p) => p.countryCode === code);
+      const matches = this.availableCandidates().filter((p) => p.countryCode === code);
       if (matches.length) {
-        const proxy = matches[this.rrIndex % matches.length]!;
+        const proxy = this.orderedCandidates(matches)[0]!;
         this.rrIndex = (this.rrIndex + 1) % matches.length;
         return proxy;
       }
@@ -655,20 +723,20 @@ export class WebsharePool {
     }
     const entry = this.countryFetches.get(code);
     if (entry?.state === 'pending') return entry.inflight;
-    if (entry?.state === 'complete') return entry.proxy;
+    if (entry?.state === 'complete') return this.orderedCandidates(entry.proxies, undefined, 0)[0] ?? null;
 
     let pending: PendingCountryFetch;
     const inflight = this.doCountryFetch(code).then((proxies) => {
       // A close/reset or replacement lookup invalidates this writer, including
       // its result for callers still waiting on the old promise.
       if (this.countryFetches.get(code) !== pending) return null;
-      const proxy = proxies.find((candidate) =>
-        !pending.invalidatedIds.has(candidate.id) && !pending.invalidatedUrls.has(candidate.url),
-      ) ?? null;
-      this.countryFetches.set(code, { state: 'complete', at: Date.now(), proxy });
-      return proxy;
+      for (const proxy of proxies) this.bindHealthIdentity(proxy.id, proxy.url);
+      // Keep inventory even when every exit is cooling down, so the completed
+      // country cache cannot extend a cooldown by caching a null placeholder.
+      this.countryFetches.set(code, { state: 'complete', at: Date.now(), proxies });
+      return this.orderedCandidates(proxies, undefined, 0)[0] ?? null;
     });
-    pending = { state: 'pending', inflight, invalidatedIds: new Set(), invalidatedUrls: new Set() };
+    pending = { state: 'pending', inflight };
     this.countryFetches.set(code, pending);
     return inflight;
   }
@@ -701,20 +769,13 @@ export class WebsharePool {
     }
   }
 
-  /** Remove an exit from every selector and prevent pending fetches restoring it. */
+  /** Invalidate country lookups; health filters retain account inventory for recovery. */
   private evictProxy(selector: { id: string } | { url: string }): boolean {
     const matches = (proxy: WebshareProxy): boolean =>
       'id' in selector ? proxy.id === selector.id : proxy.url === selector.url;
-    const before = this.candidates.length;
-    this.candidates = this.candidates.filter((proxy) => !matches(proxy));
-    let removed = this.candidates.length < before;
+    let removed = this.availableCandidates().some(matches);
     for (const [code, entry] of this.countryFetches) {
-      if (entry.state === 'pending') {
-        // A pending result's identity is not known yet. Retain exclusions only
-        // for the lifetime of that fetch; completion discards these sets.
-        if ('id' in selector) entry.invalidatedIds.add(selector.id);
-        else entry.invalidatedUrls.add(selector.url);
-      } else if (entry.proxy && matches(entry.proxy)) {
+      if (entry.state === 'complete' && entry.proxies.some(matches)) {
         this.countryFetches.delete(code);
         removed = true;
       }
@@ -722,22 +783,53 @@ export class WebsharePool {
     return removed;
   }
 
-  /** A resolution succeeded through this proxy — clear its failure count. */
-  markOk(id: string): void {
-    this.failures.delete(id);
+  /** Extraction produced usable media through this identity. */
+  markOk(id: string, proxyUrl?: string): void {
+    this.pruneHealth();
+    const now = Date.now();
+    this.recordHealth(this.healthIdentity(id, proxyUrl), {
+      failures: 0, lastSuccessAt: now, touchedAt: now, cooldownUntil: 0,
+    });
   }
 
-  /** A resolution failed through this proxy — rotate; evict after repeated failures. */
-  markBad(id: string): void {
-    const count = (this.failures.get(id) ?? 0) + 1;
-    this.failures.set(id, count);
+  /** Reachable content failure clears transport failures without proving extraction. */
+  markReachable(id: string, proxyUrl?: string): void {
+    this.pruneHealth();
+    const identity = this.healthIdentity(id, proxyUrl);
+    const health = this.health.get(identity);
+    // A late content response is weaker evidence than usable extraction and
+    // must not undo a cooldown established by concurrent proxy failures.
+    if (health?.cooldownUntil) return;
+    this.recordHealth(identity, {
+      failures: 0, lastSuccessAt: health?.lastSuccessAt ?? 0,
+      touchedAt: Date.now(), cooldownUntil: 0,
+    });
+  }
+
+  /** A proxy failure demotes this identity; repeated failures start a cooldown. */
+  markBad(id: string, proxyUrl?: string): void {
+    this.pruneHealth();
+    const identity = this.healthIdentity(id, proxyUrl);
+    const health = this.health.get(identity);
+    // Late failures from the same concurrent batch do not extend quarantine.
+    if (health?.cooldownUntil) return;
+    const count = (health?.failures ?? 0) + 1;
     if (count >= MAX_FAILURES_PER_PROXY) {
-      this.failures.delete(id);
-      if (this.evictProxy({ id })) {
+      const removed = this.evictProxy(proxyUrl ? { url: proxyUrl } : { id });
+      this.recordHealth(identity, {
+        failures: count, lastSuccessAt: 0, touchedAt: Date.now(),
+        cooldownUntil: Date.now() + PROXY_COOLDOWN_MS,
+      });
+      if (removed) {
         log.warning(
-          `[WEBSHARE] Evicting proxy after ${count} consecutive failures — ${this.candidates.length} left in pool`,
+          `[WEBSHARE] Cooling down proxy after ${count} consecutive failures — ${this.size} left in pool`,
         );
       }
+    } else {
+      this.recordHealth(identity, {
+        failures: count, lastSuccessAt: health?.lastSuccessAt ?? 0,
+        touchedAt: Date.now(), cooldownUntil: 0,
+      });
     }
   }
 
@@ -748,9 +840,17 @@ export class WebsharePool {
    * the normal refresh guard) so rotation hands out only live exits.
    */
   evictByUrl(proxyUrl: string): boolean {
-    if (this.evictProxy({ url: proxyUrl })) {
+    this.pruneHealth();
+    const removed = this.evictProxy({ url: proxyUrl });
+    if (!this.health.get(proxyUrl)?.cooldownUntil) {
+      this.recordHealth(proxyUrl, {
+        failures: MAX_FAILURES_PER_PROXY, lastSuccessAt: 0,
+        touchedAt: Date.now(), cooldownUntil: Date.now() + PROXY_COOLDOWN_MS,
+      });
+    }
+    if (removed) {
       log.warning(
-        `[WEBSHARE] Evicting replaced/stale proxy after 407 — ${this.candidates.length} left in pool, refreshing list`,
+        `[WEBSHARE] Evicting replaced/stale proxy after 407 — ${this.size} left in pool, refreshing list`,
       );
       void this.refresh().catch(() => {});
       return true;
@@ -760,14 +860,14 @@ export class WebsharePool {
 
   /** Country summary of active pool candidates (e.g. "US×10, FR×2"). */
   summary(): string {
-    return summary(this.candidates);
+    return summary(this.availableCandidates());
   }
 
   /** Test hook — replace the candidate list without touching the API. */
   _setCandidatesForTest(proxies: WebshareProxy[]): void {
     this.candidates = proxies;
     this.rrIndex = 0;
-    this.failures.clear();
+    this.health.clear();
     this.countryFetches.clear();
   }
 
@@ -973,7 +1073,7 @@ export class WebsharePool {
         };
       }
 
-      if (this.candidates.length === 0) {
+      if (this.size === 0) {
         return {
           enabled: true,
           operational: false,
@@ -1001,9 +1101,10 @@ export class WebsharePool {
 
   /** Operational snapshot (no credentials). */
   status(): Record<string, unknown> {
+    const candidates = this.availableCandidates();
     return {
       enabled: this.enabled,
-      pool_size: this.candidates.length,
+      pool_size: candidates.length,
       bandwidth: this.cachedStats
         ? {
             used: this.cachedStats.usedFormatted,
@@ -1018,13 +1119,13 @@ export class WebsharePool {
             last_updated: new Date(this.cachedStats.lastUpdatedAt).toISOString(),
           }
         : null,
-      proxies: this.candidates.map((p) => ({
+      proxies: candidates.map((p) => ({
         address: p.address,
         port: p.port,
         country: p.countryCode,
         city: p.city,
         last_verification: p.lastVerification ? new Date(p.lastVerification * 1000).toISOString() : null,
-        consecutive_failures: this.failures.get(p.id) ?? 0,
+        consecutive_failures: this.proxyHealth(p)?.failures ?? 0,
       })),
     };
   }

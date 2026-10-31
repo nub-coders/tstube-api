@@ -10,6 +10,8 @@ import { metadata } from './innertube.js';
 import { formatInd, formatSeconds, parseDur, processVideo, extractArtist } from './formatters.js';
 import type { ProcessedVideo } from './formatters.js';
 import { getLogger } from './logger.js';
+import { withSearchSlot } from './youtubeSearchBudget.js';
+import { boundedFetch } from './requestDeadline.js';
 
 const log = getLogger('ytube_api.youtube_api');
 
@@ -100,7 +102,7 @@ async function callGoogleApi(url: string, params: Record<string, string>): Promi
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 10_000);
   try {
-    const res = await fetch(`${url}?${qs}`, { signal: controller.signal });
+    const res = await boundedFetch(globalThis.fetch, 10_000)(`${url}?${qs}`, { signal: controller.signal });
     const body = await res.json().catch(() => null);
     return { ok: res.ok, status: res.status, body };
   } catch {
@@ -123,7 +125,8 @@ async function getJson(url: string, params: Record<string, string>): Promise<any
     const key = pickLiveKey(tried);
     if (!key) return null;
     tried.add(key);
-    const res = await callGoogleApi(url, { ...params, key });
+    const call = () => callGoogleApi(url, { ...params, key });
+    const res = url === SEARCH_URL ? await withSearchSlot(call) : await call();
     if (res.ok) return res.body;
     if (res.status === 0) return null; // network / timeout — not a key problem
     const errors: any[] = res.body?.error?.errors ?? [];

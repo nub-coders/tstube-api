@@ -91,7 +91,7 @@ export class StreamJobRedis {
       const backfill = !job!.secret;
       if (backfill) job!.secret = pending.secret;
       let owner = '';
-      if (!job!.extracted_url && !this.read(leaseKey!)) {
+      if ((!job!.extracted_url || job!.validation_version !== Number(argv[5])) && !this.read(leaseKey!)) {
         owner = argv[1]!;
         this.write(leaseKey!, owner, Number(argv[2]));
         job = { ...pending, secret: job!.secret };
