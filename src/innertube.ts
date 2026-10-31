@@ -5,6 +5,7 @@ import { Innertube, Platform, Parser, Helpers } from 'youtubei.js';
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
 import { extractArtist, formatInd } from './formatters.js';
 import { getLogger } from './logger.js';
+import { config } from './config.js';
 import { BoundedCache } from './boundedCache.js';
 import { websharePool } from './proxy.js';
 import { fetchRegionRestriction } from './youtubeApi.js';
@@ -136,6 +137,7 @@ export function resetInnertube(): void {
   for (const task of PROXIED_INNERTUBE_BOOTSTRAPS.values()) task.controller.abort(new Error('Innertube reset'));
   PROXIED_INNERTUBE_BOOTSTRAPS.clear();
   PROXIED_INNERTUBE_POOL.clear();
+  directBootstrap = null;
 }
 
 // Innertube instances whose HTTP traffic is bound to one Webshare exit — one
@@ -237,7 +239,8 @@ async function getPlayerInfo(yt: Innertube, vid: string, client: string, budget:
   }
 }
 
-function makeProxiedFetch(agent: ProxyAgent): typeof fetch {
+/** Webshare fetch; without an agent this is the plain direct fetch. */
+function makeProxiedFetch(agent?: ProxyAgent): typeof fetch {
   const proxied = (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
     let url: string | URL = input as any;
     let reqInit: Record<string, unknown> = { ...(init ?? {}) };
@@ -271,7 +274,9 @@ function makeProxiedFetch(agent: ProxyAgent): typeof fetch {
     if (reqInit.body != null) {
       (reqInit as any).duplex = 'half';
     }
-    return undiciFetch(url as any, { ...reqInit, dispatcher: agent } as any);
+    return agent
+      ? undiciFetch(url as any, { ...reqInit, dispatcher: agent } as any)
+      : undiciFetch(url as any, reqInit as any);
   };
   return boundedFetch(proxied as unknown as typeof fetch);
 }
@@ -314,6 +319,38 @@ async function getProxiedInnertube(proxyUrl: string): Promise<Innertube> {
   return subscribe(current, () => {
     if (PROXIED_INNERTUBE_BOOTSTRAPS.get(proxyUrl) === current) PROXIED_INNERTUBE_BOOTSTRAPS.delete(proxyUrl);
   });
+}
+
+const DIRECT_INNERTUBE_KEY = 'direct:';
+let directBootstrap: Promise<Innertube> | null = null;
+
+/** Opt-in last resort when the proxy tier is empty: a plain (non-proxied) session. */
+function directFallbackEnabled(): boolean {
+  try {
+    return Boolean(config().EXTRACTION_DIRECT_FALLBACK);
+  } catch {
+    return ['1', 'true', 'yes'].includes((process.env.EXTRACTION_DIRECT_FALLBACK || '').trim().toLowerCase());
+  }
+}
+
+/**
+ * Direct (proxy-less) Innertube session for the EXTRACTION_DIRECT_FALLBACK
+ * path. Datacenter IPs can be bot-checked by YouTube, so this is opt-in and
+ * only reached when the Webshare pool has no usable exit at all.
+ */
+async function getDirectInnertube(): Promise<Innertube> {
+  const cached = PROXIED_INNERTUBE_POOL.get(DIRECT_INNERTUBE_KEY);
+  if (cached) return cached;
+  directBootstrap ??= withRequestDeadline(PROXY_BOOTSTRAP_TIMEOUT_MS, 'direct Innertube bootstrap', () =>
+    Innertube.create({ fetch: makeProxiedFetch() }),
+  ).then((instance) => {
+    PROXIED_INNERTUBE_POOL.set(DIRECT_INNERTUBE_KEY, instance);
+    return instance;
+  }, (error) => {
+    directBootstrap = null;
+    throw error;
+  });
+  return directBootstrap;
 }
 
 /** Pre-warm Webshare exits in the background so initial requests have warm sessions ready. */
@@ -364,6 +401,14 @@ export async function getInnertube(): Promise<Innertube> {
         requestSignal()?.throwIfAborted();
         if (playerExceptionFailure(error) === 'proxy') websharePool.markBad(proxy.id, proxy.url);
         log.warning(`[YTJS] Webshare session initialization failed: ${String(error)}`);
+      }
+    }
+    if (!websharePool.size && directFallbackEnabled()) {
+      log.warning('[YTJS] Webshare pool empty — trying direct extraction fallback');
+      try {
+        return await getDirectInnertube();
+      } catch (error) {
+        log.warning(`[YTJS] Direct extraction fallback failed: ${String(error)}`);
       }
     }
     throw new Error('No usable Webshare proxy is available for YouTube extraction');
@@ -607,7 +652,7 @@ function verifiedMeta(streams: [VerifiedStream | null, VerifiedStream | null]): 
 
 async function verifiedLiveUrls(
   url: string,
-  proxyUrl: string,
+  proxyUrl: string | null,
   probes: Map<string, Promise<VerifiedStream | null>>,
   deadline: number,
 ): Promise<ResolveMeta> {
@@ -618,7 +663,7 @@ async function verifiedLiveUrls(
       pending = (async (): Promise<VerifiedStream | null> => {
         const options = { deadline, signal: requestSignal(), mode };
         if (await probeHls(url, { ...options, proxyUrl: null })) return { url, proxyUrl: null, streamType: 'hls' };
-        if (await probeHls(url, { ...options, proxyUrl })) return { url, proxyUrl, streamType: 'hls' };
+        if (proxyUrl && await probeHls(url, { ...options, proxyUrl })) return { url, proxyUrl, streamType: 'hls' };
         return null;
       })();
       probes.set(key, pending);
@@ -677,7 +722,7 @@ function mergeStreamMeta(first: ResolveMeta | null | undefined, next: ResolveMet
  */
 async function attemptResolveWithProxiedInnertube(
   vid: string,
-  proxyUrl: string,
+  proxyUrl: string | null,
   yt: Innertube,
   deadline: number,
   isCurrent: () => boolean,
@@ -796,11 +841,22 @@ async function resolveViaProxyTier(
   let geo: GeoRestriction | undefined;
   let geoLookup: Promise<void> | undefined;
   let best: ResolveMeta | null = null;
-  // Startup and an exhausted pool can need an on-demand list refresh. There
-  // is no direct extraction fallback when that refresh finds no usable exit.
+  // Startup and an exhausted pool can need an on-demand list refresh. When
+  // that finds no usable exit, EXTRACTION_DIRECT_FALLBACK may still resolve
+  // non-geo videos without a proxy.
   if (!websharePool.getAllCandidates().length && !await websharePool.getProxy()) {
-    log.error('[YTJS] No Webshare proxy is available for YouTube extraction');
-    return null;
+    if (!directFallbackEnabled()) {
+      log.error('[YTJS] No Webshare proxy is available for YouTube extraction');
+      return null;
+    }
+    log.warning('[YTJS] Webshare pool empty — trying direct extraction fallback');
+    const yt = await getDirectInnertube().catch((e) => {
+      log.warning(`[YTJS] Direct extraction fallback failed: ${String(e)}`);
+      return null;
+    });
+    if (!yt) return null;
+    const result = await attemptResolveWithProxiedInnertube(vid, null, yt, deadline, isCurrent, meta => isUsable(mergeStreamMeta(best, meta)), onComplete);
+    return result.meta;
   }
 
   // One exit's full attempt: bootstrap (a cold exit pays session setup here, a
@@ -1030,10 +1086,33 @@ function makeRelatedItem(vid: string, partial: Partial<RelatedItem>): RelatedIte
   };
 }
 
+const RELATED_CACHE = new BoundedCache<RelatedItem[]>(2048, 300);
+const RELATED_REQUESTS = new BoundedCache<Promise<RelatedItem[]>>(2048);
+
 export async function related(urlOrId: string, limit = 5): Promise<RelatedItem[]> {
   const vid = extractId(urlOrId);
   if (!vid) return [];
 
+  const select = (items: RelatedItem[]) => items.slice(0, limit).map(item => ({ ...item }));
+  const cached = RELATED_CACHE.get(vid);
+  if (cached) return select(cached);
+  let pending = RELATED_REQUESTS.get(vid);
+  if (!pending) {
+    pending = fetchRelated(vid).then(items => {
+      // Keep the whole list so a small request cannot truncate later callers.
+      if (items.length) RELATED_CACHE.set(vid, items);
+      return items;
+    });
+    RELATED_REQUESTS.set(vid, pending);
+  }
+  try {
+    return select(await pending);
+  } finally {
+    if (RELATED_REQUESTS.get(vid) === pending) RELATED_REQUESTS.delete(vid);
+  }
+}
+
+async function fetchRelated(vid: string): Promise<RelatedItem[]> {
   try {
     const yt = await getInnertube();
     const res = await yt.actions.execute('/next', { videoId: vid });
@@ -1082,7 +1161,6 @@ export async function related(urlOrId: string, limit = 5): Promise<RelatedItem[]
         const views = cvr.viewCountText?.simpleText ?? '';
         items.push(makeRelatedItem(candId, { title, duration, time: duration, channel, views }));
       }
-      if (items.length >= limit) break;
     }
     return items;
   } catch (e) {

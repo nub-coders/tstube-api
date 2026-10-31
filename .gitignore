@@ -11,6 +11,7 @@ cache*.db
 /dist/
 node_modules/
 cf-worker-test/
+.cache/
 
 # Editor / OS
 .idea/

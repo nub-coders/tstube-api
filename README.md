@@ -54,6 +54,11 @@ configured port. Invalid connection URLs fail at startup without logging credent
 
 ## Behavior notes
 
+- Repeated `/info` requests share in-flight metadata and recommendation lookups.
+  Successful results are cached per process for five minutes (up to 2,048 entries
+  each); recommendation limits are applied separately for each caller. Concurrent
+  searches also share empty or failed scrape results, so callers do not queue
+  duplicate retry cycles. A subsequent request can retry those failures.
 - Quotas and their reset headers use the next midnight UTC. Granting quota does
   not extend the current day's window.
 - YouTube Data API key cooldowns follow Google's midnight reset in US Pacific,

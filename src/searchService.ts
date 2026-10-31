@@ -46,7 +46,7 @@ interface CachedSearchResults {
 
 // Cache the complete parsed page; response limits belong to each caller.
 export const MEMORY_CACHE = new BoundedCache<SearchItem[]>(5000, 300);
-export const LOCKS = new BoundedCache<Promise<void>>(5000);
+export const LOCKS = new BoundedCache<Promise<SearchItem[]>>(5000);
 
 function normalize(q: string): string {
   return q.toLowerCase().trim().replace(/\s+/g, ' ');
@@ -173,22 +173,6 @@ async function redisSet(key: string, value: string): Promise<void> {
   }
 }
 
-/** Minimal per-key async mutex (Python used asyncio.Lock per query). */
-function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const prev = LOCKS.get(key) ?? Promise.resolve();
-  let release!: () => void;
-  const gate = new Promise<void>((r) => {
-    release = r;
-  });
-  const tail = prev.then(() => gate);
-  LOCKS.set(key, tail);
-  return prev.then(fn).finally(() => {
-    release();
-    // Only remove if we are still the tail.
-    if (LOCKS.get(key) === tail) LOCKS.delete(key);
-  });
-}
-
 // ── Search ──────────────────────────────────────────────────────
 
 function parseCachedResults(raw: string): SearchItem[] | null {
@@ -211,10 +195,12 @@ async function cachedResults(
   const cached = MEMORY_CACHE.get(key);
   if (cached !== undefined) return cached;
 
-  return withLock(key, async () => {
-    const again = MEMORY_CACHE.get(key);
-    if (again !== undefined) return again;
+  // Share the result, including an empty/failed scrape. A mutex makes every
+  // waiting caller repeat the full retry budget when there is nothing to cache.
+  const pending = LOCKS.get(key);
+  if (pending) return pending;
 
+  const task = (async () => {
     const raw = await redisGet(key);
     const remote = raw ? parseCachedResults(raw) : null;
     if (remote !== null) {
@@ -229,7 +215,13 @@ async function cachedResults(
       void redisSet(key, JSON.stringify(payload));
     }
     return results;
-  });
+  })();
+  LOCKS.set(key, task);
+  try {
+    return await task;
+  } finally {
+    if (LOCKS.get(key) === task) LOCKS.delete(key);
+  }
 }
 
 async function searchResults(query: string): Promise<SearchItem[]> {

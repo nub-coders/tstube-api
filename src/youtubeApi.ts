@@ -12,6 +12,7 @@ import type { ProcessedVideo } from './formatters.js';
 import { getLogger } from './logger.js';
 import { withSearchSlot } from './youtubeSearchBudget.js';
 import { boundedFetch } from './requestDeadline.js';
+import { BoundedCache } from './boundedCache.js';
 
 const log = getLogger('ytube_api.youtube_api');
 
@@ -28,6 +29,9 @@ export interface VideoInfo {
   thumbnail?: string;
   video_id?: string;
 }
+
+const VIDEO_INFO_CACHE = new BoundedCache<VideoInfo>(2048, 300);
+const VIDEO_INFO_REQUESTS = new BoundedCache<Promise<VideoInfo>>(2048);
 
 export function getAvailableKeys(): string[] {
   return config()
@@ -213,7 +217,27 @@ export async function fetchRegionRestriction(videoId: string): Promise<RegionRes
   return allowed || blocked ? { allowed, blocked } : null;
 }
 
-export async function getVideoById(videoId: string): Promise<VideoInfo> {  if (!getAvailableKeys().length) {
+/** Repeated /info calls share metadata work, without caching transient failures. */
+export async function getVideoById(videoId: string): Promise<VideoInfo> {
+  const cached = VIDEO_INFO_CACHE.get(videoId);
+  if (cached) return { ...cached };
+  let pending = VIDEO_INFO_REQUESTS.get(videoId);
+  if (!pending) {
+    pending = fetchVideoById(videoId).then(info => {
+      if (info.title) VIDEO_INFO_CACHE.set(videoId, info);
+      return info;
+    });
+    VIDEO_INFO_REQUESTS.set(videoId, pending);
+  }
+  try {
+    return { ...await pending };
+  } finally {
+    if (VIDEO_INFO_REQUESTS.get(videoId) === pending) VIDEO_INFO_REQUESTS.delete(videoId);
+  }
+}
+
+async function fetchVideoById(videoId: string): Promise<VideoInfo> {
+  if (!getAvailableKeys().length) {
     try {
       const info = await metadata(videoId);
       if (info) return info;

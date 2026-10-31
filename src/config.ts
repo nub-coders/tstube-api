@@ -81,6 +81,8 @@ export interface Config {
   WEBSHARE_API_KEY: string | null;
   WEBSHARE_PROXY_COUNTRIES: string;
   WEBSHARE_REFRESH_SEC: number;
+  /** Last-resort proxy-less extraction when the pool is empty (default off). */
+  EXTRACTION_DIRECT_FALLBACK: boolean;
 
   // ── Deployment ───────────────────────────────────────────────
   API_HOST: string;
@@ -191,6 +193,7 @@ export function loadConfig(): Config {
     WEBSHARE_API_KEY: process.env.WEBSHARE_API_KEY || null,
     WEBSHARE_PROXY_COUNTRIES: (process.env.WEBSHARE_PROXY_COUNTRIES ?? '').toUpperCase(),
     WEBSHARE_REFRESH_SEC: getint('WEBSHARE_REFRESH_SEC', 600),
+    EXTRACTION_DIRECT_FALLBACK: boolish(process.env.EXTRACTION_DIRECT_FALLBACK ?? 'false'),
 
     API_HOST: apiHost,
     BASE_URL: getenv('BASE_URL', `https://${apiHost}`).replace(/\/+$/, ''),

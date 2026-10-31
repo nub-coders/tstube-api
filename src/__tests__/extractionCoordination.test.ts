@@ -4,17 +4,19 @@ const state = vi.hoisted(() => ({
   create: vi.fn(), player: vi.fn(), proxyFetch: vi.fn(), probe: vi.fn(), hlsProbe: vi.fn(),
   candidates: vi.fn(), markOk: vi.fn(), markReachable: vi.fn(), markBad: vi.fn(),
   region: vi.fn(), geoCandidates: vi.fn(),
+  directFallback: false,
 }));
 vi.mock('youtubei.js', () => ({
   Innertube: { create: state.create }, Platform: { shim: {} },
   Parser: { addRuntimeParser() {}, setParserErrorHandler() {} }, Helpers: { YTNode: class {} },
 }));
 vi.mock('undici', () => ({ ProxyAgent: class {}, fetch: state.proxyFetch }));
+vi.mock('../config.js', () => ({ config: () => ({ EXTRACTION_DIRECT_FALLBACK: state.directFallback }) }));
 vi.mock('../youtubeApi.js', () => ({ fetchRegionRestriction: state.region }));
 vi.mock('../mediaProbe.js', () => ({ probeMedia: state.probe, invalidateMediaProbe: vi.fn() }));
 vi.mock('../hlsProxy.js', () => ({ probeHls: state.hlsProbe }));
 vi.mock('../proxy.js', () => ({ websharePool: {
-  enabled: true, getWarmCandidates: state.candidates, getAllCandidates: state.candidates,
+  enabled: true, size: 0, getWarmCandidates: state.candidates, getAllCandidates: state.candidates,
   getProxy: async () => null, markOk: state.markOk, markReachable: state.markReachable, markBad: state.markBad,
   getGeoCandidates: state.geoCandidates, getProxyForCountries: async () => null,
 } }));
@@ -47,6 +49,7 @@ beforeEach(() => {
   state.hlsProbe.mockResolvedValue(true);
   state.region.mockResolvedValue(null);
   state.geoCandidates.mockReturnValue([]);
+  state.directFallback = false;
 });
 afterEach(() => { resetInnertube(); vi.useRealTimers(); });
 
@@ -89,6 +92,30 @@ it('releases bootstrap admission when every caller cancels even if session creat
   await getInnertube();
   expect(state.create).toHaveBeenCalledTimes(9);
   expect(state.markBad).not.toHaveBeenCalled();
+});
+
+it('does not attempt direct extraction when the flag is off', async () => {
+  state.candidates.mockReturnValue([]);
+  await expect(getInnertube()).rejects.toThrow('No usable Webshare proxy');
+  expect(state.create).not.toHaveBeenCalled();
+});
+
+it('falls back to a direct session when the pool is empty and the flag is on', async () => {
+  state.candidates.mockReturnValue([]);
+  state.directFallback = true;
+  const instance = await getInnertube();
+  expect(state.create).toHaveBeenCalledTimes(1);
+  expect(state.create.mock.calls[0][0]).toHaveProperty('fetch');
+  expect(instance).toHaveProperty('getBasicInfo');
+});
+
+it('resolves a video without a proxy through the direct fallback', async () => {
+  state.candidates.mockReturnValue([]);
+  state.directFallback = true;
+  const meta = await resolveWithMeta(videoId(), 'muxed');
+  expect(state.create).toHaveBeenCalledTimes(1);
+  expect(meta.url).toBeTruthy();
+  expect(meta.proxyUrl).toBeNull();
 });
 
 it('coalesces concurrent audio and video extraction through one player ladder', async () => {

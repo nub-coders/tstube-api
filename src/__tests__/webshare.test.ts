@@ -8,9 +8,13 @@ import {
   formatBytes,
   parseProxyList,
   parseWebshareStats,
+  POOL_STATE_FILE,
+  readPoolState,
   WebsharePool,
+  writePoolState,
   type WebshareProxy,
 } from '../proxy.js';
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import {
   isPrivateAddress,
   isSafeProxyUrlSync,
@@ -491,5 +495,102 @@ describe('parseWebshareStats', () => {
     expect(stats.limitFormatted).toBe('Unknown');
     expect(stats.remainingFormatted).toBe('Unknown');
     expect(stats.totalRequests).toBe(0);
+  });
+});
+
+function unsafeHostsCase(): void {
+  const stored: WebshareProxy[] = [
+    {
+      id: 'p1',
+      address: '38.154.227.167',
+      port: 5868,
+      username: 'user',
+      password: 'pass',
+      url: buildProxyUrl('user', 'pass', '38.154.227.167', 5868),
+      countryCode: 'US',
+      city: 'Seattle',
+      lastVerification: 1_700_000_000,
+    },
+  ];
+  const dirty = [
+    { ...stored[0], id: 'p3', address: '10.0.0.5', url: buildProxyUrl('user', 'pass', '10.0.0.5', 5868) },
+    { ...stored[0], id: 'p4', address: '192.168.1.1' },
+    { ...stored[0], id: 'p5', address: '', username: '', password: '' },
+    stored[0],
+  ];
+  writeFileSync(POOL_STATE_FILE, JSON.stringify({ savedAt: Date.now(), proxies: dirty }), { mode: 0o600 });
+  const restored = readPoolState()!;
+  expect(restored.map((p) => p.id)).toEqual(['p1']);
+}
+
+describe('pool state persistence', () => {
+  const dir = POOL_STATE_FILE.slice(0, POOL_STATE_FILE.lastIndexOf('/'));
+
+  const stored: WebshareProxy[] = [
+    {
+      id: 'p1',
+      address: '38.154.227.167',
+      port: 5868,
+      username: 'user',
+      password: 'pass',
+      url: buildProxyUrl('user', 'pass', '38.154.227.167', 5868),
+      countryCode: 'US',
+      city: 'Seattle',
+      lastVerification: 1_700_000_000,
+    },
+    {
+      id: 'p2',
+      address: '45.130.24.12',
+      port: 1080,
+      username: 'u2',
+      password: 'p2',
+      url: buildProxyUrl('u2', 'p2', '45.130.24.12', 1080),
+      countryCode: 'DE',
+      city: 'Berlin',
+      lastVerification: 1_700_000_100,
+    },
+  ];
+
+  beforeEach(() => {
+    rmSync(POOL_STATE_FILE, { force: true });
+    mkdirSync(dir, { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(POOL_STATE_FILE, { force: true });
+  });
+
+  it('round-trips the last-known-good pool atomically', () => {
+    writePoolState(stored);
+    expect(readFileSync(POOL_STATE_FILE).length).toBeGreaterThan(0);
+    expect(readPoolState()).toEqual(
+      [...stored].sort((a, b) => b.lastVerification - a.lastVerification),
+    );
+  });
+
+  it('returns null for a missing or corrupt file', () => {
+    expect(readPoolState()).toBeNull();
+    writeFileSync(POOL_STATE_FILE, 'not json{', { mode: 0o600 });
+    expect(readPoolState()).toBeNull();
+    writeFileSync(POOL_STATE_FILE, JSON.stringify({ savedAt: Date.now(), proxies: 'nope' }), { mode: 0o600 });
+    expect(readPoolState()).toBeNull();
+  });
+
+  it('rejects a stale snapshot (older than 7 days)', () => {
+    writeFileSync(
+      POOL_STATE_FILE,
+      JSON.stringify({ savedAt: Date.now() - 8 * 24 * 60 * 60 * 1000, proxies: stored }),
+      { mode: 0o600 },
+    );
+    expect(readPoolState()).toBeNull();
+  });
+
+  it('drops entries with missing fields or unsafe hosts', unsafeHostsCase);
+
+  it('synthesizes ids for legacy entries without one', () => {
+    const legacy = [{ ...stored[0], id: undefined }];
+    writeFileSync(POOL_STATE_FILE, JSON.stringify({ savedAt: Date.now(), proxies: legacy }), { mode: 0o600 });
+    const restored = readPoolState()!;
+    expect(restored[0]?.id).toBe('38.154.227.167:5868');
   });
 });

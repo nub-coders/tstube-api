@@ -83,6 +83,7 @@ describe('search result limit caches', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     vi.unstubAllGlobals();
   });
 
@@ -177,5 +178,39 @@ describe('search result limit caches', () => {
     expect(results[2].results).toEqual(items.slice(0, 5));
     expect(results[2].suggested).toEqual(items.slice(5, 10));
     expect(upstreamCalls).toBe(1);
+  });
+
+  it('shares an empty result with concurrent callers and retries on the next request', async () => {
+    const svc = await fresh();
+    items = [];
+    const results = await Promise.all([
+      svc.fetchResults('missing song', 1),
+      svc.fetchResults(' Missing  SONG ', 20),
+      svc.fetchSuggestions('missing song', 5),
+    ]);
+    expect(results[0].main_results).toEqual([]);
+    expect(results[1].main_results).toEqual([]);
+    expect(results[2].results).toEqual([]);
+    expect(upstreamCalls).toBe(1);
+
+    items = resultItems(3);
+    expect((await svc.fetchResults('missing song', 2)).main_results).toHaveLength(2);
+    expect(upstreamCalls).toBe(2);
+  });
+
+  it('shares one retry budget during an upstream outage instead of queuing retries per caller', async () => {
+    const svc = await fresh();
+    vi.useFakeTimers();
+    const failingFetch = vi.fn<typeof fetch>(async () => {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      return new Response('Unavailable', { status: 503 });
+    });
+    vi.stubGlobal('fetch', failingFetch);
+    const started = Date.now();
+    const calls = Promise.all(Array.from({ length: 6 }, () => svc.fetchResults('some song')));
+    await vi.runAllTimersAsync();
+    expect((await calls).every(result => result.main_results.length === 0)).toBe(true);
+    expect(failingFetch).toHaveBeenCalledTimes(2);
+    expect(Date.now() - started).toBe(400);
   });
 });

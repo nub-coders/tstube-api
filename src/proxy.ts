@@ -8,6 +8,9 @@ import { config } from './config.js';
 import { getLogger } from './logger.js';
 import { isPrivateAddress, looksLocalHostname } from './urlValidation.js';
 import net from 'node:net';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const log = getLogger('ytube_api.webshare');
 
@@ -29,6 +32,10 @@ const MIN_REFRESH_INTERVAL_MS = 30_000;
 const COUNTRY_FETCH_TTL_MS = 5 * 60_000;
 /** Bandwidth stats cache TTL (60s). */
 const STATS_CACHE_TTL_MS = 60_000;
+/** Last-known-good pool snapshot, restored at boot before the API is reachable. */
+export const POOL_STATE_FILE = join(dirname(fileURLToPath(import.meta.url)), '.cache', 'webshare-pool.json');
+/** Persisted exits older than this are not trusted at boot. */
+const POOL_STATE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 export interface WebshareProxy {
   id: string;
@@ -225,6 +232,61 @@ export function parseProxyList(
 
   result.proxies.sort((a, b) => b.lastVerification - a.lastVerification);
   return result;
+}
+
+/**
+ * Persist the last-known-good pool so a restart (e.g. container DNS not yet
+ * ready) can serve requests before the Webshare API is reachable. Atomic
+ * tmp+rename; credentials are kept to mode 0600, container-local.
+ */
+export function writePoolState(proxies: WebshareProxy[]): void {
+  try {
+    mkdirSync(dirname(POOL_STATE_FILE), { recursive: true });
+    const tmp = `${POOL_STATE_FILE}.${process.pid}.tmp`;
+    writeFileSync(tmp, JSON.stringify({ savedAt: Date.now(), proxies }), { mode: 0o600 });
+    renameSync(tmp, POOL_STATE_FILE);
+  } catch {
+    /* best-effort — the live refresh remains the source of truth */
+  }
+}
+
+/**
+ * Load a persisted pool; null when missing, corrupt, or older than
+ * POOL_STATE_MAX_AGE_MS. Entries are re-validated with the same safety
+ * filter as live API data (invalid/unsafe hosts dropped).
+ */
+export function readPoolState(): WebshareProxy[] | null {
+  try {
+    const raw = readFileSync(POOL_STATE_FILE, 'utf8');
+    const parsed = JSON.parse(raw) as { savedAt?: unknown; proxies?: unknown };
+    if (typeof parsed.savedAt !== 'number' || !Array.isArray(parsed.proxies)) return null;
+    if (Date.now() - parsed.savedAt > POOL_STATE_MAX_AGE_MS) return null;
+
+    const proxies: WebshareProxy[] = [];
+    for (const item of parsed.proxies as Array<Record<string, unknown>>) {
+      const address = typeof item?.address === 'string' ? item.address.trim() : '';
+      const port = Number(item?.port);
+      const username = typeof item?.username === 'string' ? item.username : '';
+      const password = typeof item?.password === 'string' ? item.password : '';
+      if (!address || !Number.isInteger(port) || port <= 0 || port > 65535 || !username || !password) continue;
+      if (!isSafeProxyHost(address)) continue;
+      proxies.push({
+        id: typeof item?.id === 'string' ? item.id : `${address}:${port}`,
+        address,
+        port,
+        username,
+        password,
+        url: buildProxyUrl(username, password, address, port),
+        countryCode: typeof item?.countryCode === 'string' ? item.countryCode.toUpperCase() : '',
+        city: typeof item?.city === 'string' ? item.city : '',
+        lastVerification: typeof item?.lastVerification === 'number' ? item.lastVerification : 0,
+      });
+    }
+    proxies.sort((a, b) => b.lastVerification - a.lastVerification);
+    return proxies;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -462,19 +524,28 @@ export class WebsharePool {
       log.info('[WEBSHARE] WEBSHARE_API_KEY not set — fresh YouTube extraction unavailable');
       return;
     }
+    // Serve the last-known-good pool immediately; a boot-time API failure
+    // (e.g. container DNS not yet ready) then degrades to stale exits instead
+    // of an empty tier until the network heals.
+    const saved = readPoolState();
+    if (saved?.length) {
+      this.candidates = saved;
+      log.info(`[WEBSHARE] Restored ${saved.length} persisted proxy(ies) from pool state`);
+    }
     void this.refresh();
     const generation = this.generation;
-    // A transient failure (e.g. container DNS not ready at boot) must not
-    // leave the tier empty until the next 10-minute timer tick.
-    const retryBoot = (attempt: number): void => {
-      if (generation !== this.generation || !this.initialized || this.size || attempt >= 5) return;
+    // A transient boot failure must not leave the tier empty until the next
+    // 10-minute timer tick — retry with exponential backoff (30s → 300s cap)
+    // for as long as the pool stays empty.
+    const retryBoot = (backoffMs: number): void => {
+      if (generation !== this.generation || !this.initialized || this.size) return;
       const t = setTimeout(() => {
-        if (generation !== this.generation || !this.initialized) return;
-        void this.refresh().then(() => retryBoot(attempt + 1));
-      }, 30_000 * (attempt + 1));
+        if (generation !== this.generation || !this.initialized || this.size) return;
+        void this.refresh().then(() => retryBoot(Math.min(backoffMs * 2, 300_000)));
+      }, backoffMs);
       t.unref?.();
     };
-    setTimeout(() => retryBoot(0), 30_000).unref?.();
+    setTimeout(() => retryBoot(30_000), 30_000).unref?.();
 
     const intervalMs = Math.max(60, config().WEBSHARE_REFRESH_SEC) * 1000;
     this.timer = setInterval(() => {
@@ -551,6 +622,7 @@ export class WebsharePool {
       const parsed = parseProxyList(payload, { countries });
       for (const proxy of parsed.proxies) this.bindHealthIdentity(proxy.id, proxy.url);
       this.candidates = parsed.proxies;
+      if (parsed.proxies.length) writePoolState(parsed.proxies);
       this.rrIndex = 0;
       const usable = this.availableCandidates();
       log.info(
