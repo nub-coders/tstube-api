@@ -1,8 +1,14 @@
+import { performance } from 'node:perf_hooks';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebsharePool, buildProxyUrl, type WebshareProxy } from '../proxy.js';
 
 vi.mock('../config.js', () => ({
   config: () => ({ WEBSHARE_API_KEY: 'mock-health-key', WEBSHARE_PROXY_COUNTRIES: '', WEBSHARE_REFRESH_SEC: 60 }),
+}));
+
+// Health fixtures must not overwrite the snapshot used by persistence tests.
+vi.mock('node:fs', () => ({
+  mkdirSync: vi.fn(), readFileSync: vi.fn(() => '{}'), renameSync: vi.fn(), writeFileSync: vi.fn(),
 }));
 
 function proxy(id: string, port: number, countryCode = 'US', password = 'p'): WebshareProxy {
@@ -36,6 +42,7 @@ describe('Webshare extraction health', () => {
     pool = new WebsharePool();
     now = 1_800_000_000_000;
     vi.spyOn(Date, 'now').mockImplementation(() => now);
+    vi.spyOn(performance, 'now').mockImplementation(() => now - 1_800_000_000_000);
     inventory = [];
     fetchMock = vi.fn<typeof fetch>(async () => Response.json(payload(inventory)));
     vi.stubGlobal('fetch', fetchMock);

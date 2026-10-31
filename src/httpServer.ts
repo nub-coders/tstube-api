@@ -463,6 +463,11 @@ async function handle(req: IncomingMessage, res: ServerResponse, router: Router)
     metricPath = matched?.route.template ?? 'unmatched';
     result = await runPipeline(ctx, router, matched);
   } catch (e) {
+    if (controller.signal.aborted && e === controller.signal.reason) {
+      // A disconnected caller cancels its wait; no response can be sent.
+      metrics.record(method, metricPath, 499, (Date.now() - started) / 1000);
+      return;
+    }
     if (e instanceof HttpError) {
       result = json(e.status, e.payload);
     } else {

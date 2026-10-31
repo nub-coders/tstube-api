@@ -11,6 +11,7 @@ import net from 'node:net';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { performance } from 'node:perf_hooks';
 
 const log = getLogger('ytube_api.webshare');
 
@@ -424,7 +425,8 @@ export class WebsharePool {
   private timer: NodeJS.Timeout | null = null;
   private refreshInflight: Promise<void> | null = null;
   private generation = 0;
-  private lastRefreshAt = 0;
+  // Process-local elapsed time keeps clock corrections out of the rate limit.
+  private lastRefreshAt = -Infinity;
   private initialized = false;
   private cachedStats: WebshareBandwidthStats | null = null;
   private statsFetchInflight: Promise<WebshareBandwidthStats> | null = null;
@@ -565,7 +567,7 @@ export class WebsharePool {
     this.countryFetches.clear();
     this.initialized = false;
     this.refreshInflight = null;
-    this.lastRefreshAt = 0;
+    this.lastRefreshAt = -Infinity;
     this.cachedStats = null;
     this.statsFetchInflight = null;
     this.lastStatsFetchAt = 0;
@@ -583,7 +585,7 @@ export class WebsharePool {
 
   private async doRefresh(): Promise<void> {
     const generation = this.generation;
-    const now = Date.now();
+    const now = performance.now();
     if (now - this.lastRefreshAt < MIN_REFRESH_INTERVAL_MS) return;
     this.lastRefreshAt = now;
 
@@ -640,7 +642,7 @@ export class WebsharePool {
   async getProxy(): Promise<WebshareProxy | null> {
     if (!this.enabled) return null;
     if (!this.availableCandidates().length) {
-      if (Date.now() - this.lastRefreshAt >= MIN_REFRESH_INTERVAL_MS) {
+      if (performance.now() - this.lastRefreshAt >= MIN_REFRESH_INTERVAL_MS) {
         await this.refresh().catch(() => {});
       }
       if (!this.availableCandidates().length) return null;
@@ -743,7 +745,7 @@ export class WebsharePool {
     const direct = this.pickForCountries(wanted);
     if (direct) return direct;
 
-    if (Date.now() - this.lastRefreshAt >= MIN_REFRESH_INTERVAL_MS) {
+    if (performance.now() - this.lastRefreshAt >= MIN_REFRESH_INTERVAL_MS) {
       await this.refresh().catch(() => {});
       const refreshed = this.pickForCountries(wanted);
       if (refreshed) return refreshed;
