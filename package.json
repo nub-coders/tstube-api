@@ -3,6 +3,7 @@
   "version": "2026.3.12",
   "private": true,
   "type": "module",
+  "license": "MIT",
   "description": "TypeScript replacement for the ytube_api FastAPI service + Telegram bot",
   "engines": {
     "node": ">=22.19.0"

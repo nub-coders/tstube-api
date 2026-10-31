@@ -1,167 +1,214 @@
-# tstube-api
+# TsTube API
 
-A TypeScript rewrite of the `ytube_api` FastAPI service + Telegram bot. The HTTP
-responses, status codes, JSON key order, error envelopes, rate limiting and the
-bot's rich-message UI are ports of the Python original, not reinterpretations.
+High-performance, lightweight YouTube and SoundCloud extraction engine, media streaming relay, and Telegram bot written in TypeScript for Node.js.
 
-## Stack
+TsTube API delivers fast, resilient media resolution and playback relaying without heavy external web frameworks, utilizing native Node.js HTTP servers, Innertube (`youtubei.js`), rotating proxy pools, and Redis distributed coordination.
 
-- **Runtime:** Node.js ≥ 22.19 (ESM). No web framework — a small router on `node:http`.
-- **Redis:** `ioredis`, for bearer tokens, daily counters and stream-job state.
-- **Extraction:** the Innertube `player` endpoint via `youtubei.js`, exclusively through Webshare, with client and proxy fallback ladders.
-- **SoundCloud:** public track and set links resolve through web-player metadata to progressive audio or HLS. HLS streams require an HLS-capable player, such as FFmpeg. Blocked and preview-only tracks are rejected.
-- **Bot:** raw Telegram Bot API over HTTPS (`sendRichMessage` / `editMessageText`
-  with `rich_message: { html }`), long-polled with `getUpdates`. No MTProto client.
+---
 
-## Layout
+## Features
+
+- **Zero-Framework Architecture:** Powered directly by `node:http` with strict route validation, minimal dependencies, and high throughput.
+- **Resilient Extraction Pipeline:** Multi-client Innertube resolution backed by automated Webshare proxy rotation, geo-targeted bypass, and cooldown tracking.
+- **Smart Stream Relay & Resumption:** Returns opaque, capability-secured stream URLs that relay media, handle CDN renegotiation, and resume interrupted transfers automatically.
+- **Validated HLS Delivery:** Rewrites master/variant playlists and child segments into scoped proxy tokens for seamless playback on modern players.
+- **SoundCloud Integration:** Direct resolution of public tracks and sets into progressive or HLS audio streams.
+- **Distributed State Management:** Redis-backed rate limiting, quota tracking, in-flight extraction leases, and cross-replica coordination.
+- **Dual-Mode Telegram Bot:** Interactive bot built with `grammY` supporting inline search, rich HTML message cards, user quotas, and administrative controls.
+- **Observability:** Built-in Prometheus metrics exposition (`/metrics`) and structured JSON logging.
+
+---
+
+## Architecture Overview
 
 ```
-src/
-  index.ts            entrypoint: config, redis, HTTP server, optional bot
-  httpServer.ts       router, middleware (rate limit + metrics), result plumbing
-  apiRoutes.ts        every HTTP endpoint
-  routeArgs.ts        query validation + FastAPI argument tables
-  streamJobs.ts       Redis stream jobs, extraction leases, local memo/events
-  streamProxy.ts      media byte relay and bounded playback resumption (node:http)
-  hlsProxy.ts         validated HLS playlist/segment capability relay
-  proxy.ts         country-aware proxy inventory and extraction health
-  innertube.ts        Innertube client + related-video parsing
-  searchService.ts    YouTube search scrape (in-process + Upstash cache)
-  cacheManager.ts     stream-URL cache (Redis + container-local file)
-  metrics.ts          Prometheus text exposition
-  telegram/           Bot API client, rich UI helpers, commands/callbacks/admin
+                      ┌─────────────────────────────────────────┐
+                      │              Edge / Traefik             │
+                      └────────────────────┬────────────────────┘
+                                           │
+                        ┌──────────────────┴──────────────────┐
+                        │                                     │
+                        ▼                                     ▼
+             ┌─────────────────────┐               ┌─────────────────────┐
+             │   tstube-api (xN)   │               │   tstube-bot (x1)   │
+             │   HTTP API Server   │               │ Telegram Long-Poll  │
+             └──────────┬──────────┘               └──────────┬──────────┘
+                        │                                     │
+                        ├──────────────────┬──────────────────┤
+                        ▼                  ▼                  ▼
+             ┌─────────────────────┐ ┌───────────┐ ┌─────────────────────┐
+             │   Webshare Proxies  │ │   Redis   │ │    YouTube CDN      │
+             │ (Rotating Outbound) │ │  (State)  │ │   (Direct/Relay)    │
+             └─────────────────────┘ └───────────┘ └─────────────────────┘
 ```
 
-## Running
+---
 
-```sh
+## Deployment with Docker
+
+The repository includes a multi-stage `Dockerfile` and a production-ready `docker-compose.yml` configured for zero-downtime horizontal scaling.
+
+### 1. Configure Environment
+
+Copy the example environment file and customize your settings:
+
+```bash
+cp .env.example .env
+```
+
+Ensure you configure your Redis host and credentials, Webshare API key (for YouTube extraction), and Telegram Bot token if running the bot.
+
+### 2. Launch Services with Docker Compose
+
+The `docker-compose.yml` file splits the application into two dedicated service roles sharing the same base image:
+
+- `tstube-api`: Stateless HTTP API service (safe to scale horizontally).
+- `tstube-bot`: Dedicated Telegram bot poller (strictly 1 replica to avoid polling conflicts).
+
+```bash
+# Build images and start containers in the background
+docker compose up -d --build
+
+# Inspect running containers
+docker compose ps
+
+# View unified real-time logs
+docker compose logs -f
+```
+
+### 3. Scaling the API Service
+
+Because extraction job leases and rate-limiting counters live in Redis, you can scale the API service to handle heavy traffic:
+
+```bash
+docker compose up -d --scale tstube-api=4
+```
+
+### 4. Running Directly with Docker
+
+You can also build and run an isolated container manually:
+
+```bash
+# Build the Docker image
+docker build -t tstube-api:latest .
+
+# Run the container
+docker run -d \
+  --name tstube-api \
+  --env-file .env \
+  -p 8000:8000 \
+  tstube-api:latest
+```
+
+---
+
+## Local Development
+
+### Prerequisites
+
+- **Node.js:** `>= 22.19.0`
+- **Redis:** `>= 6.2` (local instance or remote connection URL)
+
+### Setup & Commands
+
+```bash
+# Install dependencies
 npm install
-npm run build      # tsc -> dist/ (+ copies favicon assets)
-npm start          # node dist/index.js
-npm run dev        # rebuild-on-watch
+
+# Build TypeScript to dist/ and copy static assets
+npm run build
+
+# Start the application in production mode
+npm start
+
+# Run with file watcher during development
+npm run dev
+
+# Execute TypeScript typechecking without emitting files
 npm run typecheck
-npm test           # vitest
+
+# Run unit and integration tests with Vitest
+npm test
+
+# Run Vitest in interactive watch mode
+npm run test:watch
 ```
 
-Configuration is environment-only (see `.env.example`). A `.env` file is loaded
-with `setdefault` semantics, so real environment variables win. A missing
-`BOT_TOKEN` leaves the process serving the HTTP API standalone.
+---
 
-`REDIS_URL`, when set, defines the whole Redis connection and overrides the
-discrete Redis settings. Use `rediss://` for TLS and a path such as `/2` for the
-database. A URL without a port uses 6379; discrete settings retain their own
-configured port. Invalid connection URLs fail at startup without logging credentials.
+## Configuration Reference
 
-## Behavior notes
+All settings are configured via environment variables (loaded from `.env` on startup):
 
-- Repeated `/info` requests share in-flight metadata and recommendation lookups.
-  Successful results are cached per process for five minutes (up to 2,048 entries
-  each); recommendation limits are applied separately for each caller. Concurrent
-  searches also share empty or failed scrape results, so callers do not queue
-  duplicate retry cycles. A subsequent request can retry those failures.
-- Quotas and their reset headers use the next midnight UTC. Granting quota does
-  not extend the current day's window.
-- YouTube Data API key cooldowns follow Google's midnight reset in US Pacific,
-  including daylight-saving changes.
-- Stream extraction uses a separate 120-second Redis lease. Concurrent workers
-  share one attempt, and an expired worker cannot overwrite its successor.
-  Background jobs have a 100-second deadline; individual YouTube resolutions
-  have 42 seconds. Resolver requests wait up to 105 seconds, including any
-  recovery wait. A job still pending returns `202` with `Retry-After: 2`;
-  terminal extraction failure returns `502`. Disconnected callers stop waiting
-  while background extraction retains its own job deadline.
-- Public search remains free. Uncached YouTube Data API searches share Redis
-  admission limits across replicas: 5,000 quota units per Pacific day, 10 attempts
-  per rolling minute, and four concurrent search requests by default. Each
-  attempt reserves 101 units for search and its possible details request.
-  Successful results are cached for five minutes. Set
-  `YOUTUBE_SEARCH_DAILY_BUDGET`, `YOUTUBE_SEARCH_REQUESTS_PER_MINUTE`, and
-  `YOUTUBE_SEARCH_MAX_CONCURRENCY` to tune these limits. An explicit Data API
-  search returns 429 when admission is denied and 503 when Redis admission is
-  unavailable; cached results remain usable. Scraped search remains available.
-- Finite playlists follow continuation pages, with limits of 5,000 songs,
-  100 pages, and 30 seconds. Failure to finish produces an error instead of a
-  successful partial list. YouTube Mix playlists return the current generated
-  panel, since a Mix has no fixed end.
+| Environment Variable | Default | Description |
+|---|---|---|
+| `PORT` | `8000` | Port for the HTTP API server |
+| `API_HOST` | `api.example.com` | Primary hostname used for link generation and routing |
+| `BASE_URL` | `https://api.example.com` | Base public URL prepended to streaming endpoints |
+| `REDIS_URL` | _None_ | Complete Redis connection string (e.g. `redis://:pass@host:6379/0`) |
+| `REDIS_HOST` | `localhost` | Redis host when `REDIS_URL` is omitted |
+| `REDIS_PORT` | `15440` | Redis port when `REDIS_URL` is omitted |
+| `REDIS_PASSWORD` | _None_ | Redis authentication password |
+| `START_BOT` | `true` | Set to `true` to start the Telegram bot process |
+| `BOT_TOKEN` | _None_ | Telegram Bot token obtained from `@BotFather` |
+| `ADMIN_IDS` | `""` | Space-separated list of numeric Telegram User IDs for admins |
+| `TG_GROUP` | `""` | Support group username |
+| `TG_CHANNEL` | `""` | Announcement channel username |
+| `WEBSHARE_API_KEY` | _None_ | Webshare API key for rotating extraction proxies |
+| `WEBSHARE_PROXY_COUNTRIES` | `""` | Comma-separated ISO country codes to filter proxy exits |
+| `WEBSHARE_REFRESH_SEC` | `600` | Frequency in seconds to refresh proxy IP lists |
+| `EXTRACTION_DIRECT_FALLBACK`| `false` | Fall back to direct connection if proxy pool is empty |
+| `YOUTUBE_API_KEYS` | `""` | Comma-separated official YouTube Data API v3 keys |
+| `YOUTUBE_SEARCH_DAILY_BUDGET`| `5000` | Maximum daily Data API quota units allocated to search |
+| `DAILY_LIMIT` | `1000` | Daily request quota allocated to standard user tokens |
+| `ADMIN_LIMIT` | `100000` | Daily request quota allocated to administrator tokens |
 
-- **Auth runs before routing.** An unauthenticated request to any protected path
-  (or an unknown path) returns the middleware's `401`, never a `404`/`422`.
-- **`/stream` returns a bearer resolver URL**, not the raw CDN URL. The resolver
-  relays bytes through the verified playback route. Its capability contains
-  `base64url(sha256("{mode}:{url}"))` plus a random secret; the deterministic
-  identifier alone cannot authorize playback.
-- **Rejected sources receive one verified refresh per resolver request.** A
-  CDN `403`, `404`, or `410`, or a recoverable dial failure through a pinned
-  proxy, triggers cache invalidation and re-extraction through Webshare,
-  excluding the previous proxy exit. The replacement must pass playback checks,
-  and the original capability secret is preserved.
-- **Interrupted finite media can resume without re-extraction.** For eligible
-  signed media responses, the relay makes at most two reconnections after
-  transient resets or truncated transfers. It keeps the same URL and proxy exit,
-  requests exactly the remaining byte interval, and verifies the representation
-  and range before forwarding more bytes.
-- **Fresh YouTube extraction requires Webshare.** Innertube bootstrap and player
-  requests, including metadata fallback sessions, always use a Webshare exit.
-  There is no direct extraction fallback when `WEBSHARE_API_KEY` is missing or
-  every exit fails. Existing validated cached streams remain usable. Region
-  restrictions reported by proxied player requests steer later attempts to
-  suitable countries.
-  Concurrent callers share bootstrap for an exit and extraction for the same
-  video. Player requests are limited to eight active calls per process and one
-  per exit. Repeated proxy failures start a five-minute cooldown that survives
-  proxy-list refreshes; recent extraction successes receive priority. Content
-  unavailability does not count as a proxy failure.
-- **Video requests require video.** An unavailable muxed/video source does not
-  silently fall back to audio. Live HLS selection validates the requested mode,
-  including video and its required audio rendition groups.
-- **Webshare extraction does not force Webshare media transfer.** For every
-  fresh candidate, each format is probed directly from the API server first.
-  If that succeeds, the cached playback route omits Webshare. Otherwise, the
-  media is checked through the extracting Webshare exit and retains that binding
-  only if it works. Audio and video keep independent routes when necessary.
-  The API continues relaying media through the existing resolver flow; this
-  avoids Webshare bandwidth for accessible sources, not the API server's own
-  media bandwidth.
-- **Caches and jobs carry a playback validation version.** Legacy Redis/file
-  cache entries are re-extracted instead of bypassing current checks. Existing
-  stream jobs migrate lazily through a shared extraction owner while retaining
-  the capability secret, so previously issued resolver URLs remain valid.
-- **Fresh stream URLs receive a lightweight media check before publication.**
-  This covers both YouTube formats, normal/recovery proxy candidates, and direct
-  SoundCloud/JioSaavn URLs. The check uses the playback proxy binding and requests
-  `bytes=0-16383`, inspecting at most 16 KiB before closing the response. YouTube
-  CDN URLs must first pass an ordinary GET with a bounded 16 KiB read: some
-  signed URLs serve a tiny range but reject normal playback with HTTP 403/404.
-  Both checks use the same URL and direct/Webshare route. This retains at most
-  32 KiB for a successful YouTube check; socket buffers can receive additional
-  bytes, including when the origin ignores Range.
-  Each source check has one five-second budget shared by both requests and queue
-  time, with four active checks and at most 64 pending distinct routes per process.
-  Duplicate checks coalesce;
-  successes are cached for five minutes (or signed expiry, if sooner), keyed by
-  URL and full proxy identity, with at most 2,048 entries. Rejected routes clear
-  their probe result. Existing stream-cache hits avoid another network check.
-  Bad status/ranges, empty or truncated samples, HTML/JSON errors, and unrecognized
-  media headers are rejected. Recognized prefixes include MP4/M4A, WebM, MP3/AAC,
-  Ogg, FLAC, WAV, and MPEG-TS. This checks source accessibility and basic format
-  plausibility without FFmpeg, decoding, or codec compatibility checks.
-- **Live HLS uses a playlist and resource relay.** Selection validates root and
-  child playlists plus real media segments for the requested audio/video mode.
-  The relay rewrites playlists to opaque local capabilities for child playlists,
-  segments, keys, and initialization resources, preserving the selected proxy
-  route. Child authority cannot outlive its parent: direct root capabilities
-  last up to four hours and proxy-pinned roots up to one hour; segment/resource
-  tokens last at most five minutes. Child playlists reload under that bounded
-  authority. The separate HLS source cache lasts 60 seconds; that freshness limit
-  does not shorten an issued capability's stable manifest-reload session.
-  Playback requires an HLS-capable player, such as FFmpeg. CDN blocks and live
-  source changes can still prevent playback; these checks do not guarantee
-  uninterrupted delivery.
-- Proxy agents retired from the connection cache drain existing streams before
-  closing. New proxy credentials receive a separate agent.
-- Telegram polling conflicts retry after 30 seconds. Terminal polling failures
-  are logged and stop polling while leaving the HTTP API running; shutdown also
-  cancels pending polling retries.
-- **Bot UI degrades.** If rich or ephemeral delivery is unavailable, group cards
-  use an explicitly safe public fallback. Otherwise, delivery falls back to a
-  direct message. Credential-bearing content is never implicitly made public.
+---
+
+## API Endpoints
+
+### Public Endpoints
+
+- `GET /health` — Health check and operational diagnostics.
+- `GET /search?q={query}&page={page}` — Free scraped YouTube search or quota-guarded Data API search.
+- `GET /trending?limit={n}` — Current popular / trending videos.
+- `GET /suggest?q={query}` — Search keyword suggestions and auto-completions.
+- `GET /metrics` — Prometheus metrics format endpoint.
+- `GET /rate-limit-status` — Inspect caller quota, daily usage, and reset windows.
+
+### Protected Endpoints (Bearer Token Required)
+
+Authentication is provided via the `Authorization: Bearer <TOKEN>` header or `?token=<TOKEN>` query argument.
+
+- `GET /info?url={url}` — Fetch video details, formats, and related content. In-flight requests are automatically deduplicated and cached.
+- `GET /stream?url={url}&mode={audio|video}` — Resolves target media and issues an opaque, secured capability URL (`/stream/resolver/{token}`).
+- `GET /playlist?url={url}` — Paginates and resolves all items within a playlist.
+
+### Streaming Relay
+
+- `GET /stream/resolver/{stream_id}` — Capability-authorized media relay. Relays verified bytes directly or via pinned proxy exit, supporting HTTP Range requests and connection recovery.
+
+---
+
+## Telegram Bot Interface
+
+When `START_BOT=true` and `BOT_TOKEN` is set, the built-in bot provides user and management interfaces:
+
+### User Commands
+- `/start` — Welcome overview, account information, and usage limits.
+- `/menu` — Interactive card with quick actions and search options.
+- `/token` — View or refresh personal API access token.
+- `/ping` — Response latency and health check.
+
+### Admin Commands
+- `/admin` — Open administrative control panel.
+- `/stats` — Real-time telemetry, active connections, and proxy health stats.
+- `/grant <user_id> [count]` — Grant additional request quota to a user.
+- `/revoke <user_id>` — Revoke active token and reset access.
+- `/ban <user_id>` / `/unban <user_id>` — Manage access blocklists.
+
+---
+
+## License
+
+This project is open-source software licensed under the [MIT License](LICENSE).
