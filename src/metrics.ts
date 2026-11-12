@@ -19,6 +19,7 @@ let upstreamConnectSlow = 0;
 let streamBytesTotal = 0;
 let streamActive = 0;
 const streamErrors = new Map<string, number>();
+const streamProbeErrors = new Map<string, number>();
 const HTTP_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'CONNECT', 'TRACE']);
 
 const SLOW_CONNECT_S = 1.0;
@@ -51,6 +52,13 @@ export function recordStreamBytes(n: number): void {
 
 export function recordStreamError(code: string | number): void {
   inc(streamErrors, String(code));
+}
+
+/** Validation probes have separate, bounded labels from client playback. */
+export function recordStreamProbeError(code: string | number): void {
+  const value = String(code);
+  const label = /^[45]\d{2}$/.test(value) || value === 'connect' || value === 'transfer' ? value : 'other';
+  inc(streamProbeErrors, label);
 }
 
 export function streamStarted(): void {
@@ -117,6 +125,13 @@ export function render(): string {
   for (const code of sortedKeys(streamErrors)) {
     lines.push(`stream_errors_total{code="${esc(code)}"} ${streamErrors.get(code) ?? 0}`);
   }
+  lines.push(
+    '# HELP stream_probe_errors_total Validation probe failures by upstream status or error class.',
+    '# TYPE stream_probe_errors_total counter',
+  );
+  for (const code of sortedKeys(streamProbeErrors)) {
+    lines.push(`stream_probe_errors_total{code="${esc(code)}"} ${streamProbeErrors.get(code) ?? 0}`);
+  }
   return lines.join('\n') + '\n';
 }
 
@@ -133,4 +148,5 @@ export function resetMetrics(): void {
   streamBytesTotal = 0;
   streamActive = 0;
   streamErrors.clear();
+  streamProbeErrors.clear();
 }

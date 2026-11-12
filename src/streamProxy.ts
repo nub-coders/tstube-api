@@ -60,6 +60,8 @@ export interface ProxyUpstream {
 }
 
 export interface ProxyOptions {
+  /** Validation uses the same transport without recording client playback telemetry. */
+  purpose?: 'playback' | 'probe';
   rangeHeader?: string | null;
   userAgent?: string | null;
   /** Epoch milliseconds when the client request started (for TTFB). */
@@ -72,6 +74,18 @@ export interface ProxyOptions {
    * exit that resolved it. HTTPS targets are tunneled via CONNECT.
    */
   proxyUrl?: string | null;
+}
+
+function probeContext(parsed: URL | undefined, opts: ProxyOptions): Record<string, unknown> {
+  return { purpose: 'probe', host: parsed?.hostname.slice(0, 253) ?? null,
+    range: Boolean(opts.rangeHeader), proxied: Boolean(opts.proxyUrl) };
+}
+
+function recordProbeError(code: string | number, message: string, parsed: URL | undefined, opts: ProxyOptions): void {
+  metrics.recordStreamProbeError(code);
+  log.debug(`[STREAM_PROBE] ${message}`, {
+    ...probeContext(parsed, opts), ...(typeof code === 'number' ? { status: code } : { code }),
+  });
 }
 
 // ── HTTP-proxy tunneling (geo-bypass streams) ──────────────────────
@@ -466,6 +480,7 @@ export function proxyStream(
 ): Promise<ProxyUpstream> {
   if (opts.signal?.aborted) return Promise.resolve(cancelledResult());
   if (redirectCount > MAX_REDIRECTS) {
+    if (opts.purpose === 'probe') recordProbeError('other', 'too many validation redirects', undefined, opts);
     return Promise.resolve({
       status: 502,
       headers: { 'content-type': 'application/json' },
@@ -480,6 +495,7 @@ export function proxyStream(
   try {
     parsed = new URL(targetUrl);
   } catch (e) {
+    if (opts.purpose === 'probe') recordProbeError('other', 'invalid validation URL', undefined, opts);
     return Promise.resolve({
       status: 502,
       headers: { 'content-type': 'application/json' },
@@ -506,7 +522,8 @@ export function proxyStream(
       opts.signal?.removeEventListener('abort', onAbort);
       if (cancelled) return;
       if (!hostOk || (parsed.protocol !== 'https:' && parsed.protocol !== 'http:')) {
-        log.error(`[STREAM_PROXY] upstream host rejected by safety check: ${parsed.hostname}`);
+        if (opts.purpose === 'probe') recordProbeError('other', 'upstream host rejected by safety check', parsed, opts);
+        else log.error(`[STREAM_PROXY] upstream host rejected by safety check: ${parsed.hostname}`);
         resolve({
           status: 502,
           headers: { 'content-type': 'application/json' },
@@ -530,9 +547,11 @@ function dialStream(
   redirectCount = 0,
 ): Promise<ProxyUpstream> {
   return new Promise<ProxyUpstream>((resolve) => {
+    const isProbe = opts.purpose === 'probe';
     const proxy = opts.proxyUrl ? parseProxy(opts.proxyUrl) : null;
     if (opts.proxyUrl && !proxy) {
-      log.error('[STREAM_PROXY] invalid proxy URL — refusing to dial');
+      if (isProbe) recordProbeError('other', 'invalid proxy URL — refusing to dial', parsed, opts);
+      else log.error('[STREAM_PROXY] invalid proxy URL — refusing to dial');
       resolve({
         status: 502,
         headers: { 'content-type': 'application/json' },
@@ -600,6 +619,7 @@ function dialStream(
     }
 
     function onData(chunk: Buffer): void {
+      if (isProbe) return;
       if (first) {
         metrics.recordStreamTtfb((Date.now() - startedMs) / 1000);
         first = false;
@@ -615,8 +635,11 @@ function dialStream(
 
     function onUpstreamError(err: Error): void {
       if (finished) return;
-      metrics.recordStreamError('transfer');
-      log.debug(`[STREAM_PROXY] Stream disconnected: ${String(err)}`);
+      if (isProbe) recordProbeError('transfer', 'validation body disconnected', parsed, opts);
+      else {
+        metrics.recordStreamError('transfer');
+        log.debug(`[STREAM_PROXY] Stream disconnected: ${String(err)}`);
+      }
       cleanup();
       stopUpstream();
       out?.destroy(err);
@@ -670,7 +693,7 @@ function dialStream(
       }
       headersReceived = true;
       clearTimeout(connectTimer);
-      metrics.recordUpstreamConnect((Date.now() - connectStarted) / 1000);
+      if (!isProbe) metrics.recordUpstreamConnect((Date.now() - connectStarted) / 1000);
 
       const status = upstream.statusCode ?? 502;
 
@@ -678,7 +701,8 @@ function dialStream(
       // Googlevideo frequently issues 302 redirects to specific edge CDN clusters (rr*.googlevideo.com).
       // node:http does not follow them automatically, so we must follow them here.
       if ([301, 302, 303, 307, 308].includes(status) && upstream.headers.location) {
-        log.info(`[STREAM_PROXY] Following upstream ${status} redirect`);
+        if (isProbe) log.debug('[STREAM_PROBE] following validation redirect', { ...probeContext(parsed, opts), status });
+        else log.info(`[STREAM_PROXY] Following upstream ${status} redirect`);
         cleanup();
         upstream.destroy();
         req.destroy();
@@ -686,6 +710,7 @@ function dialStream(
           const nextUrl = new URL(upstream.headers.location, parsed).href;
           resolve(proxyStream(nextUrl, opts, redirectCount + 1));
         } catch (e) {
+          if (isProbe) recordProbeError('other', 'invalid validation redirect', parsed, opts);
           resolve({
             status: 502,
             headers: { 'content-type': 'application/json' },
@@ -697,8 +722,11 @@ function dialStream(
       }
 
       if (status >= 400) {
-        metrics.recordStreamError(status);
-        log.error(`[STREAM_PROXY] upstream ${status} (expired or IP-locked URL)`);
+        if (isProbe) recordProbeError(status, 'upstream rejected validation probe', parsed, opts);
+        else {
+          metrics.recordStreamError(status);
+          log.error(`[STREAM_PROXY] upstream ${status} (expired or IP-locked URL)`);
+        }
         cleanup();
         upstream.destroy();
         req.destroy();
@@ -725,8 +753,8 @@ function dialStream(
       // awaiting caller can attach its own error handler. Retain the error on
       // the stream without letting that handoff window crash the process.
       out.on('error', () => {});
-      active = true;
-      metrics.streamStarted();
+      active = !isProbe;
+      if (active) metrics.streamStarted();
       upstream.on('data', onData);
       upstream.once('end', onEnd);
       upstream.once('close', onUpstreamClose);
@@ -749,9 +777,12 @@ function dialStream(
       }
       cleanup();
       tunnelController.abort();
-      metrics.recordUpstreamConnect((Date.now() - connectStarted) / 1000);
-      metrics.recordStreamError('connect');
-      log.error(`[STREAM_PROXY] Upstream connection error: ${String(e)}`);
+      if (isProbe) recordProbeError('connect', 'upstream validation connection failed', parsed, opts);
+      else {
+        metrics.recordUpstreamConnect((Date.now() - connectStarted) / 1000);
+        metrics.recordStreamError('connect');
+        log.error(`[STREAM_PROXY] Upstream connection error: ${String(e)}`);
+      }
       const msg = String(e);
       const refused = isHttps && Boolean(proxy) && /no longer allocated|HTTP 407/i.test(msg);
       // A connect/tunnel timeout or reset through a pinned exit means the exit

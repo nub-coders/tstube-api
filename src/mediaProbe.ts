@@ -129,7 +129,7 @@ async function checkSample(url: string, proxyUrl: string | null | undefined, sig
   let body: Readable | null = null;
   try {
     if (signal.aborted) return false;
-    const response = await proxyStream(url, { proxyUrl, rangeHeader, signal });
+    const response = await proxyStream(url, { proxyUrl, rangeHeader, signal, purpose: 'probe' });
     body = response.body;
     if (signal.aborted || !body || response.error || ![200, 206].includes(response.status)) return false;
     const encoding = response.headers['content-encoding']?.trim().toLowerCase();

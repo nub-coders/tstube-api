@@ -605,7 +605,8 @@ export async function proxyHlsManifest(target: string, options: HlsManifestOptio
     if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return errorResult(502, 'Expired HLS authority');
     const loaded = await loadManifest(target, { ...options, signal });
     if (!loaded.parsed) return loaded.upstream.status === 499 && !options.signal?.aborted ? cancelled() : loaded.upstream;
-    const parsed = await verifyTrack(target, options.mode ?? 'video', { ...options, signal }, 0, !!options.videoEvidence, loaded.parsed);
+    // The requested playlist is playback; its validation descendants are probes.
+    const parsed = await verifyTrack(target, options.mode ?? 'video', { ...options, signal, purpose: 'probe' }, 0, !!options.videoEvidence, loaded.parsed);
     if (!parsed) return signal.aborted ? cancelled(options.signal) : errorResult();
     const text = await rewriteManifest(parsed, { ...options, expiresAt, signal });
     return { status: 200, headers: {
@@ -647,6 +648,6 @@ export async function probeHls(target: string, options: ProxyOptions & { mode?: 
   const timeout = Math.min(HLS_READ_TIMEOUT_MS, (options.deadline ?? Infinity) - Date.now());
   if (options.signal?.aborted || timeout <= 0) return false;
   const signal = options.signal ? AbortSignal.any([options.signal, AbortSignal.timeout(timeout)]) : AbortSignal.timeout(timeout);
-  try { return !!await verifyTrack(target, options.mode ?? 'audio', { ...options, signal }); }
+  try { return !!await verifyTrack(target, options.mode ?? 'audio', { ...options, signal, purpose: 'probe' }); }
   catch { return false; }
 }
