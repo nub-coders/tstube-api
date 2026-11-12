@@ -38,6 +38,7 @@ export const AWAIT_TIMEOUT_S = 105.0;
 export const EXTRACTION_TIMEOUT_MS = 100_000;
 /** A crashed or stalled extractor must not hold a four-hour capability hostage. */
 const EXTRACTION_LEASE_TTL_S = 120;
+const FAILURE_RETRY_COOLDOWN_S = 30;
 
 // The capability outlives individual extraction attempts. A separate random
 // lease token fences both successful and failed results from expired workers.
@@ -48,6 +49,9 @@ if raw then
   local ok, decoded = pcall(cjson.decode, raw)
   if ok and type(decoded) == 'table' then job = decoded end
 end
+if ARGV[8] ~= '' and (not job or job.secret ~= ARGV[8]) then
+  return {'', ''}
+end
 local pending = cjson.decode(ARGV[1])
 if not job then
   job = pending
@@ -56,7 +60,11 @@ end
 local backfill = not job.secret or job.secret == cjson.null
 if backfill then job.secret = pending.secret end
 local owner = ''
-if (not job.extracted_url or job.extracted_url == cjson.null or job.validation_version ~= tonumber(ARGV[6])) and
+local retryBefore = tonumber(ARGV[7])
+local retryNow = tonumber(ARGV[9])
+local retryAllowed = not retryBefore or not job.failed or type(job.extracted_time) ~= 'number' or
+    job.extracted_time <= retryBefore or (retryNow and job.extracted_time > retryNow)
+if retryAllowed and (not job.extracted_url or job.extracted_url == cjson.null or job.validation_version ~= tonumber(ARGV[6])) and
     redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3], 'NX') then
   owner = ARGV[2]
   pending.secret = job.secret
@@ -361,7 +369,7 @@ function startBackgroundExtraction(
  * Pending jobs reuse active work; failed or abandoned jobs can acquire a new
  * attempt without rotating the capability handed to existing clients.
  */
-export async function ensureStreamJob(url: string, mode: string): Promise<string> {
+async function ensureJob(url: string, mode: string, recovery?: { secret: string; retryBefore?: number }): Promise<string | null> {
   validateYoutubeTarget(url); // SSRF guard: only valid YouTube targets reach resolver
   const resolvedMode = resolveMode(mode);
   const streamId = encodeStreamId(url, resolvedMode);
@@ -373,7 +381,9 @@ export async function ensureStreamJob(url: string, mode: string): Promise<string
     ENSURE_JOB_SCRIPT, 2, jobKey(streamId), leaseKey(streamId),
     JSON.stringify(pending), newStreamSecret(), EXTRACTION_LEASE_TTL_S,
     STREAM_TTL, Math.min(STREAM_TTL, PROXY_STREAM_TTL_S), STREAM_VALIDATION_VERSION,
+    recovery?.retryBefore ?? '', recovery?.secret ?? '', Date.now() / 1000,
   ) as [string, string];
+  if (!raw) return null;
   const job = JSON.parse(raw) as StreamJob;
   if (owner) {
     jobForgetLocal(streamId);
@@ -384,6 +394,10 @@ export async function ensureStreamJob(url: string, mode: string): Promise<string
     jobForgetLocal(streamId);
   }
   return streamCapability(streamId, job.secret!);
+}
+
+export async function ensureStreamJob(url: string, mode: string): Promise<string> {
+  return (await ensureJob(url, mode))!;
 }
 
 /** Wait (up to `timeout` seconds) for a job with extracted_url or failure, or null if gone. */
@@ -431,15 +445,28 @@ export async function awaitStreamJob(
   signal?.throwIfAborted();
   const parsed = parseStreamCapability(capability);
   if (!parsed) return null;
-  const known = await jobGet(parsed.streamId);
+  let known = await jobGet(parsed.streamId);
   signal?.throwIfAborted();
   if (known === null || known.secret !== parsed.secret) return null;
-  if ((!known.extracted_url && !known.failed) || (known.extracted_url && !isCurrentSource(known))) {
-    // Reuse live leases, recover abandoned work, or migrate an old source.
-    // All three preserve the issued capability secret.
+  if (known.failed) {
+    // Another replica may already have retried a failure kept in this memo.
+    JOB_MEMO.delete(parsed.streamId);
+    known = await jobGet(parsed.streamId);
+    signal?.throwIfAborted();
+    if (known === null || known.secret !== parsed.secret) return null;
+  }
+  const now = Date.now() / 1000;
+  const retryBefore = now - FAILURE_RETRY_COOLDOWN_S;
+  const retryFailure = known.failed && (typeof known.extracted_time !== 'number' ||
+    !Number.isFinite(known.extracted_time) || known.extracted_time <= retryBefore || known.extracted_time > now);
+  if ((!known.extracted_url && (!known.failed || retryFailure)) || (known.extracted_url && !isCurrentSource(known))) {
+    // Reuse live leases, recover abandoned/failed work, or migrate an old source.
+    // Recovery preserves the issued capability secret.
     const activeLease = await redis().get(leaseKey(parsed.streamId));
     signal?.throwIfAborted();
-    if (!activeLease) await ensureStreamJob(known.url, known.mode);
+    if (!activeLease && !await ensureJob(known.url, known.mode, {
+      secret: parsed.secret, retryBefore,
+    })) return null;
   }
   const job = await awaitExtracted(parsed.streamId, timeout, signal);
   if (job === null || job.secret !== parsed.secret) return null;

@@ -82,6 +82,7 @@ export class StreamJobRedis {
     if (script.includes('-- stream-job:ensure')) {
       let job: Record<string, unknown> | null;
       try { job = raw ? JSON.parse(raw) : null; } catch { job = null; }
+      if (argv[7] && (!job || job.secret !== argv[7])) return ['', ''];
       const pending = JSON.parse(argv[0]!);
       if (!job) {
         job = pending;
@@ -91,7 +92,9 @@ export class StreamJobRedis {
       const backfill = !job!.secret;
       if (backfill) job!.secret = pending.secret;
       let owner = '';
-      if ((!job!.extracted_url || job!.validation_version !== Number(argv[5])) && !this.read(leaseKey!)) {
+      const retryAllowed = !argv[6] || !job!.failed || typeof job!.extracted_time !== 'number' ||
+        job!.extracted_time <= Number(argv[6]) || job!.extracted_time > Number(argv[8]);
+      if (retryAllowed && (!job!.extracted_url || job!.validation_version !== Number(argv[5])) && !this.read(leaseKey!)) {
         owner = argv[1]!;
         this.write(leaseKey!, owner, Number(argv[2]));
         job = { ...pending, secret: job!.secret };

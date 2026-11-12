@@ -655,8 +655,10 @@ async function verifiedLiveUrls(
   proxyUrl: string | null,
   probes: Map<string, Promise<VerifiedStream | null>>,
   deadline: number,
+  onVerified?: (meta: ResolveMeta) => void,
 ): Promise<ResolveMeta> {
-  const streams = await Promise.all((['video', 'audio'] as const).map(mode => {
+  const streams: [VerifiedStream | null, VerifiedStream | null] = [null, null];
+  await Promise.all((['video', 'audio'] as const).map(async (mode, index) => {
     const key = `hls:${mode}:${url}`;
     let pending = probes.get(key);
     if (!pending) {
@@ -665,12 +667,18 @@ async function verifiedLiveUrls(
         if (await probeHls(url, { ...options, proxyUrl: null })) return { url, proxyUrl: null, streamType: 'hls' };
         if (proxyUrl && await probeHls(url, { ...options, proxyUrl })) return { url, proxyUrl, streamType: 'hls' };
         return null;
-      })();
+      })().finally(() => {
+        if (requestSignal()?.aborted && probes.get(key) === pending) probes.delete(key);
+      });
       probes.set(key, pending);
     }
-    return pending;
+    const verified = await pending;
+    if (verified && !requestSignal()?.aborted) {
+      streams[index as 0 | 1] = verified;
+      onVerified?.(verifiedMeta(streams));
+    }
   }));
-  return verifiedMeta(streams as [VerifiedStream | null, VerifiedStream | null]);
+  return verifiedMeta(streams);
 }
 
 /** Prefer server-direct media even when Webshare was needed for extraction. */
@@ -679,8 +687,10 @@ async function verifiedStreamUrls(
   proxyUrl: string | null,
   probes: Map<string, Promise<VerifiedStream | null>>,
   deadline = requestDeadline(),
+  onVerified?: (meta: ResolveMeta) => void,
 ): Promise<ResolveMeta> {
-  const checked = await Promise.all(urls.map(async url => {
+  const checked: [VerifiedStream | null, VerifiedStream | null] = [null, null];
+  await Promise.all(urls.map(async (url, index) => {
     if (!url) return null;
     let pending = probes.get(url);
     if (!pending) {
@@ -690,10 +700,16 @@ async function verifiedStreamUrls(
         // direct/proxy checks if another client returns the identical URL.
         if (proxyUrl && await probeMedia(url, { proxyUrl, deadline })) return { url, proxyUrl };
         return null;
-      })();
+      })().finally(() => {
+        if (requestSignal()?.aborted && probes.get(url) === pending) probes.delete(url);
+      });
       probes.set(url, pending);
     }
-    return pending;
+    const verified = await pending;
+    if (verified && !requestSignal()?.aborted) {
+      checked[index as 0 | 1] = verified;
+      onVerified?.(verifiedMeta(checked));
+    }
   }));
   // Audio may use a combined source; a video request must contain video.
   const muxed = checked[0];
@@ -716,9 +732,9 @@ function mergeStreamMeta(first: ResolveMeta | null | undefined, next: ResolveMet
 /**
  * Resolve through a proxied Innertube instance (stage A of the geo-bypass
  * tier). The instance is bootstrapped by the caller (on its own clock); here
- * each client in the ladder gets its own probe budget bounded by `deadline`,
- * so one slow or non-OK client can't starve the ones after it. Each format's
- * media is checked directly first, then through this exit if necessary.
+ * player requests stay serialized per exit while slow media validation can
+ * overlap the next client. Each format is checked directly, then through its
+ * extracting exit. All work remains bounded by the tier deadline.
  */
 async function attemptResolveWithProxiedInnertube(
   vid: string,
@@ -734,52 +750,94 @@ async function attemptResolveWithProxiedInnertube(
   let geo: GeoRestriction | undefined;
   let best: ResolveMeta | null = null;
   const probes = new Map<string, Promise<VerifiedStream | null>>();
-  for (const client of PROXY_CLIENT_LADDER) {
-    if (Date.now() >= deadline) break;
-    try {
-      const budget = Math.min(PROXY_PROBE_TIMEOUT_MS, Math.max(1_000, deadline - Date.now()));
-      const info = await getPlayerInfo(yt, vid, client, budget);
-      requestSignal()?.throwIfAborted();
-      if (info.playability_status?.status !== 'OK') {
-        const failure = playabilityFailure(info.playability_status?.status, info.playability_status?.reason);
+  const result = (): ProxiedResolveAttempt => ({ meta: best,
+    failure: contentFailure ? 'content' : proxyFailure ? 'proxy' : 'unknown', geo });
+  try {
+    return await withRequestDeadline(Math.max(1, deadline - Date.now()), 'exit resolution', async () => {
+      let accept!: (value: ProxiedResolveAttempt) => void;
+      let accepted = false;
+      const winner = new Promise<ProxiedResolveAttempt>(resolve => { accept = resolve; });
+      const publish = () => {
+        if (!accepted && !requestSignal()?.aborted && best && isUsable(best)) {
+          accepted = true;
+          onComplete();
+          accept(result());
+        }
+      };
+      const recordFailure = (error: unknown) => {
+        if (requestSignal()?.aborted) return;
+        const failure = playerExceptionFailure(error);
         contentFailure ||= failure === 'content';
         proxyFailure ||= failure === 'proxy';
-        if (!geo && isGeoBlockedError(String(info.playability_status?.reason ?? ''))) {
-          geo = { allowed: extractGeoCountries(info), blocked: [] };
+        const reason = (error as { info?: { reason?: string } } | null)?.info?.reason ?? String(error);
+        if (!geo && isGeoBlockedError(reason)) geo = { allowed: [], blocked: [] };
+      };
+      const validations: Promise<void>[] = [];
+      const validate = async (info: any) => {
+        const manifest = liveManifest(info);
+        const onVerified = (meta: ResolveMeta) => {
+          best = mergeStreamMeta(best, meta);
+          if (isCurrent() && manifest === undefined) INFO_CACHE.set(vid, info);
+          publish();
+        };
+        const clientDeadline = Math.min(deadline, requestDeadline());
+        let meta = manifest !== undefined
+          ? manifest ? await verifiedLiveUrls(manifest, proxyUrl, probes, clientDeadline, onVerified) : { urls: [null, null] as ResolveMeta['urls'], proxyUrl: null }
+          : await verifiedStreamUrls(await extractStreamUrls(yt, info), proxyUrl, probes, clientDeadline, onVerified);
+        // Keep usable finite VOD formats before falling back to HLS.
+        const alternateManifest = info.streaming_data?.hls_manifest_url ?? info.streaming_data?.hlsManifestUrl;
+        if (manifest === undefined && !isUsable(meta) && alternateManifest) {
+          meta = mergeStreamMeta(meta, await verifiedLiveUrls(alternateManifest, proxyUrl, probes, clientDeadline, onVerified));
         }
-        continue;
-      }
-      contentFailure = true; // A playable player response proves this exit is reachable.
-      const manifest = liveManifest(info);
-      let meta = manifest !== undefined
-        ? manifest ? await verifiedLiveUrls(manifest, proxyUrl, probes, deadline) : { urls: [null, null] as ResolveMeta['urls'], proxyUrl: null }
-        : await verifiedStreamUrls(await extractStreamUrls(yt, info), proxyUrl, probes, deadline);
-      // VOD can advertise HLS as well. Keep usable finite formats first;
-      // use HLS only for a requested slot that the finite choices cannot supply.
-      const alternateManifest = info.streaming_data?.hls_manifest_url ?? info.streaming_data?.hlsManifestUrl;
-      if (manifest === undefined && !isUsable(meta) && alternateManifest) {
-        meta = mergeStreamMeta(meta, await verifiedLiveUrls(alternateManifest, proxyUrl, probes, deadline));
-      }
-      requestSignal()?.throwIfAborted();
-      if (meta.urls[0] || meta.urls[1]) {
-        if (isCurrent() && manifest === undefined) INFO_CACHE.set(vid, info);
-        best = mergeStreamMeta(best, meta);
-        if (isUsable(best)) {
-          onComplete();
-          return { meta: best, failure: 'content' };
+        requestSignal()?.throwIfAborted();
+        if (meta.urls[0] || meta.urls[1]) {
+          onVerified(meta);
         }
-      }
-    } catch (error) {
-      if (requestSignal()?.aborted) return { meta: null, failure: 'unknown' };
-      const failure = playerExceptionFailure(error);
-      contentFailure ||= failure === 'content';
-      proxyFailure ||= failure === 'proxy';
-      const reason = (error as { info?: { reason?: string } } | null)?.info?.reason ?? String(error);
-      if (!geo && isGeoBlockedError(reason)) geo = { allowed: [], blocked: [] };
+      };
+      const ladder = (async () => {
+        for (const client of PROXY_CLIENT_LADDER) {
+          if (accepted || requestSignal()?.aborted || Date.now() >= deadline) break;
+          try {
+            const info = await getPlayerInfo(yt, vid, client, Math.min(PROXY_PROBE_TIMEOUT_MS, deadline - Date.now()));
+            requestSignal()?.throwIfAborted();
+            if (info.playability_status?.status !== 'OK') {
+              const failure = playabilityFailure(info.playability_status?.status, info.playability_status?.reason);
+              contentFailure ||= failure === 'content';
+              proxyFailure ||= failure === 'proxy';
+              if (!geo && isGeoBlockedError(String(info.playability_status?.reason ?? ''))) {
+                geo = { allowed: extractGeoCountries(info), blocked: [] };
+              }
+              continue;
+            }
+            contentFailure = true;
+            const validation = validate(info).catch(recordFailure);
+            validations.push(validation);
+            // Fast checks finish before another player call. Slow checks keep
+            // their existing transport budget while fallback clients advance.
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([validation, new Promise<void>(resolve => {
+                timer = setTimeout(resolve, CLIENT_FALLBACK_DELAY_MS);
+              })]);
+            } finally { clearTimeout(timer); }
+          } catch (error) { recordFailure(error); }
+        }
+        await Promise.all(validations);
+        if (!accepted) onComplete();
+        return result();
+      })();
+      return await Promise.race([winner, ladder]);
+    });
+  } catch {
+    if (requestSignal()?.aborted) return { meta: null, failure: 'unknown' };
+    const partial = result().meta;
+    if (partial?.urls[0] && !partial.urls[1] && !partial.streamTypes?.[0]) {
+      // Keep verified combined-file audio when its dedicated check hits the deadline.
+      best = mergeStreamMeta(partial, { urls: [null, partial.urls[0]], proxyUrl: formatProxy(partial, 0) });
     }
+    onComplete();
+    return result();
   }
-  onComplete();
-  return { meta: best, failure: contentFailure ? 'content' : proxyFailure ? 'proxy' : 'unknown', geo };
 }
 
 /**
@@ -799,9 +857,9 @@ const TIER_BUDGET_MS = 35_000;
 // own clock, separate from the probe budget, so a cold session doesn't consume
 // the time meant for getBasicInfo. A cached instance returns from this instantly.
 const PROXY_BOOTSTRAP_TIMEOUT_MS = 20_000;
-// One getBasicInfo round-trip through the proxy. Spent per client, not shared
-// across the whole ladder, so a single slow probe no longer fails the candidate.
+// Player response deadline; media checks retain their separate bounded reads.
 const PROXY_PROBE_TIMEOUT_MS = 8_000;
+const CLIENT_FALLBACK_DELAY_MS = 1_000;
 
 /** Resolve with the first task that yields a non-null value, else null once all settle. */
 function raceUsable(tasks: Promise<ResolveMeta | null>[], isUsable: (meta: ResolveMeta) => boolean): Promise<ResolveMeta | null> {
@@ -934,12 +992,10 @@ async function resolveViaProxyTier(
 
     const warm = untried.filter((c) => isProxiedInnertubeWarm(c.url));
     const cold = untried.filter((c) => !isProxiedInnertubeWarm(c.url));
-    for (const group of [warm, cold]) {
-      if (!group.length || Date.now() >= deadline) continue;
-      const meta = await raceUsable(group.map((p) => attempt(p)), meta => isUsable(mergeStreamMeta(best, meta)));
-      if (meta) best = mergeStreamMeta(best, meta);
-      if (best && isUsable(best)) return best;
-    }
+    // Start warm exits first, but let cold sessions bootstrap while they validate.
+    const meta = await raceUsable([...warm, ...cold].map((p) => attempt(p)), meta => isUsable(mergeStreamMeta(best, meta)));
+    if (meta) best = mergeStreamMeta(best, meta);
+    if (best && isUsable(best)) return best;
   }
 
   return best;
